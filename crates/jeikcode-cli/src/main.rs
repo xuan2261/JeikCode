@@ -496,6 +496,7 @@ async fn run_serve_mode(
                 jeikcode::host_service::host_msg(
                     &format!("Could not install the host service: {e:#}"),
                     &format!("系统服务配置失败: {e:#}"),
+                    &format!("Không thể cài đặt dịch vụ máy chủ: {e:#}"),
                 )
             );
             eprintln!(
@@ -503,6 +504,7 @@ async fn run_serve_mode(
                 jeikcode::host_service::host_msg(
                     "Continuing in the foreground.",
                     "改为前台运行。",
+                    "Tiếp tục chạy ở tiền cảnh.",
                 )
             );
         }

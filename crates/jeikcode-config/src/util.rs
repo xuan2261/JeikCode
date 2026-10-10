@@ -108,9 +108,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn stable_project_hash_keeps_existing_disk_key() {
+        // Independent std Unix Path::hash reference, also pinned by MCP:
+        // component bytes + rotated component-length bits, not str::hash.
+        assert_eq!(
+            stable_project_hash(Path::new("/opt/jeikcode/env")),
+            "1442052fcc3b8d22"
+        );
         assert_eq!(
             stable_project_hash(Path::new("/tmp/jeikcode-trust-golden")),
-            "8b6a67e0b2c06dae"
+            "dbfd3a693a3f2b18"
         );
     }
 }

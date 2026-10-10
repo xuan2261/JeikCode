@@ -89,13 +89,15 @@ pub fn commit_language_guidance(language: Option<jeikcode_config::locale::Locale
 Keep Conventional Commit types/scopes, code identifiers, and trailers unchanged. An explicit user \
 or project commit-message rule takes precedence."
         }
-        Some(Locale::En) => {
-            "Write the natural-language parts of the commit subject and body in English. \
-Keep Conventional Commit types/scopes, code identifiers, and trailers unchanged. An explicit user \
+        Some(Locale::Vi) => {
+            // Tiếng Việt chỉ áp dụng cho nội dung, không đổi tiền tố hay trailer cố định.
+            "Write the natural-language parts of the commit subject and body in Vietnamese. \
+Keep Conventional Commit types/scopes, code identifiers, and trailers unchanged. \
+Preserve the fixed Co-authored-by: trailer prefix and its schema. An explicit user \
 or project commit-message rule takes precedence."
         }
-        None => {
-            "Match the natural-language parts of the commit message to the user's current conversation language. \
+        Some(Locale::En) | None => {
+            "Write the natural-language parts of the commit subject and body in English. \
 Keep Conventional Commit types/scopes, code identifiers, and trailers unchanged. An explicit user \
 or project commit-message rule takes precedence."
         }
@@ -1188,12 +1190,10 @@ mod tests {
     }
 
     #[test]
-    fn persona_defaults_commit_message_to_conversation_language() {
-        let guidance = commit_language_guidance(None);
-        assert!(
-            guidance.contains("Match the natural-language parts of the commit message to the user's current conversation language"),
-            "commit guidance must cover the subject and body, not only the trailer"
-        );
+    fn persona_defaults_commit_message_to_english() {
+        use jeikcode_config::locale::Locale;
+        assert_eq!(commit_language_guidance(None), commit_language_guidance(Some(Locale::En)));
+        assert!(commit_language_guidance(None).contains("subject and body in English"));
     }
 
     #[test]
@@ -1207,6 +1207,19 @@ mod tests {
         let en = commit_language_guidance(Some(Locale::En));
         assert!(en.contains("subject and body in English"));
         assert!(en.contains("code identifiers, and trailers unchanged"));
+    }
+
+    #[test]
+    fn persona_uses_vietnamese_commit_guidance_without_changing_response_language() {
+        use jeikcode_config::locale::Locale;
+        let guidance = commit_language_guidance(Some(Locale::Vi));
+        assert!(guidance.contains("subject and body in Vietnamese"));
+        assert!(guidance.contains("Conventional Commit types/scopes, code identifiers, and trailers unchanged"));
+        assert!(guidance.contains("user or project commit-message rule takes precedence"));
+        assert!(guidance.contains("fixed Co-authored-by: trailer prefix and its schema"));
+        let persona = coding_persona_with_language("m", Some(Locale::Vi), true, false);
+        assert!(persona.contains(guidance));
+        assert!(persona.contains("Always communicate in the language used by the user"));
     }
 
     #[test]
