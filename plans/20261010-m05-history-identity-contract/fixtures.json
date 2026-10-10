@@ -1,0 +1,239 @@
+{
+  "source_base": "8f7d49d9efdb596cd1c74b2acf546ed0386d8722",
+  "note": "Diagnostic model fixtures. raw_key is an oracle available only to these fixtures, NOT a field currently returned by the JeikCode API.",
+  "cases": [
+    {
+      "id": "assistant_after_folded_tool",
+      "raw": [
+        {"key": "u0", "role": "user", "text": "first question"},
+        {"key": "a1", "role": "assistant", "text": "running tool", "tool_calls": ["c1"]},
+        {"key": "t2", "role": "tool", "text": "tool complete", "call_id": "c1"},
+        {"key": "u3", "role": "user", "text": "second question"},
+        {"key": "a4", "role": "assistant", "text": "last answer"}
+      ],
+      "select": "a4",
+      "api_keys": ["u0", "a1", "t2", "u3", "a4"],
+      "canvas_keys": ["u0", "a1", "u3", "a4"],
+      "beta_target": "u3",
+      "index_first_target": "u3"
+    },
+    {
+      "id": "duplicate_user_text",
+      "raw": [
+        {"key": "u0", "role": "user", "text": "continue"},
+        {"key": "a1", "role": "assistant", "text": "first response"},
+        {"key": "u2", "role": "user", "text": "continue"},
+        {"key": "a3", "role": "assistant", "text": "second response"}
+      ],
+      "select": "u0",
+      "api_keys": ["u0", "a1", "u2", "a3"],
+      "canvas_keys": ["u0", "a1", "u2", "a3"],
+      "beta_target": "u2",
+      "index_first_target": "u0"
+    },
+    {
+      "id": "empty_tool_text_matches_any_expected_text",
+      "raw": [
+        {"key": "u0", "role": "user", "text": "protect this question"},
+        {"key": "a1", "role": "assistant", "text": "calling tool", "tool_calls": ["c1"]},
+        {"key": "t2", "role": "tool", "text": "", "call_id": "c1"}
+      ],
+      "select": "u0",
+      "api_keys": ["u0", "a1", "t2"],
+      "canvas_keys": ["u0", "a1"],
+      "beta_target": "t2",
+      "index_first_target": "u0"
+    },
+    {
+      "id": "presentation_only_user_row",
+      "raw": [
+        {"key": "u0", "role": "user", "text": "real question"},
+        {"key": "a1", "role": "assistant", "text": "real answer"}
+      ],
+      "presentation": [
+        {"key": "p0", "role": "user", "text": "display-only introduction", "anchor": "at_start"}
+      ],
+      "select": "p0",
+      "api_keys": ["p0", "u0", "a1"],
+      "canvas_keys": ["p0", "u0", "a1"],
+      "beta_target": "u0",
+      "index_first_target": null
+    },
+    {
+      "id": "presentation_shifts_real_user",
+      "raw": [
+        {"key": "u0", "role": "user", "text": "real question"},
+        {"key": "a1", "role": "assistant", "text": "real answer"}
+      ],
+      "presentation": [
+        {"key": "p0", "role": "user", "text": "display-only introduction", "anchor": "at_start"}
+      ],
+      "select": "u0",
+      "api_keys": ["p0", "u0", "a1"],
+      "canvas_keys": ["p0", "u0", "a1"],
+      "beta_target": "u0",
+      "index_first_target": null
+    },
+    {
+      "id": "hidden_cold_summary",
+      "raw": [
+        {"key": "s0", "role": "system", "text": "internal cold summary", "synthetic": true, "internal_origin": "jeikcode.legacy_cold_summary"},
+        {"key": "u1", "role": "user", "text": "hello"},
+        {"key": "a2", "role": "assistant", "text": "answer"}
+      ],
+      "select": "u1",
+      "api_keys": ["u1", "a2"],
+      "canvas_keys": ["u1", "a2"],
+      "beta_target": "u1",
+      "index_first_target": null
+    },
+    {
+      "id": "display_capped_long_user",
+      "raw": [
+        {"key": "u0", "role": "user", "repeat": {"char": "A", "count": 24577}},
+        {"key": "a1", "role": "assistant", "text": "answer"}
+      ],
+      "select": "u0",
+      "api_keys": ["u0", "a1"],
+      "canvas_keys": ["u0", "a1"],
+      "beta_target": "u0",
+      "index_first_target": null
+    },
+    {
+      "id": "display_capped_unicode_user",
+      "raw": [
+        {"key": "u0", "role": "user", "repeat": {"char": "界", "count": 8193}},
+        {"key": "a1", "role": "assistant", "text": "answer"}
+      ],
+      "select": "u0",
+      "api_keys": ["u0", "a1"],
+      "canvas_keys": ["u0", "a1"],
+      "beta_target": "u0",
+      "index_first_target": null
+    },
+    {
+      "id": "image_only_after_presentation",
+      "raw": [
+        {"key": "u0", "role": "user", "text": "", "images": true},
+        {"key": "u1", "role": "user", "text": "", "images": true}
+      ],
+      "presentation": [
+        {"key": "p0", "role": "assistant", "text": "rendered only", "anchor": "at_start"}
+      ],
+      "select": "u0",
+      "api_keys": ["p0", "u0", "u1"],
+      "canvas_keys": ["p0", "u0", "u1"],
+      "beta_target": "u1",
+      "index_first_target": "u1"
+    },
+    {
+      "id": "hidden_reminder_before_assistant",
+      "raw": [
+        {"key": "u0", "role": "user", "text": "question"},
+        {"key": "s1", "role": "user", "text": "<system-reminder>\ninternal reminder\n</system-reminder>", "synthetic": true},
+        {"key": "a2", "role": "assistant", "text": "answer"}
+      ],
+      "select": "a2",
+      "api_keys": ["u0", "a2"],
+      "canvas_keys": ["u0", "a2"],
+      "beta_target": "s1",
+      "index_first_target": "s1"
+    },
+    {
+      "id": "presentation_after_turn",
+      "raw": [
+        {"key": "u0", "role": "user", "text": "one"},
+        {"key": "a1", "role": "assistant", "text": "reply one"},
+        {"key": "u2", "role": "user", "text": "two"},
+        {"key": "a3", "role": "assistant", "text": "reply two"}
+      ],
+      "turn_stats": [{"turn_id": 11, "after_message": 2, "position_valid": true}],
+      "presentation": [
+        {"key": "p2", "role": "assistant", "text": "presentation between turns", "anchor": "after_turn", "turn_id": 11}
+      ],
+      "select": "p2",
+      "api_keys": ["u0", "a1", "p2", "u2", "a3"],
+      "canvas_keys": ["u0", "a1", "p2", "u2", "a3"],
+      "beta_target": "u2",
+      "index_first_target": "u2"
+    },
+    {
+      "id": "tail_window_after_inserted_presentation",
+      "raw": [
+        {"key": "u0", "role": "user", "text": "first"},
+        {"key": "a1", "role": "assistant", "text": "first reply"},
+        {"key": "u2", "role": "user", "text": "second"},
+        {"key": "a3", "role": "assistant", "text": "second reply"}
+      ],
+      "presentation": [
+        {"key": "p0", "role": "assistant", "text": "header row", "anchor": "at_start"}
+      ],
+      "window_offset": 2,
+      "select": "u2",
+      "api_keys": ["p0", "u0", "a1", "u2", "a3"],
+      "canvas_keys": ["a1", "u2", "a3"],
+      "beta_target": "a3",
+      "index_first_target": "a3"
+    },
+    {
+      "id": "after_turn_uses_native_snapshot_coordinate_after_hidden_row",
+      "raw": [
+        {"key": "u0", "role": "user", "text": "first question"},
+        {"key": "h1", "role": "user", "text": "<system-reminder>\nhidden reminder\n</system-reminder>", "synthetic": true},
+        {"key": "a2", "role": "assistant", "text": "first answer"},
+        {"key": "u3", "role": "user", "text": "second question"},
+        {"key": "a4", "role": "assistant", "text": "second answer"}
+      ],
+      "turn_stats": [{"turn_id": 42, "after_message": 3, "position_valid": true}],
+      "presentation": [
+        {"key": "p3", "role": "assistant", "text": "inserted divider", "anchor": "after_turn", "turn_id": 42}
+      ],
+      "select": "p3",
+      "api_keys": ["u0", "a2", "u3", "p3", "a4"],
+      "canvas_keys": ["u0", "a2", "u3", "p3", "a4"],
+      "beta_target": "u3",
+      "index_first_target": "u3"
+    },
+    {
+      "id": "verify_cadence_assistant_is_hidden_only_by_webui",
+      "raw": [
+        {"key": "u0", "role": "user", "text": "ordinary question"},
+        {"key": "av1", "role": "assistant", "text": "internal verification", "internal_origin": "verify_cadence", "tool_calls": []},
+        {"key": "a2", "role": "assistant", "text": "final answer"}
+      ],
+      "select": "a2",
+      "api_keys": ["u0", "av1", "a2"],
+      "canvas_keys": ["u0", "a2"],
+      "beta_target": "av1",
+      "index_first_target": "av1"
+    },
+    {
+      "id": "synthetic_user_hidden_only_by_webui",
+      "raw": [
+        {"key": "u0", "role": "user", "text": "ordinary question"},
+        {"key": "us1", "role": "user", "text": "internal user note", "synthetic": true},
+        {"key": "a2", "role": "assistant", "text": "final answer"}
+      ],
+      "select": "a2",
+      "api_keys": ["u0", "us1", "a2"],
+      "canvas_keys": ["u0", "a2"],
+      "beta_target": "us1",
+      "index_first_target": "us1"
+    },
+    {
+      "id": "inflight_display_only_user_reuses_existing_text",
+      "raw": [
+        {"key": "u0", "role": "user", "text": "continue"}
+      ],
+      "inflight": [
+        {"key": "u0", "role": "user", "text": "continue"},
+        {"key": "ui1", "role": "user", "text": "continue"}
+      ],
+      "select": "ui1",
+      "api_keys": ["u0", "ui1"],
+      "canvas_keys": ["u0", "ui1"],
+      "beta_target": "u0",
+      "index_first_target": null
+    }
+  ]
+}
