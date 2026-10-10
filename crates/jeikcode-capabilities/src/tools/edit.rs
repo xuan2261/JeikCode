@@ -374,7 +374,10 @@ where
     let value = Option::<serde_json::Value>::deserialize(d)?;
     match value {
         None | Some(serde_json::Value::Null) => Ok(Vec::new()),
-        Some(v) => parse_edits_value(v).map_err(serde::de::Error::custom),
+        Some(v) => {
+            crate::tools::repair::validate_complete_edits(&v).map_err(serde::de::Error::custom)?;
+            parse_edits_value(v).map_err(serde::de::Error::custom)
+        }
     }
 }
 
@@ -399,7 +402,7 @@ fn parse_edits_value(value: serde_json::Value) -> Result<Vec<EditHunk>, String> 
             for k in keys {
                 match parse_edits_value(map[&k].clone()) {
                     Ok(mut got) => hunks.append(&mut got),
-                    Err(_) => {}
+                    Err(e) => return Err(e),
                 }
             }
             if hunks.is_empty() {
@@ -415,32 +418,8 @@ fn parse_edits_value(value: serde_json::Value) -> Result<Vec<EditHunk>, String> 
     }
 }
 
-fn unwrap_stringified_json_layers(s: &str) -> String {
-    let mut cur = s.trim().to_string();
-    for _ in 0..3 {
-        let t = cur.trim();
-        if t.len() < 2 || !t.starts_with('"') {
-            break;
-        }
-        let Ok(inner) = serde_json::from_str::<String>(t) else {
-            break;
-        };
-        let inner_trim = inner.trim_start();
-        if inner == cur
-            || !(inner_trim.starts_with('[')
-                || inner_trim.starts_with('{')
-                || inner_trim.starts_with('"'))
-        {
-            break;
-        }
-        cur = inner;
-    }
-    cur
-}
-
 fn parse_edits_string(s: &str) -> Result<Vec<EditHunk>, String> {
-    let t = unwrap_stringified_json_layers(s);
-    let t = t.trim();
+    let t = s.trim();
     if t.is_empty() {
         return Ok(Vec::new());
     }
@@ -453,11 +432,9 @@ fn parse_edits_string(s: &str) -> Result<Vec<EditHunk>, String> {
             parse_edits_value(v)
         }
         Ok(_) => Err("stringified edits decoded but was not a JSON array or object".into()),
-        Err(e) => {
-            Err(format!(
-                "edits was a string (expected a JSON array). Could not decode: {e}"
-            ))
-        }
+        Err(e) => Err(format!(
+            "edits was a string (expected a JSON array). Could not decode: {e}"
+        )),
     }
 }
 
@@ -1781,6 +1758,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn guard_truncated_edits_repair_execute_no_prefix_writes() {
+        use crate::tools::repair::{merge_edit_file_args, repair_tool_args};
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("guard.txt");
+        let original = b"alpha\nbeta\nsibling\n";
+        std::fs::write(&path, original).unwrap();
+        let truncated = r#"[{"old_string":"alpha","new_string":"changed"},{"old_string":"beta","new_string":"cut"#;
+        let sibling = json!({"old_string":"sibling","new_string":"changed sibling"});
+        let cases = [
+            format!(r#"{{"file_path":"guard.txt","edits":{truncated}"#),
+            json!({"file_path":"guard.txt","edits":truncated}).to_string(),
+            json!({"file_path":"guard.txt","edits":truncated,
+                "old_string":"sibling","new_string":"changed sibling"})
+            .to_string(),
+            json!({"file_path":"guard.txt","edits":[sibling.clone(), truncated]}).to_string(),
+            json!({"file_path":"guard.txt","edits":{"a":sibling,"b":truncated}}).to_string(),
+        ];
+        let complete = json!({"file_path":"guard.txt","edits":[{"old_string":"sibling","new_string":"changed sibling"}]}).to_string();
+        for raw in cases {
+            let repaired = repair_tool_args("edit_file", &raw);
+            assert!(EditFileTool.coalesce_group_key(&repaired).is_none());
+            assert!(merge_edit_file_args(&[&repaired, &complete]).is_none());
+            // The exact raw entrypoint and the post-repair entrypoint both fail.
+            for args in [&raw, &repaired] {
+                let result = EditFileTool.execute(args, &ctx(d.path())).await;
+                assert!(result.is_error, "{args}: {}", result.content);
+                assert_eq!(std::fs::read(&path).unwrap(), original);
+                // A missing file must still report an argument error, not an IO error.
+                let missing = tempfile::tempdir().unwrap();
+                let result = EditFileTool.execute(args, &ctx(missing.path())).await;
+                assert!(result.is_error);
+                assert!(
+                    !result.content.contains("path_not_found"),
+                    "{}",
+                    result.content
+                );
+                assert!(
+                    !result.content.contains("cannot read"),
+                    "{}",
+                    result.content
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn guard_native_and_string_layers_share_depth_budget() {
+        let hunk = json!({"old_string":"a","new_string":"b"});
+        let mut deep = hunk.clone();
+        for _ in 0..128 {
+            deep = json!([deep]);
+        }
+        assert!(
+            serde_json::from_value::<Args>(json!({"file_path":"missing","edits":deep})).is_err()
+        );
+        let mut mixed = hunk;
+        for _ in 0..20 {
+            mixed = json!({"nested":mixed.to_string()});
+        }
+        assert!(
+            serde_json::from_value::<Args>(json!({"file_path":"missing","edits":mixed})).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn guard_strict_truncated_new_string_without_siblings() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("guard.txt"), "alpha").unwrap();
+        for edits in [
+            r#"[{"old_string":"alpha","new_string":"cut"#,
+            r#"{"old_string":"alpha","new_string":"cut"#,
+        ] {
+            let raw = json!({"file_path":"guard.txt","edits":edits}).to_string();
+            assert!(serde_json::from_str::<Args>(&raw).is_err());
+            let repaired = crate::tools::repair::repair_tool_args("edit_file", &raw);
+            let result = EditFileTool.execute(&repaired, &ctx(d.path())).await;
+            assert!(result.is_error, "{}", result.content);
+            assert_eq!(
+                std::fs::read_to_string(d.path().join("guard.txt")).unwrap(),
+                "alpha"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn gbk_file_edits_in_place_and_stays_gbk() {
         // A GBK/GB18030-encoded file (common on Chinese Windows) must be editable
         // directly — matched in UTF-8 space, then written back in its ORIGINAL encoding,
@@ -2738,7 +2800,10 @@ fn b() { 2 }
             let args = serde_json::json!({"file_path":"a.rs", "edits":inner}).to_string();
             let r = EditFileTool.execute(&args, &ctx(d.path())).await;
             assert!(r.is_error, "partial request must fail: {}", r.content);
-            assert_eq!(std::fs::read_to_string(d.path().join("a.rs")).unwrap(), original);
+            assert_eq!(
+                std::fs::read_to_string(d.path().join("a.rs")).unwrap(),
+                original
+            );
         }
     }
 
@@ -2787,7 +2852,11 @@ fn b() { 2 }
         })
         .to_string();
         let r = EditFileTool.execute(&args, &ctx(d.path())).await;
-        assert!(r.is_error, "cut edits must reject sibling recovery: {}", r.content);
+        assert!(
+            r.is_error,
+            "cut edits must reject sibling recovery: {}",
+            r.content
+        );
         assert_eq!(
             std::fs::read_to_string(d.path().join("mod.rs")).unwrap(),
             "            \"todowrite\",\n            \"read_file\",\n"
