@@ -282,6 +282,8 @@ struct SubTask {
     subagent_type: String,
     #[serde(default)]
     difficulty: String,
+    #[serde(default, deserialize_with = "deserialize_model_id")]
+    model_id: Option<String>,
     /// Worker-only: working-dir-relative globs the worker may WRITE within. Required for
     /// `worker`; ignored for `explore` (read-only). Enforced by `WorkerScopeGate`.
     #[serde(
@@ -296,11 +298,53 @@ struct Args {
     tasks: Vec<SubTask>,
 }
 
+pub fn valid_task_model_id(id: &str) -> bool {
+    id.split_once('/').is_some_and(|(p, m)| !p.is_empty() && !m.is_empty())
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_./".contains(&b))
+}
+
+fn deserialize_model_id<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    String::deserialize(d).map(Some)
+}
+
+/// Immutable task binding. Only nonsecret engine identities enter receipts.
+pub struct TaskModelBinding {
+    pub registry_id: String,
+    pub provider_id: String,
+    pub api_model: String,
+    pub provider: Arc<dyn LlmProvider>,
+    pub chat_options: jeikcode_kernel::provider::ChatOptions,
+}
+
+pub type TaskModelResolver = Arc<dyn Fn(&str) -> Result<TaskModelBinding, String> + Send + Sync>;
+
+struct ObservedTaskProvider {
+    inner: Arc<dyn LlmProvider>,
+    called: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl LlmProvider for ObservedTaskProvider {
+    fn model_name(&self) -> &str { self.inner.model_name() }
+    fn context_window(&self) -> u32 { self.inner.context_window() }
+    fn bind_session_id(&self, id: &str) { self.inner.bind_session_id(id); }
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[jeikcode_kernel::tool::ToolDef],
+        options: &jeikcode_kernel::provider::ChatOptions,
+    ) -> Result<futures::stream::BoxStream<'static, jeikcode_kernel::stream::StreamEvent>, jeikcode_kernel::stream::ProviderError> {
+        self.called.store(true, std::sync::atomic::Ordering::Release);
+        self.inner.chat_stream(messages, tools, options).await
+    }
+}
+
 pub struct TaskTool {
     make_fast_provider: Box<dyn Fn() -> Arc<dyn LlmProvider> + Send + Sync>,
     make_capable_provider: Box<dyn Fn() -> Arc<dyn LlmProvider> + Send + Sync>,
     make_explore_tools: Box<dyn Fn() -> MountedTools + Send + Sync>,
     make_worker_tools: Box<dyn Fn() -> MountedTools + Send + Sync>,
+    explicit_model_resolver: Option<TaskModelResolver>,
     max_concurrent: usize,
     max_rounds: Option<u32>,
     tool_loop_policy: Option<ToolLoopPolicy>,
@@ -319,11 +363,17 @@ impl TaskTool {
             make_capable_provider: Box::new(make_capable_provider),
             make_explore_tools: Box::new(make_explore_tools),
             make_worker_tools: Box::new(make_worker_tools),
+            explicit_model_resolver: None,
             max_concurrent: DEFAULT_MAX_CONCURRENT,
             max_rounds: Some(super::DEFAULT_CHILD_MAX_ROUNDS),
             tool_loop_policy: Some(ToolLoopPolicy::default()),
             inherited_worker_middlewares: Vec::new(),
         }
+    }
+
+    pub fn with_model_resolver(mut self, resolver: Option<TaskModelResolver>) -> Self {
+        self.explicit_model_resolver = resolver;
+        self
     }
 
     pub fn with_max_concurrent(mut self, n: usize) -> Self {
@@ -379,6 +429,7 @@ impl Tool for TaskTool {
                             "prompt": {"type": "string", "description": "The full subtask for the subagent"},
                             "subagent_type": {"type": "string", "enum": ["explore", "worker"]},
                             "difficulty": {"type": "string", "enum": ["simple", "hard"]},
+                            "model_id": {"type": "string", "description": "Optional exact registered provider/model ID. Overrides difficulty model selection; invalid IDs fail closed."},
                             "scope": {
                                 "type": "array",
                                 "items": { "type": "string" },
@@ -458,16 +509,59 @@ impl Tool for TaskTool {
         ctx.progress
             .emit(format!("dispatching {} subtask(s)…", parsed.tasks.len()));
 
+        let mut rejected = Vec::new();
         for (idx, t) in parsed.tasks.into_iter().enumerate() {
             let is_worker = t.subagent_type == "worker";
             let scope = t.scope.clone();
             let is_hard = t.difficulty == "hard";
             // Fresh provider + fresh tools per child (a session consumes its provider).
-            let provider = if is_hard {
+            let mut route = json!({"selection_source": "legacy_difficulty", "status": "resolved"});
+            let mut chat_options = None;
+            let provider = if let Some(id) = &t.model_id {
+                let binding = if !valid_task_model_id(id) {
+                    Err("model_id must be an exact qualified registry ID".to_string())
+                } else {
+                    self.explicit_model_resolver.as_ref()
+                        .ok_or_else(|| "explicit task model routing unavailable".to_string())
+                        .and_then(|resolve| resolve(id))
+                        .and_then(|binding| {
+                            if binding.registry_id != *id
+                                || id.split_once('/').map(|(account, _)| account) != Some(binding.provider_id.as_str())
+                                || binding.api_model.trim().is_empty()
+                                || binding.provider.model_name() != binding.api_model
+                            {
+                                return Err("explicit task binding mismatch".into());
+                            }
+                            Ok(binding)
+                        })
+                };
+                match binding {
+                    Ok(binding) => {
+                        route = json!({"requested_model_id": id, "resolved_registry_id": binding.registry_id,
+                            "provider_id": binding.provider_id, "resolved_api_model": binding.api_model,
+                            "selection_source": "explicit_task", "status": "resolved",
+                            "effective_api_model": null, "remote_serving_identity": null});
+                        chat_options = Some(binding.chat_options);
+                        binding.provider
+                    }
+                    Err(_) => {
+                        let label = format!("{}#{}", if is_worker { "worker" } else { "explore" }, idx + 1);
+                        let receipt = json!({"requested_model_id": valid_task_model_id(id).then_some(id), "selection_source": "explicit_task", "status": "unresolved",
+                            "resolved_registry_id": null, "provider_id": null, "resolved_api_model": null,
+                            "effective_api_model": null, "remote_serving_identity": null});
+                        let body = format!("<route>{receipt}</route>\nexplicit model resolution or provider construction failed; no inherited fallback");
+                        ctx.progress.emit(format!("<task_route id=\"{label}\">{receipt}</task_route>"));
+                        rejected.push(render_task_block(&label, &t.description, "", "error", "task_error", &body));
+                        continue;
+                    }
+                }
+            } else if is_hard {
                 (self.make_capable_provider)()
             } else {
                 (self.make_fast_provider)()
             };
+            let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let provider: Arc<dyn LlmProvider> = Arc::new(ObservedTaskProvider { inner: provider, called: called.clone() });
             // Capture the actual model this subtask runs on (for display + routing proof)
             // BEFORE the provider is moved into the child builder.
             let model = provider.model_name().to_string();
@@ -491,6 +585,7 @@ impl Tool for TaskTool {
                 if is_worker { "worker" } else { "explore" },
                 idx + 1
             );
+            ctx.progress.emit(format!("<task_route id=\"{label}\">{route}</task_route>"));
             let prompt = t.prompt;
             let desc = t.description;
             let sem = sem.clone();
@@ -527,6 +622,9 @@ impl Tool for TaskTool {
                     .working_dir(wd.clone())
                     .cancel_token(child_cancel)
                     .hook(progress_hook.clone());
+                if let Some(options) = chat_options {
+                    builder = builder.chat_options(options);
+                }
                 if let Some(policy) = tool_loop_policy {
                     builder = builder.tool_loop_policy(policy);
                 }
@@ -555,7 +653,7 @@ impl Tool for TaskTool {
                 // There is deliberately no total wall-clock timeout here. Long-running
                 // research may make steady progress for many minutes; liveness is bounded by
                 // provider idle timeouts, the child round cap, and explicit parent/user cancel.
-                let outcome = match handle.await {
+                let mut outcome = match handle.await {
                     Ok(o) => o,
                     Err(join_err) => Outcome {
                         stop: StopReason::ProviderError,
@@ -563,6 +661,10 @@ impl Tool for TaskTool {
                         ..Default::default()
                     },
                 };
+                if route["selection_source"] == "explicit_task" && outcome.error.is_some() {
+                    // Adapter/auth diagnostics may contain endpoints or credentials.
+                    outcome.error = Some("explicit task provider execution failed".into());
+                }
                 // Include the failure reason on the terminal ✗ line. Retained UIs
                 // commit terminal child events to scrollback while keeping only
                 // running children in the fixed panel.
@@ -572,14 +674,21 @@ impl Tool for TaskTool {
                     format!("\u{2717} failed ({:?}) \u{b7} {label}", outcome.stop)
                 };
                 progress.emit(subtask_progress_line(&head, &model, &desc));
-                (label, desc, model, outcome)
+                if called.load(std::sync::atomic::Ordering::Acquire) {
+                    route["effective_api_model"] = json!(model);
+                    route["status"] = json!("provider_called");
+                }
+                // This records the local request boundary, not remotely served identity.
+                route["remote_serving_identity"] = serde_json::Value::Null;
+                progress.emit(format!("<task_route id=\"{label}\">{route}</task_route>"));
+                (label, desc, model, outcome, route)
             });
         }
 
         // Collect all child results (order determined by completion, then sorted by label).
         // The outer closure always returns Ok(tuple); inner JoinErrors are handled at the
         // inner spawn site above and mapped to an errored Outcome.
-        let mut collected: Vec<(String, String, String, Outcome)> = Vec::new();
+        let mut collected: Vec<(String, String, String, Outcome, serde_json::Value)> = Vec::new();
         while let Some(res) = set.join_next().await {
             if let Ok(tuple) = res {
                 collected.push(tuple);
@@ -588,10 +697,10 @@ impl Tool for TaskTool {
         // Sort by label for deterministic output regardless of scheduling order.
         collected.sort_by(|a, b| a.0.cmp(&b.0));
 
-        let n_total = collected.len();
-        let mut n_error = 0usize;
-        let mut blocks: Vec<String> = Vec::new();
-        for (label, desc, model, outcome) in collected {
+        let n_total = collected.len() + rejected.len();
+        let mut n_error = rejected.len();
+        let mut blocks: Vec<String> = rejected;
+        for (label, desc, model, outcome, route) in collected {
             let is_err = outcome.stop != StopReason::Stopped;
             if is_err {
                 n_error += 1;
@@ -622,6 +731,7 @@ impl Tool for TaskTool {
             } else {
                 ("completed", "task_result", produced)
             };
+            let body = format!("<route>{route}</route>\n{body}");
             blocks.push(render_task_block(&label, &desc, &model, state, tag, &body));
         }
 
@@ -1043,6 +1153,14 @@ fn render_task_block(
 }
 
 #[cfg(test)]
+#[path = "task_offline_scope.rs"]
+mod offline_scope;
+
+#[cfg(test)]
+#[path = "task_offline_acceptance.rs"]
+mod offline_acceptance;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use futures::stream::{self, BoxStream};
@@ -1109,6 +1227,205 @@ mod tests {
             move || r1.mount(&[]),
             move || r2.mount(&[]),
         )
+    }
+
+    #[test]
+    fn per_task_model_schema_and_parse_are_additive() {
+        let schema = dummy().parameters_schema();
+        let item = &schema["properties"]["tasks"]["items"];
+        assert_eq!(item["properties"]["model_id"]["type"], "string");
+        assert!(!item["required"].as_array().unwrap().contains(&json!("model_id")));
+        let old = parse_task_args(r#"{"tasks":[{"description":"d","prompt":"p"}]}"#).unwrap();
+        assert!(old.tasks[0].model_id.is_none());
+        let explicit = parse_task_args(r#"{"tasks":[{"description":"d","prompt":"p","model_id":"local8045/gemini-3.8-flash-high"}]}"#).unwrap();
+        assert_eq!(explicit.tasks[0].model_id.as_deref(), Some("local8045/gemini-3.8-flash-high"));
+        assert!(parse_task_args(r#"{"tasks":[{"description":"d","prompt":"p","model_id":null}]}"#).is_err());
+    }
+
+    #[tokio::test]
+    async fn explicit_model_id_without_resolver_never_inherits() {
+        let out = dummy().execute(r#"{"tasks":[{"description":"d","prompt":"p","model_id":"unknown/model"}]}"#, &ctx()).await;
+        assert!(out.is_error);
+        assert!(out.content.contains("unresolved"));
+        assert!(out.content.contains(r#""effective_api_model":null"#));
+    }
+
+    struct RouteMock {
+        model: String,
+        barrier: Arc<tokio::sync::Barrier>,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl LlmProvider for RouteMock {
+        fn model_name(&self) -> &str { &self.model }
+        async fn chat_stream(&self, _: &[Message], _: &[ToolDef], _: &ChatOptions) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+            self.calls.lock().unwrap().push(self.model.clone());
+            self.barrier.wait().await;
+            Ok(stream::iter(vec![StreamEvent::TextDelta("I am unrelated-model".into()), StreamEvent::Done { truncated: false }]).boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn per_task_model_concurrent_routes_override_difficulty_and_isolate_failures() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let resolver: TaskModelResolver = Arc::new({
+            let calls = calls.clone();
+            move |id| {
+                let (account, model) = id.split_once('/').unwrap();
+                if account == "unknown" { return Err("https://user:secret@host?api_key=secret".into()); }
+                Ok(TaskModelBinding {
+                    registry_id: id.into(), provider_id: account.into(), api_model: model.into(),
+                    provider: Arc::new(RouteMock { model: model.into(), barrier: barrier.clone(), calls: calls.clone() }),
+                    chat_options: ChatOptions::default(),
+                })
+            }
+        });
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut context = ctx();
+        context.progress = ProgressSink::new(Arc::new({ let captured = captured.clone(); move |s| captured.lock().unwrap().push(s) }));
+        let tool = dummy().with_model_resolver(Some(resolver)).with_max_concurrent(2);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), tool.execute(r#"{"tasks":[
+            {"description":"a","prompt":"p","difficulty":"hard","model_id":"gemini/gemini-api"},
+            {"description":"b","prompt":"p","difficulty":"simple","model_id":"gpt/gpt-api"},
+            {"description":"bad","prompt":"p","model_id":"unknown/model"}
+        ]}"#, &context)).await.unwrap();
+        assert!(!result.is_error);
+        let mut calls = calls.lock().unwrap().clone();
+        calls.sort();
+        assert_eq!(calls, vec!["gemini-api", "gpt-api"]);
+        assert!(result.content.contains(r#""effective_api_model":"gemini-api""#));
+        assert!(result.content.contains(r#""provider_id":"gpt""#));
+        assert!(result.content.contains("unresolved"));
+        assert!(!result.content.contains("secret"));
+        let admission = captured.lock().unwrap();
+        let admission: Vec<_> = admission.iter().filter(|s| s.starts_with("<task_route")).collect();
+        assert_eq!(admission.len(), 5); // three admissions + two terminal bindings
+        assert_eq!(admission.iter().filter(|s| s.contains(r#""effective_api_model":null"#)).count(), 3);
+    }
+
+    #[tokio::test]
+    async fn per_task_model_provider_error_retains_binding_without_fallback() {
+        let tool = dummy().with_model_resolver(Some(Arc::new(|id| Ok(TaskModelBinding {
+            registry_id: id.into(), provider_id: "registered".into(), api_model: "mock".into(),
+            provider: Arc::new(MockProvider { reply: None }), chat_options: ChatOptions::default(),
+        }))));
+        let out = tool.execute(r#"{"tasks":[{"description":"failure","prompt":"p","model_id":"registered/mock"}]}"#, &ctx()).await;
+        assert!(out.is_error);
+        assert!(out.content.contains(r#""requested_model_id":"registered/mock""#));
+        assert!(out.content.contains(r#""resolved_api_model":"mock""#));
+        assert!(out.content.contains(r#""effective_api_model":"mock""#));
+        assert!(out.content.contains(r#""remote_serving_identity":null"#));
+    }
+
+    #[tokio::test]
+    async fn per_task_model_omitted_preserves_difficulty_factories() {
+        let reg = Arc::new(ToolRegistry::new());
+        let r2 = reg.clone();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let fast = calls.clone();
+        let capable = calls.clone();
+        let tool = TaskTool::new(
+            move || { fast.lock().unwrap().push("fast"); Arc::new(MockProvider { reply: Some("ok".into()) }) as Arc<dyn LlmProvider> },
+            move || { capable.lock().unwrap().push("capable"); Arc::new(MockProvider { reply: Some("ok".into()) }) as Arc<dyn LlmProvider> },
+            move || reg.mount(&[]), move || r2.mount(&[]),
+        );
+        let out = tool.execute(r#"{"tasks":[{"description":"a","prompt":"p"},{"description":"b","prompt":"p","difficulty":"hard"}]}"#, &ctx()).await;
+        assert!(!out.is_error);
+        assert_eq!(*calls.lock().unwrap(), vec!["fast", "capable"]);
+    }
+
+    #[tokio::test]
+    async fn explicit_model_id_invalid_or_unknown_never_mounts_or_falls_back() {
+        let tool = TaskTool::new(
+            || panic!("no fast fallback"), || panic!("no capable fallback"),
+            || panic!("no child explore tools"), || panic!("no child worker tools"),
+        ).with_model_resolver(Some(Arc::new(|_| Err("secret diagnostic".into()))));
+        for id in ["", "model", "unknown/model", "https://secret@host/model"] {
+            let args = json!({"tasks": [{"description":"d", "prompt":"p", "model_id":id}]}).to_string();
+            let result = tool.execute(&args, &ctx()).await;
+            assert!(result.is_error);
+            assert!(result.content.contains(r#""effective_api_model":null"#));
+            assert!(result.content.contains(r#""remote_serving_identity":null"#));
+            assert!(!result.content.contains("secret"));
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_model_id_binding_mismatch_rejected_before_spawn() {
+        for mismatch in ["registry", "account", "api_model"] {
+            let tool = TaskTool::new(
+                || panic!("no fallback"), || panic!("no fallback"),
+                || panic!("no tools before admission"), || panic!("no tools before admission"),
+            ).with_model_resolver(Some(Arc::new(move |id| Ok(TaskModelBinding {
+                registry_id: if mismatch == "registry" { "other/mock".into() } else { id.into() },
+                provider_id: if mismatch == "account" { "other".into() } else { "registered".into() },
+                api_model: if mismatch == "api_model" { "other".into() } else { "mock".into() },
+                provider: Arc::new(MockProvider { reply: Some("must not run".into()) }),
+                chat_options: ChatOptions::default(),
+            }))));
+            let result = tool.execute(r#"{"tasks":[{"description":"d","prompt":"p","model_id":"registered/mock"}]}"#, &ctx()).await;
+            assert!(result.is_error, "{mismatch}");
+            assert!(result.content.contains(r#""effective_api_model":null"#));
+        }
+    }
+
+    #[tokio::test]
+    async fn per_task_model_cancel_before_request_retains_only_resolved_binding() {
+        let tool = dummy().with_model_resolver(Some(Arc::new(|id| Ok(TaskModelBinding {
+            registry_id: id.into(), provider_id: "registered".into(), api_model: "mock".into(),
+            provider: Arc::new(MockProvider { reply: Some("must not be called".into()) }),
+            chat_options: ChatOptions::default(),
+        }))));
+        let context = ctx();
+        context.cancel.cancel();
+        let result = tool.execute(r#"{"tasks":[{"description":"cancel","prompt":"p","model_id":"registered/mock"}]}"#, &context).await;
+        assert!(result.is_error);
+        assert!(result.content.contains("Cancelled"));
+        assert!(result.content.contains(r#""resolved_api_model":"mock""#));
+        assert!(result.content.contains(r#""effective_api_model":null"#));
+        assert!(!result.content.contains("must not be called"));
+    }
+
+    #[tokio::test]
+    async fn per_task_model_worker_scope_admission_unchanged() {
+        let tool = dummy().with_model_resolver(Some(Arc::new(|_| panic!("scope rejects before resolution"))));
+        let result = tool.execute(r#"{"tasks":[{"description":"worker","prompt":"p","subagent_type":"worker","model_id":"registered/mock"}]}"#, &ctx()).await;
+        assert!(result.is_error);
+        assert!(result.content.contains("declared no `scope`"));
+        assert!(matches!(tool.risk(r#"{"tasks":[{"description":"worker","prompt":"p","subagent_type":"worker","model_id":"registered/mock"}]}"#), RiskLevel::Risky));
+    }
+
+    struct OptionsMock(Arc<Mutex<Vec<ChatOptions>>>);
+    #[async_trait]
+    impl LlmProvider for OptionsMock {
+        fn model_name(&self) -> &str { "api-model" }
+        async fn chat_stream(&self, _: &[Message], _: &[ToolDef], options: &ChatOptions) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+            self.0.lock().unwrap().push(options.clone());
+            Ok(stream::iter(vec![StreamEvent::TextDelta("I am another model".into()), StreamEvent::Done { truncated: false }]).boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn per_task_model_forwards_bound_options_and_engine_receipt() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let captured = calls.clone();
+        let tool = dummy().with_model_resolver(Some(Arc::new(move |id| Ok(TaskModelBinding {
+            registry_id: id.into(), provider_id: "account".into(), api_model: "api-model".into(),
+            provider: Arc::new(OptionsMock(captured.clone())),
+            chat_options: ChatOptions { max_tokens: Some(123), temperature: Some(0.25),
+                tool_choice: jeikcode_kernel::provider::ToolChoice::None, ..Default::default() },
+        }))));
+        let result = tool.execute(r#"{"tasks":[{"description":"d","prompt":"p","difficulty":"hard","model_id":"account/profile"}]}"#, &ctx()).await;
+        assert!(!result.is_error, "{}", result.content);
+        let options = calls.lock().unwrap();
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].max_tokens, Some(123));
+        assert_eq!(options[0].temperature, Some(0.25));
+        assert_eq!(options[0].tool_choice, jeikcode_kernel::provider::ToolChoice::None);
+        assert!(result.content.contains(r#""requested_model_id":"account/profile""#));
+        assert!(result.content.contains(r#""effective_api_model":"api-model""#));
+        assert!(result.content.contains(r#""remote_serving_identity":null"#));
     }
 
     #[test]
@@ -1749,6 +2066,7 @@ mod tests {
             prompt: "p".into(),
             subagent_type: ty.into(),
             difficulty: String::new(),
+            model_id: None,
             scope: scope.into_iter().map(String::from).collect(),
         };
         let tasks = vec![

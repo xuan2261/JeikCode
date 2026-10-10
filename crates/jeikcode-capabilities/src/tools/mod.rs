@@ -108,7 +108,7 @@ pub use report_finding::{Finding, ReportFindingTool};
 pub use search_replace::{GlobalSearchReplaceTool, SearchReplaceTool};
 pub use sensitive_path::{path_is_sensitive, references_sensitive_path, SensitivePathGate};
 pub use shell_route::{is_shell_tool_name, SHELL_TOOL_ALIASES, SHELL_TOOL_NAME};
-pub use task::TaskTool;
+pub use task::{valid_task_model_id, TaskModelBinding, TaskModelResolver, TaskTool};
 pub use todo::{
     bind_todowrite, is_todo_tool_name, todo_action_kind, TodoLive, TodoTool, TODO_TOOL_ALIASES,
     TODO_TOOL_NAME,

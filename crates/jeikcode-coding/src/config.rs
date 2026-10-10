@@ -235,6 +235,7 @@ pub struct CodingAgentConfig {
     pub subagent_fast_provider: Option<Arc<TierProvider>>,
     /// Swap-aware, lazily-built CAPABLE-tier provider (same contract as above).
     pub subagent_capable_provider: Option<Arc<TierProvider>>,
+    pub task_model_routing: Option<Arc<crate::provider_factory::TaskModelRouting>>,
     /// Tool-result fold threshold in bytes. `None` → built-in default
     /// (64 KiB); `Some(0)` disables folding entirely. Sourced from
     /// `[tools.tool_output] max_bytes` (config) / `JEIKCODE_TOOL_OUTPUT_THRESHOLD_BYTES` (env,
@@ -799,6 +800,7 @@ impl CodingAgentConfig {
             subagent_config: None,
             subagent_fast_provider: None,
             subagent_capable_provider: None,
+            task_model_routing: None,
             tool_output_max_bytes: None,
             tool_output_no_fold_tools: Vec::new(),
         }

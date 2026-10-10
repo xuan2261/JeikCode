@@ -255,6 +255,7 @@ pub fn derive_tier_config(
     tier.subagent_fast_provider = None;
     tier.subagent_capable_provider = None;
     tier.subagent_config = None;
+    tier.task_model_routing = None;
     tier
 }
 
@@ -304,6 +305,7 @@ pub fn derive_tier_config_from_resolved(
     tier.subagent_fast_provider = None;
     tier.subagent_capable_provider = None;
     tier.subagent_config = None;
+    tier.task_model_routing = None;
     tier
 }
 
@@ -345,11 +347,81 @@ pub fn resolve_subagent_tier_thunks(
     (thunk_for(&fast_key), thunk_for(&capable_key))
 }
 
+/// Shared admission resolver; each resolve clones one complete immutable generation.
+/// Running tasks retain their constructed provider across subsequent resets.
+pub struct TaskModelRouting {
+    generation: std::sync::Mutex<(Arc<dyn CodingProviderFactory>, CodingAgentConfig, jeikcode_config::config::Config)>,
+    session_id: std::sync::Mutex<Option<String>>,
+}
+
+impl TaskModelRouting {
+    fn snapshot_base(base: &CodingAgentConfig) -> CodingAgentConfig {
+        let mut base = base.clone();
+        base.task_model_routing = None;
+        base.subagent_fast_provider = None;
+        base.subagent_capable_provider = None;
+        base.subagent_config = None;
+        base
+    }
+
+    pub fn set_session_id(&self, id: &str) {
+        *self.session_id.lock().unwrap() = Some(id.to_string());
+    }
+
+    pub fn resolve(&self, id: &str) -> Result<jeikcode_capabilities::tools::TaskModelBinding, String> {
+        let (factory, base, registry) = self.generation.lock().unwrap().clone();
+        let (account_id, model_id) = id.split_once('/').ok_or("invalid qualified model ID")?;
+        if !jeikcode_capabilities::tools::valid_task_model_id(id) || model_id.is_empty() {
+            return Err("invalid qualified model ID".into());
+        }
+        // Exact catalog lookup only: never aliases, display names or default selection.
+        let profile = registry.logical_models().get(id).cloned().ok_or("unknown model ID")?;
+        if profile.account != account_id || !registry.logical_accounts().contains_key(account_id) {
+            return Err("invalid model provider account".into());
+        }
+        let accounts = registry.logical_accounts();
+        let account = accounts.get(account_id).ok_or("unknown provider account")?;
+        let preset_id = jeikcode_config::config::provider_preset::canonical_preset_id(&account.provider);
+        if jeikcode_config::config::provider_preset::preset(preset_id).is_none() {
+            return Err("unknown provider protocol".into());
+        }
+        let resolved = registry.resolve_model(Some(id)).map_err(|_| "model resolution failed")?;
+        if resolved.model.trim().is_empty() {
+            return Err("empty API model".into());
+        }
+        let mut task = derive_tier_config_from_resolved(&base, &resolved);
+        // Explicit cross-provider routes MUST NOT inherit parent auth or endpoint.
+        task.base_url = resolved.base_url.clone().ok_or("provider endpoint unavailable")?;
+        task.api_key = resolved.api_key.clone().unwrap_or_default();
+        // Do not carry coordinator sampling/tool-choice overrides across models.
+        task.chat_options = jeikcode_kernel::provider::ChatOptions {
+            max_tokens: resolved.max_tokens.map(|n| n as u32),
+            reasoning_effort: jeikcode_kernel::provider::ReasoningEffort::from_config(resolved.reasoning_effort.as_deref()),
+            ..Default::default()
+        };
+        let session_id = self.session_id.lock().unwrap().clone();
+        let provider = factory.build(&task, session_id.as_deref()).map_err(|_| "task provider construction failed")?;
+        if provider.model_name() != resolved.model {
+            return Err("task provider model binding mismatch".into());
+        }
+        Ok(jeikcode_capabilities::tools::TaskModelBinding {
+            registry_id: resolved.selection_id,
+            provider_id: resolved.account_id,
+            api_model: resolved.model,
+            provider,
+            chat_options: task.chat_options,
+        })
+    }
+}
+
 pub fn refresh_subagent_tiers(
     factory: Arc<dyn CodingProviderFactory>,
     coding: &CodingAgentConfig,
     config: &jeikcode_config::config::Config,
 ) {
+    if let Some(routing) = &coding.task_model_routing {
+        *routing.generation.lock().unwrap() = (factory.clone(), TaskModelRouting::snapshot_base(coding), config.clone());
+    }
     if coding.subagent_fast_provider.is_none() && coding.subagent_capable_provider.is_none() {
         return;
     }
@@ -367,17 +439,29 @@ pub fn install_subagent_tiers(
     coding: &mut CodingAgentConfig,
     config: &jeikcode_config::config::Config,
 ) {
+    coding.task_model_routing = Some(Arc::new(TaskModelRouting {
+        generation: std::sync::Mutex::new((factory.clone(), TaskModelRouting::snapshot_base(coding), config.clone())),
+        session_id: std::sync::Mutex::new(None),
+    }));
     let (fast, capable) = resolve_subagent_tier_thunks(factory, coding, &coding.model, config);
     coding.subagent_fast_provider = Some(TierProvider::new(fast));
     coding.subagent_capable_provider = Some(TierProvider::new(capable));
 }
 
 #[cfg(test)]
+#[path = "provider_factory_offline_acceptance.rs"]
+mod offline_acceptance;
+
+#[cfg(test)]
+#[path = "provider_factory_offline_transport.rs"]
+mod offline_transport;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn config(provider_type: &str) -> CodingAgentConfig {
+    pub(super) fn config(provider_type: &str) -> CodingAgentConfig {
         let mut cfg = CodingAgentConfig::new(
             "key",
             "http://localhost:11434/v1",
@@ -399,6 +483,133 @@ mod tests {
                 "provider type {kind}"
             );
         }
+    }
+
+    pub(super) struct RecordingFactory(pub(super) std::sync::Mutex<Vec<CodingAgentConfig>>);
+
+    struct NamedMock(String);
+    #[async_trait::async_trait]
+    impl LlmProvider for NamedMock {
+        fn model_name(&self) -> &str { &self.0 }
+        async fn chat_stream(&self, _: &[jeikcode_kernel::message::Message], _: &[jeikcode_kernel::tool::ToolDef], _: &jeikcode_kernel::provider::ChatOptions) -> Result<futures::stream::BoxStream<'static, jeikcode_kernel::stream::StreamEvent>, jeikcode_kernel::stream::ProviderError> {
+            use futures::StreamExt;
+            Ok(futures::stream::iter(vec![
+                jeikcode_kernel::stream::StreamEvent::TextDelta("offline fake runner response".into()),
+                jeikcode_kernel::stream::StreamEvent::Done { truncated: false },
+            ]).boxed())
+        }
+    }
+    impl CodingProviderFactory for RecordingFactory {
+        fn build(&self, cfg: &CodingAgentConfig, _: Option<&str>) -> Result<Arc<dyn LlmProvider>, ProviderBuildError> {
+            self.0.lock().unwrap().push(cfg.clone());
+            Ok(Arc::new(NamedMock(cfg.model.clone())))
+        }
+    }
+
+    pub(super) fn task_registry() -> jeikcode_config::config::Config {
+        let mut registry = jeikcode_config::config::Config::default();
+        registry.provider_accounts.insert("local8045".into(), serde_json::from_value(serde_json::json!({
+            "provider": "gemini-compatible", "base_url": "https://offline.invalid/v1", "api_key": "task-secret"
+        })).unwrap());
+        registry.models.insert("local8045/gemini".into(), serde_json::from_value(serde_json::json!({
+            "account": "local8045", "model": "gemini-api", "context_window": 32000, "max_tokens": 1234
+        })).unwrap());
+        registry
+    }
+
+    #[test]
+    fn per_task_model_binds_cross_provider_and_survives_refresh() {
+        let factory = Arc::new(RecordingFactory(std::sync::Mutex::new(Vec::new())));
+        let mut parent = config("responses");
+        let mut registry = task_registry();
+        install_subagent_tiers(factory.clone(), &mut parent, &registry);
+        let routing = parent.task_model_routing.clone().unwrap();
+        let bound = routing.resolve("local8045/gemini").unwrap();
+        assert_eq!(bound.provider_id, "local8045");
+        assert_eq!(bound.api_model, "gemini-api");
+        assert_eq!(bound.chat_options.max_tokens, Some(1234));
+        assert_eq!(parent.model, "model");
+        assert_eq!(parent.api_key, "key");
+        {
+            let calls = factory.0.lock().unwrap();
+            assert_eq!(calls[0].provider_type, "gemini");
+            assert_eq!(calls[0].api_key, "task-secret");
+            assert_eq!(calls[0].base_url, "https://offline.invalid/v1");
+            assert_eq!(calls[0].context_window, 32000);
+        }
+        registry.models.get_mut("local8045/gemini").unwrap().model = "changed-api".into();
+        refresh_subagent_tiers(factory.clone(), &parent, &registry);
+        assert_eq!(bound.provider.model_name(), "gemini-api");
+        assert_eq!(routing.resolve("local8045/gemini").unwrap().api_model, "changed-api");
+    }
+
+    #[test]
+    fn explicit_model_id_invalid_registry_never_constructs_provider() {
+        let factory = Arc::new(RecordingFactory(std::sync::Mutex::new(Vec::new())));
+        let mut parent = config("responses");
+        let mut registry = task_registry();
+        registry.models.get_mut("local8045/gemini").unwrap().account = "missing".into();
+        install_subagent_tiers(factory.clone(), &mut parent, &registry);
+        let routing = parent.task_model_routing.as_ref().unwrap();
+        for id in ["", " ", "gemini", "unknown/model", "local8045/gemini", "https://user:secret@host/model?key=x"] {
+            assert!(routing.resolve(id).is_err(), "{id}");
+        }
+        registry.models.get_mut("local8045/gemini").unwrap().account = "local8045".into();
+        registry.provider_accounts.get_mut("local8045").unwrap().provider = "bogus".into();
+        refresh_subagent_tiers(factory.clone(), &parent, &registry);
+        assert!(routing.resolve("local8045/gemini").is_err());
+        assert!(factory.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn per_task_model_registry_to_fake_runner_receipts_and_parent_invariance() {
+        use jeikcode_kernel::tool::{Tool, ToolContext, ToolRegistry, ProgressSink};
+        let factory = Arc::new(RecordingFactory(std::sync::Mutex::new(Vec::new())));
+        let mut parent = config("responses");
+        let mut registry = task_registry();
+        registry.provider_accounts.insert("gpt".into(), serde_json::from_value(serde_json::json!({
+            "provider": "openai", "base_url": "https://gpt.offline.invalid/v1", "api_key": "gpt-secret"
+        })).unwrap());
+        registry.models.insert("gpt/profile".into(), serde_json::from_value(serde_json::json!({
+            "account": "gpt", "model": "gpt-api"
+        })).unwrap());
+        parent.chat_options.temperature = Some(0.9);
+        install_subagent_tiers(factory.clone(), &mut parent, &registry);
+        let routing = parent.task_model_routing.clone().unwrap();
+        let tools = Arc::new(ToolRegistry::new());
+        let worker_tools = tools.clone();
+        let tool = jeikcode_capabilities::tools::TaskTool::new(
+            || panic!("explicit route must not select fast"),
+            || panic!("explicit route must not select capable"),
+            move || tools.mount(&[]), move || worker_tools.mount(&[]),
+        ).with_model_resolver(Some(Arc::new(move |id| routing.resolve(id))));
+        let dir = tempfile::tempdir().unwrap();
+        let context = ToolContext {
+            working_dir: dir.path().to_path_buf(), cancel: tokio_util::sync::CancellationToken::new(),
+            progress: ProgressSink::noop(), requester: None,
+        };
+        let result = tool.execute(r#"{"tasks":[
+            {"description":"Gemini","prompt":"offline","difficulty":"hard","model_id":"local8045/gemini"},
+            {"description":"GPT","prompt":"offline","model_id":"gpt/profile"},
+            {"description":"invalid","prompt":"offline","model_id":"unknown/model"}
+        ]}"#, &context).await;
+        assert!(!result.is_error, "{}", result.content);
+        for value in [r#""effective_api_model":"gemini-api""#, r#""provider_id":"local8045""#,
+            r#""effective_api_model":"gpt-api""#, r#""status":"unresolved""#] {
+            assert!(result.content.contains(value), "{}", result.content);
+        }
+        assert!(!result.content.contains("secret"));
+        assert!(!result.content.contains("offline.invalid"));
+        let calls = factory.0.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].provider_type, "gemini");
+        assert_eq!(calls[0].api_key, "task-secret");
+        assert_eq!(calls[1].api_key, "gpt-secret");
+        assert_eq!(calls[0].chat_options.temperature, None);
+        assert_eq!(parent.api_key, "key");
+        assert_eq!(parent.model, "model");
+        assert_eq!(parent.provider_type, "responses");
+        assert_eq!(parent.chat_options.temperature, Some(0.9));
     }
 
     #[test]

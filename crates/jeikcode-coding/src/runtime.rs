@@ -4108,6 +4108,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             .clone()
                             .or_else(|| runtime.config.subagent_config.clone());
                         next.subagent_config = routing.clone();
+                        next.task_model_routing = runtime.config.task_model_routing.clone();
                         next.subagent_fast_provider = runtime.config.subagent_fast_provider.clone();
                         next.subagent_capable_provider =
                             runtime.config.subagent_capable_provider.clone();
@@ -8200,6 +8201,10 @@ mod tests {
             "failed reload must leave the live runtime's tier cache and routing intact"
         );
         runtime.handle.shutdown().await.unwrap();
+    }
+
+    mod offline_integration {
+        include!("runtime_offline_integration.rs");
     }
 
     fn native_start(fail_provider: bool) -> CodingRuntimeStart {

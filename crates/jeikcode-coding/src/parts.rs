@@ -461,6 +461,9 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                     .ok()
                     .as_deref(),
             );
+            let explicit_resolver = cfg.task_model_routing.clone().map(|routing| {
+                Arc::new(move |id: &str| routing.resolve(id)) as jeikcode_capabilities::tools::TaskModelResolver
+            });
             registry.register(Arc::new(
                 TaskTool::new(
                     make_fast,
@@ -468,6 +471,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                     make_explore_tools,
                     make_worker_tools,
                 )
+                .with_model_resolver(explicit_resolver)
                 .with_max_concurrent(max_concurrent)
                 .with_max_rounds(max_rounds)
                 .with_tool_loop_policy(cfg.tool_loop_policy)
@@ -1581,6 +1585,9 @@ pub fn assemble(
         // conversation — otherwise each session-less child is a distinct window and GLM-5.2's
         // multi-window guard serializes the strong-tier subtasks. (Single-model users already
         // reuse the host provider, which the kernel binds with this id, so they're unaffected.)
+        if let Some(routing) = &cfg.task_model_routing {
+            routing.set_session_id(&b.id);
+        }
         if let Some(cell) = &cfg.subagent_fast_provider {
             cell.set_session_id(&b.id);
         }
