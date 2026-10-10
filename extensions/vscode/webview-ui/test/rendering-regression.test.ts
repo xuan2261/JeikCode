@@ -1152,9 +1152,38 @@ function testMarkdownTableInsertsMissingDelimiter() {
   assert.match(html, /<\/table>\s*<p>后续内容<\/p>/);
 }
 
+// Stream bridge behavior belongs to ChatProvider, not the App composition shell.
+const sourceStringChatProvider = readFileSync(
+  join(process.cwd(), 'webview-ui/src/state/ChatProvider.tsx'),
+  'utf8',
+);
+
+function testChatProviderPreservesTerminalAndIdleProtections() {
+  const done = sourceStringChatProvider.match(/case 'done':([\s\S]*?)case 'stopped':/)?.[1];
+  assert.ok(done, 'ChatProvider must own the done bridge');
+  assert.match(done, /markStreamActivity\(\)/);
+  assert.match(done, /msg\.stopReason && msg\.stopReason !== 'stopped'/);
+  assert.match(done, /type: 'STREAM_WARNING'/);
+  assert.match(done, /type: 'GENERATION_DONE', tokens: msg\.tokens/);
+  assert.match(done, /if \(msg\.sessionId\)/);
+  assert.match(done, /type: 'SET_ACTIVE_SESSION', sessionId: msg\.sessionId/);
+
+  const idle = sourceStringChatProvider.match(/const timer = window\.setInterval\(([\s\S]*?)\}, 1000\)/)?.[1];
+  assert.ok(idle, 'ChatProvider must own the idle timer');
+  assert.match(idle, /shouldShowIdleNotice/);
+  assert.match(idle, /isGenerating: stateRef\.current\.isGenerating/);
+  assert.match(idle, /lastEventAt: lastStreamEventAtRef\.current/);
+  assert.match(idle, /thresholdMs: 15_000/);
+  assert.match(idle, /alreadyShown: idleNoticeShownRef\.current/);
+  assert.match(idle, /idleNoticeShownRef\.current = true/);
+  assert.match(idle, /type: 'STREAM_IDLE_NOTICE'/);
+  assert.match(sourceStringChatProvider, /return \(\) => window\.clearInterval\(timer\)/);
+  assert.match(sourceStringChatProvider, /return \(\) => window\.removeEventListener\('message', handleMessage\)/);
+}
+
 function testGenerationDoneReloadsFinishedSessionHistory() {
   const source = readFileSync(join(process.cwd(), 'src/chat/provider.ts'), 'utf8');
-  const onDone = source.match(/onDone:\s*\([^)]*\)\s*=>\s*\{[\s\S]*?\n\s*\},\n\s*onStopped:/)?.[0] ?? '';
+  const onDone = source.match(/onDone:\s*\([^)]*\)\s*=>\s*\{[\s\S]*?\r?\n\s*\},\r?\n\s*onStopped:/)?.[0] ?? '';
 
   assert.match(onDone, /const doneSessionId = sessionId \|\| streamSessionId/);
   assert.match(onDone, /this\._reloadFinishedSessionHistory\(doneSessionId, streamGeneration\)/);
@@ -1219,6 +1248,7 @@ testMarkdownTableRepairDoesNotChangeHtmlBlocks();
 testMarkdownTableRepairKeepsMarkedOneColumnRows();
 testMarkdownTableRepairsSingleColumnDelimiter();
 testMarkdownTableInsertsMissingDelimiter();
+testChatProviderPreservesTerminalAndIdleProtections();
 testGenerationDoneReloadsFinishedSessionHistory();
 testLogoutRequiresSetupOnlyForLoginDependentProvider();
 testToolDurationFormattingUsesMillisecondsBelowOneSecond();
