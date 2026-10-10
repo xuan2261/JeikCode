@@ -2,7 +2,6 @@
 // and a model; the desktop window previously opened a blank chat.
 
 import { useState } from 'preact/hooks';
-import { postLanguage } from '../api';
 import { Lang } from '../i18n';
 import { useSettings } from '../settings';
 
@@ -33,24 +32,41 @@ export function OnboardingWizard({
 }) {
   const { lang, setLang, t } = useSettings();
   const [step, setStep] = useState<1 | 2>(1);
-  const [choice, setChoice] = useState<Lang>(lang === 'zh' ? 'zh' : 'en');
+  const [choice, setChoice] = useState<Lang>(lang);
   const [saving, setSaving] = useState(false);
+  const [saveFailed, setSaveFailed] = useState(false);
 
   function finish() {
     markOnboardingDone();
     onClose();
   }
 
-  async function next() {
+  async function chooseLang(next: Lang) {
+    if (saving) return;
+    setChoice(next);
     setSaving(true);
-    setLang(choice);
+    setSaveFailed(false);
     try {
-      await postLanguage(choice);
+      await setLang(next);
     } catch {
-      /* the settings store already retries on later toggles */
+      setSaveFailed(true);
+    } finally {
+      setSaving(false);
     }
-    setSaving(false);
-    setStep(2);
+  }
+
+  async function next() {
+    if (saving) return;
+    setSaving(true);
+    setSaveFailed(false);
+    try {
+      await setLang(choice);
+      setStep(2);
+    } catch {
+      setSaveFailed(true);
+    } finally {
+      setSaving(false);
+    }
   }
 
   return (
@@ -66,18 +82,21 @@ export function OnboardingWizard({
               <button
                 type="button"
                 class={'onboarding-lang' + (choice === 'en' ? ' active' : '')}
-                onClick={() => setChoice('en')}
+                disabled={saving}
+                onClick={() => void chooseLang('en')}
               >
                 {t('onboarding.langEn')}
               </button>
               <button
                 type="button"
                 class={'onboarding-lang' + (choice === 'zh' ? ' active' : '')}
-                onClick={() => setChoice('zh')}
+                disabled={saving}
+                onClick={() => void chooseLang('zh')}
               >
                 {t('onboarding.langZh')}
               </button>
             </div>
+            {saveFailed && <p role="alert">{t('settings.languageSaveFailed')}</p>}
           </div>
         ) : (
           <div class="modal-body onboarding-body">

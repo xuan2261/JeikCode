@@ -166,10 +166,25 @@ export function ThemeDialog({ onClose }: { onClose: () => void }) {
 
 export function LanguageDialog({ onClose }: { onClose: () => void }) {
   const { lang, setLang, t } = useSettings();
+  const [saving, setSaving] = useState(false);
+  const [saveFailed, setSaveFailed] = useState(false);
   const options: { value: Lang; label: string }[] = [
     { value: 'zh', label: '中文' },
     { value: 'en', label: 'English' },
   ];
+
+  async function chooseLang(next: Lang) {
+    if (saving) return;
+    setSaving(true);
+    setSaveFailed(false);
+    try {
+      await setLang(next);
+    } catch {
+      setSaveFailed(true);
+    } finally {
+      setSaving(false);
+    }
+  }
   return (
     <SettingsModal title={t('settings.menuLang')} onClose={onClose}>
       <div class="field-group">
@@ -179,7 +194,8 @@ export function LanguageDialog({ onClose }: { onClose: () => void }) {
             <button
               key={o.value}
               class={'segmented-btn' + (lang === o.value ? ' active' : '')}
-              onClick={() => setLang(o.value)}
+              onClick={() => void chooseLang(o.value)}
+              disabled={saving}
               type="button"
             >
               {o.label}
@@ -187,6 +203,7 @@ export function LanguageDialog({ onClose }: { onClose: () => void }) {
           ))}
         </div>
       </div>
+      {saveFailed && <p role="alert">{t('settings.languageSaveFailed')}</p>}
     </SettingsModal>
   );
 }

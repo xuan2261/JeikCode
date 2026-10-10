@@ -3,9 +3,10 @@
 // {placeholder} interpolation against the i18n catalog.
 
 import { createContext, ComponentChildren } from 'preact';
-import { useContext, useEffect, useState } from 'preact/hooks';
+import { useContext, useEffect, useState, useRef } from 'preact/hooks';
 import { messages, Lang, MsgKey } from './i18n';
 import { getConfig, postLanguage } from './api';
+import { createLanguageSaveQueue } from './lib/languageSaveQueue';
 
 export type Theme = 'light' | 'dark' | 'system';
 
@@ -18,7 +19,7 @@ interface SettingsCtx {
   theme: Theme;
   setTheme: (t: Theme) => void;
   lang: Lang;
-  setLang: (l: Lang) => void;
+  setLang: (l: Lang) => Promise<void>;
   t: (key: MsgKey, params?: TParams) => string;
 }
 
@@ -60,13 +61,14 @@ function normalizeServerLang(value: string | undefined): Lang | null {
 export function SettingsProvider({ children }: { children: ComponentChildren }) {
   const [theme, setThemeState] = useState<Theme>(readTheme);
   const [lang, setLangState] = useState<Lang>(readLang);
+  const languageSaves = useRef(createLanguageSaveQueue<Lang>(postLanguage));
 
   // The config file is the global switch. A missing choice stays English.
   useEffect(() => {
     let cancelled = false;
     getConfig()
       .then((cfg) => {
-        if (cancelled) return;
+        if (cancelled || languageSaves.current.hasSelection()) return;
         const next = normalizeServerLang(cfg.language);
         if (next) setLangState(next);
       })
@@ -76,9 +78,12 @@ export function SettingsProvider({ children }: { children: ComponentChildren }) 
     };
   }, []);
 
-  function setLang(next: Lang) {
+  function setLang(next: Lang): Promise<void> {
+    // Preserve the user's local choice even if persistence fails; callers must
+    // report the failure and can retry the same choice. Never roll back a newer
+    // selection because an earlier save failed.
     setLangState(next);
-    void postLanguage(next).catch(() => {});
+    return languageSaves.current.save(next);
   }
 
   // Apply theme to <html data-theme>; theme.css keys light/dark off this.
@@ -92,7 +97,7 @@ export function SettingsProvider({ children }: { children: ComponentChildren }) 
   }, [theme]);
 
   useEffect(() => {
-    document.documentElement.setAttribute('lang', lang === 'zh' ? 'zh-CN' : 'en');
+    document.documentElement.setAttribute('lang', lang === 'zh' ? 'zh-CN' : lang);
     try {
       localStorage.setItem(LANG_KEY, lang);
     } catch {
