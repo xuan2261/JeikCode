@@ -75,7 +75,34 @@ cargo build --release --bin jeikcode
 
 ### 2. 极致简化的“纯打 Tag 发版”闭环 (Zero-Manual-Effort)
 
-**不用手改** `Cargo.toml`、`Cargo.lock`、安装脚本、README 徽章或 `latest.json`。发版前按**中英文双语分段模板**在 `CHANGELOG.md` 编写更新说明并同步至 README（见 `AGENTS.md` 6.3），再打 Tag：
+Do not manually change `Cargo.toml`, `Cargo.lock`, installer scripts, README
+badges, or `latest.json` just to release a version. This guide owns release-note
+formatting and README synchronization; prepare them before creating the tag.
+
+#### Release preparation and authorization
+
+- Stable releases use `vX.Y.Z` tags from `main`. Confirm that the release commit
+  belongs to the up-to-date remote `main` history before tagging. The workflow's
+  `v*` trigger does not itself prove branch ancestry; deterministic ancestry
+  enforcement is recommended, not provided by this documentation change.
+- Prepend `## vX.Y.Z (YYYY-MM-DD)` to `CHANGELOG.md`. Use the template below:
+  complete English section, a standalone `---`, then the complete Chinese
+  section. Keep technical detail, implementation, and verification in each
+  language; report only verification actually performed. The pipeline owns
+  the English installation links above the notes; do not duplicate them.
+- For stable releases, synchronize the Changelog section immediately before
+  License in `README.md` and `README.en.md` with the English notes, and in
+  `README.zh-CN.md` with the Chinese notes. Keep only the latest two versions
+  there, with links to [CHANGELOG.md](../CHANGELOG.md) and
+  [GitHub Releases](https://github.com/jeikl/JeikCode/releases).
+- For prerelease tags containing `-` (for example, `vX.Y.Z-beta.1`), update only
+  `CHANGELOG.md`; do not rotate README release summaries. Prereleases do not
+  replace `releases/latest`.
+- Commit, push, and tag only within the user's authorized scope. Follow the
+  repository's commit and co-authorship rules, push the prepared release to
+  `origin/main`, and ensure the worktree is clean before tagging. Do not discard
+  unrelated work to obtain a clean worktree. This procedure grants no additional
+  permission to publish.
 
 #### 标准更新日志模板（英文讲完一整段，分割线 `---`，讲中文）：
 ```markdown
@@ -94,14 +121,15 @@ cargo build --release --bin jeikcode
   - **验证与交付**: 运行的单元测试与端到端验证...
 ```
 
-#### 执行发版推送：
-```bash
-# 1. 确保当前代码已推送到远程主干 main
-git push origin main
+#### Authorized release push
 
-# 2. 打上新版本 Tag 并推送到 GitHub（即可触发全自动化发布流水线！）
-git tag v7.0.2
-git push origin v7.0.2
+Replace `vX.Y.Z` with the intended version only after completing the preparation
+and authorization checks above:
+
+```bash
+git push origin main
+git tag vX.Y.Z
+git push origin vX.Y.Z
 ```
 
 #### 流水线在云端自动完成的全部闭环工作：
@@ -118,7 +146,7 @@ git push origin v7.0.2
    - **不**修改 `Cargo.toml`、锁文件、README，也**不**再推送 `chore(release)`。下游分支不会因为发版而落后 `main`。
    - 带 `-` 的 Tag 标为 prerelease，不占 `releases/latest`。
 
-> **打 Tag 之前**：按 `AGENTS.md` 6.3 写好 `CHANGELOG.md`，稳定版同步 README 更新说明并推到 `main`。流水线不会再改这些文件，也不会为清单往 `main` 追加提交。
+> The pipeline does not prepare or commit release documentation for you, and it does not append manifest-update commits to `main`.
 
 ---
 
