@@ -58,7 +58,23 @@ CLI / TUI / daemon / background / ACP / clix
 
 ## 4. 验证与交付
 
-- 修改过程中优先运行单元测试；涉及多 crate 或公共协议变更时运行 `cargo check --workspace`；
+### CI-first — Builds, tests, and disk usage
+
+- MUST prefer existing GitHub Actions workflows for broad builds/tests,
+  cross-platform validation, and packaging. Do not run them locally by default.
+- MUST verify that CI results match the exact commit SHA and cover the changes;
+  results from an older commit do not validate newer code.
+- Limit local checks to the minimum needed to reproduce a bug, validate unpushed
+  changes, or smoke-test behavior that requires the local environment.
+  Before a heavy local build, MUST explain why CI cannot meet the requirement.
+- MUST NOT repeat local builds/tests for the same scope already validated by CI
+  at the same commit unless there is a concrete reason.
+- MUST NOT commit/push work in progress solely to trigger CI without authorization;
+  respect the authorized scope for commits, pushes, and target branches.
+- When running a built product, prefer downloading the binary/artifact for the
+  required commit and platform; do not download Cargo target directories/caches.
+- If CI is unavailable or lacks required checks, MUST report what remains
+  unverified; do not claim that verification is complete.
 - 修改提示词、配置项或文档时，必须核对 `teaches/` 与实现代码的一致性。
 
 ---
