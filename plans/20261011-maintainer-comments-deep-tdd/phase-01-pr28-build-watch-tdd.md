@@ -1,6 +1,7 @@
 # Phase 01 — PR #28: cheap build-script Git watches (RED/GREEN)
 
-**Status:** ready for RED test; implementation not yet verified.
+**Status:** FORK_VERIFIED at published PR head
+`923507e77fbddb23213e126558fce7b626b4d1eb`; upstream integration blocked.
 
 ## Source and ownership
 
@@ -66,7 +67,7 @@ Minimum actual source:
   (build-time dirty identity). Actual default directives watched tracked
   `docs/guide.md` and `webui/app.ts` and omitted the opt-in env watcher.
 - GREEN: minimally gate tracked watches and env directive; rerun the exact test.
-- **Observed GREEN in the isolated uncommitted PR28 worktree:** all six
+- **Observed GREEN in the isolated PR28 candidate:** all six
   tests **6/6 PASS after strengthening assertions to compare the entire
   `git ls-files -z` tracked set** in default and opt-in modes;
   `isolated_git_env` strips inherited Git overrides, disables host
@@ -77,14 +78,42 @@ Minimum actual source:
 - **Durable hosted test gate added:** `.github/workflows/portability.yml`
   runs the hermetic watcher harness in the Ubuntu/Windows/macOS native
   matrix **after existing native regression and check** and uploads
-  `build-watch-test.log` even on failure. Exact commit-SHA CI evidence
-  must still be collected before calling the change fork-verified.
+  `build-watch-test.log` even on failure.
 - **Observed repo-wide `cargo fmt -- --check` nonzero:** it reports an
   existing formatting difference in `crates/jeikcode-daemon/src/lib.rs`
   around line 10309. That file is byte-identical to the immutable PR28
   published source (Git blob `b45830501a619647f70a940fe281c6093b595fc0`)
   and is outside this fix. Do not silently reformat it. Workspace-wide
   `cargo clippy --workspace --all-targets` is still NOT YET VERIFIED.
+
+## Exact published acceptance — 2026-10-12 checkpoint
+
+- Nonforce fast-forward of the existing fork PR branch
+  `feat/community-self-repair-mvp` from `5c9ff20...` to
+  `923507e77fbddb23213e126558fce7b626b4d1eb` verified by remote SHA.
+  The unrelated locally ahead `edfbff1` worktree was preserved.
+- [Fork CI 38176328221](https://github.com/xuan2261/JeikCode/actions/runs/38176328221):
+  exact head, **5/5 SUCCESS**, including workspace Rust check.
+- [Fork Portability 38176330751](https://github.com/xuan2261/JeikCode/actions/runs/38176330751):
+  exact head, **10/10 SUCCESS**. The actual build-watch Python harness ran
+  **6/6 PASS** on Ubuntu, macOS and Windows. Native regression tests and
+  native cargo checks ran before the new test step in each OS job.
+- [Fork Self-repair Acceptance 38176290753](https://github.com/xuan2261/JeikCode/actions/runs/38176290753):
+  exact head, **linux-sandbox SUCCESS**. Real Linux sandbox acceptance ran
+  4 tests, 0 failed/ignored. CLI repair, build identity, capability/skill,
+  auth/daemon and WebUI gates completed; separately reported pre-existing
+  ignored tests in other targeted library commands remain ignored rather
+  than being relabeled as executed.
+- [Upstream PR #28](https://github.com/jeikl/JeikCode/pull/28)
+  remains open and **CONFLICTING** against advanced beta; this suppresses
+  upstream `pull_request` runs. The maintainer explicitly offered to
+  retarget/integrate the old PR after the watcher fix. Therefore
+  **do not rebase/force-push**; successful exact-head fork checks do not prove
+  the eventual merge commit or constitute approving review.
+- The optional workflow question is answered by current source scope:
+  `self-repair-acceptance.yml` intentionally retains fork-feature-branch
+  `[repair-acceptance]` push and manual dispatch; no expensive beta push
+  trigger was enabled. Repository-wide clippy has not been executed.
 - REFACTOR: check temporary repo/worktree cleanup, path escaping, non-dir
   watches, detached-head case, `git diff --check` and scoped rustfmt.
 - Hosted correctness: prioritize exact SHA PR CI/portability; full fmt/clippy
@@ -95,7 +124,8 @@ Minimum actual source:
 
 ## Exit and prohibited actions
 
-Exit requires actual RED→GREEN fixture evidence, independent source review,
-correct source+docs/teaches contracts, and exact final candidate CI. Maintain
-the published PR's ancestry and attribution. No rebase, force-push, release,
-or pretending that the user's locally ahead `edfbff1` was delivered.
+The fork milestone's RED→GREEN, independent source review and exact-head
+hosted CI/Portability/real sandbox verification are complete. Upstream
+integration and independent maintainer approval remain external gates.
+Maintain the published PR's ancestry and attribution. No rebase, force-push,
+release, or pretending that the locally ahead `edfbff1` was delivered.

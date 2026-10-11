@@ -1,6 +1,8 @@
 # Phase 03 — PR #31: investigate the four residual replay gaps
 
 **Status:** current-beta reproduction required; old PR will not merge as-is.
+For D, a source-only audit on `fdf655f200185b7516b60b0fc84fb151ccbd9236`
+confirms absent canonical ID enforcement; a real TDD RED is still required.
 
 ## Authority
 
@@ -52,6 +54,17 @@ make stale cards actionable.
 
 ### D — Canonical history mutation reconciliation barrier
 
+**SOURCE-PROVEN / RED NOT YET VERIFIED**, not a completed fix.
+On upstream beta `fdf655f20`, `crates/jeikcode-daemon/src/lib.rs`
+`resolve_target_message_index` (around 5221–5365) still ignores the
+existing request-side `expected_message_id`/`target_message_id` fields.
+Patch/delete/truncate call sites around 5416/5530/5677 resolve by index,
+role and fuzzy text, then only echo supplied IDs into events.
+`webui/src/components/Chat.tsx` already hydrates `Message.id`, while
+outbound mutation call sites around 6980–7225 still omit it. These paths
+were independently inspected on immutable `fdf655f20`; do not interpret
+the source finding as an executed RED test.
+
 Interleave two sessions, delayed GET and SSE with raw/filtered history
 indices, same-text duplicate messages and hidden system/tool payloads.
 Mutation route must target a stable canonical identity: mismatched
@@ -63,6 +76,12 @@ before introducing a new view-generation or index-mapping protocol.
 public-contract architecture decision only if the existing identity and lease
 contracts cannot close a proven race. Preserve all
 patch/delete-agent/delete-turn/truncate and subsequent submit tests.
+Companion WebUI tests must also ensure identity mismatch or
+`notFound:true` responses do not perform optimistic local deletion or
+truncation. Prefer authoritative ID resolution using existing request
+fields, preserving legacy index/text fallback **only when no stable ID was
+provided**. Do not introduce a new revision/schema field merely to fix
+this source-proven identity hole.
 
 ## Execution / go-no-go per item
 
