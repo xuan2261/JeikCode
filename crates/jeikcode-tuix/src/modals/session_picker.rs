@@ -1788,6 +1788,12 @@ mod tests {
     fn replay_ignores_accounting_only_turn_positions() {
         use jeikcode_kernel::message::Message;
 
+        // The replay labels are localized by process-global i18n state.
+        // Other tests may switch language concurrently, so serialize and
+        // restore the previous locale before asserting English-only labels.
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+
         #[derive(Default)]
         struct Rec {
             lines: Vec<UiLine>,
@@ -1806,6 +1812,9 @@ mod tests {
         }
 
         let mut session = Session::new(PathBuf::from("/tmp/x"));
+        // A session title can legitimately contain digits from an unrelated
+        // accounting-only statistic; force this boundary deterministically.
+        session.name = "session-987-fixture".into();
         session.messages = vec![
             Message::user("q1"),
             Message::assistant("a1", vec![]),
@@ -1848,8 +1857,28 @@ mod tests {
             })
             .collect();
         assert!(
-            labels.iter().all(|label| !label.contains("987")),
-            "accounting-only stat leaked into replay divider: {labels:?}"
+            labels
+                .iter()
+                .any(|label| label.contains("resumed: session-987-fixture")),
+            "regression fixture must prove session metadata can contain the accounting sentinel"
+        );
+        // Only a Done/usage divider can leak a TurnStat token count. A
+        // resumed-session title is also a TurnSeparator but is not accounting.
+        let accounting_labels: Vec<&str> = labels
+            .iter()
+            .copied()
+            .filter(|label| label.starts_with("✓ Done ·") && label.contains(" tokens"))
+            .collect();
+        assert_eq!(
+            accounting_labels.len(),
+            1,
+            "expected exactly one accounting divider: {labels:?}"
+        );
+        assert!(
+            accounting_labels
+                .iter()
+                .all(|label| !label.contains("987") && label.contains("77 tokens")),
+            "accounting-only stat leaked into replay divider: {accounting_labels:?}"
         );
         let context = state.last_context.as_ref().expect("valid context restored");
         assert_eq!(context.sent_tokens, 77);
