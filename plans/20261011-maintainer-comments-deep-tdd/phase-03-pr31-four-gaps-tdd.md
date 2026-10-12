@@ -19,6 +19,84 @@ HTTP smoke prove that branch, **not** necessity of moving its design to beta.
 
 ## Four isolated TDD investigations
 
+### Executed verification of existing PR #31-D WIP — 2026-10-12
+
+This is **LOCAL WIP TESTED**, not `FORK_VERIFIED`, integration or public
+contract approval. It supplements the earlier source-only discovery. The
+worktree `C:/Work/JeikCode/.worktrees/m05-canonical-history-id-20261012`
+remains on immutable HEAD
+`e53c0d28bc9e5710b23cbe35cbccbde1e81a984a`, with **staged plus
+unstaged changes** in daemon, WebUI, workflow and test files. The unrelated
+`extensions/jetbrains/gradlew.bat` line-ending difference remains
+untouched. Current upstream `beta` is still
+`acf6c35ad2ed156ce1638e77b39729c23bb3eb82`, two commits ahead;
+the WIP has **not** been integrated or pushed at a new SHA.
+
+Targeted native and lightweight test evidence on Windows / Rust 1.93.0 /
+Node 22.22.0, with an isolated temporary `JEIKCODE_HOME` and locked Cargo
+dependencies:
+
+| Command | Observed result | What it actually proves |
+| --- | --- | --- |
+| `python scripts/test_history_message_identity.py` | **6/6 PASS**, exit 0 | Hermetic Rustc harness compiles and exercises the production daemon resolver function with test-only type stubs |
+| `cd webui; node --test src/api.test.ts src/lib/historyMessages.test.ts src/lib/sessionCache.test.ts` | **40/40 PASS**, exit 0, 0 skipped | API receipt/ID forwarding, history target-selection and L1/L2 cache invalidation assertions |
+| `cargo test -p jeikcode-daemon --lib resolve_target_message_index --locked -- --nocapture` | **2/2 PASS**, exit 0, 398 filtered | Real native kernel message types: reasoning/text compatibility and unique canonical ID targeting |
+| `cargo test -p jeikcode-daemon --lib canonical_history_mutation_handlers --locked -- --nocapture` | **1/1 PASS**, exit 0, 399 filtered, native test body 0.13 seconds | Actual in-process daemon PATCH/DELETE/TRUNCATE handlers over a persisted native snapshot; confirms stable ID matching, wrong-ID reject and mutation event targeting |
+
+The daemon command rebuilt the unpushed test candidate locally because
+hosted CI could not yet exercise an uncommitted branch. The first local
+compilation ended in 2m50s with nonfatal existing warnings. These are
+**Windows-local**, not Linux/macOS or exact-head hosted CI results. The
+native test is an in-process handler/persistence test, not an independent
+running-daemon HTTP/browser acceptance test.
+
+This dirty working-tree source snapshot has these SHA-256 anchors,
+independently useful until WIP changes:
+
+```text
+crates/jeikcode-daemon/src/lib.rs    f3afd86b82c3de2bbd3b2fa689227c86dafa6248829d69e2585b9ab6eb1d7aea
+scripts/test_history_message_identity.py    a779566183a8e55d6e972125801d9a590d70816ab0fb39825b18a29004ab54da
+webui/src/api.ts    75291819d3f773923b38aa597417e8ea9d997444a3061173e747fdf1e638ac06
+webui/src/components/Chat.tsx    9f347f1db7313d0e13e26aa9b8f3d1477940e51ef7fef022f656163b87c113d1
+webui/src/lib/historyMessages.ts    ce72b595dfbca9f03861d973643c8d80a0a1f27a6e89f610cb70f2e6209474a3
+webui/src/lib/sessionCache.ts    ab4bf5d26556aec8eeeb245e761bbd61898360b6c2db3019142afed3bf1d9aeb
+```
+
+**Independent strict read-only review — NO GO for beta.4 integration**
+(no Critical; two Important items):
+
+1. **Beta cursor preservation is a blocking integration gap.** Upstream
+   commit `5493cfa30` introduces per-session `after_seq` resume cursors
+   and part-identity/idempotent canvas reconciliation. The e53c-based
+   WIP `webui/src/api.ts` and `Chat.tsx` do not contain those semantics.
+   A future integration must start from `acf6c35`'s Chat/API/session
+   projection and layer the WIP ID/tombstone logic **without reverting** the
+   new stream cursor, and clear the relevant normal/sync cursors on
+   patch/delete/truncate in both active and background sessions. Do not
+   resolve by blindly overwriting the upstream Chat file.
+2. **Atomic history mutation is an acknowledged data-loss boundary.**
+   PATCH/DELETE/TRUNCATE still load snapshots outside a session-wide
+   read-modify-write lock and only serialize final `save_snapshot`.
+   Concurrent handlers can overwrite or resurrect each other's changes.
+   The handlers also currently ignore a `false` return from bounded
+   `stop_and_wait`, which means a prior active turn may still be
+   persisting. This is a **pre-existing**, explicitly excluded contract,
+   not repaired by ID-based targeting. Before claiming full data integrity,
+   obtain the maintainer's atomicity decision and a deterministic RED test.
+
+The same review found the current strong-ID resolver and native handler
+targeting internally sound and no new Important issue in the
+IndexedDB/tombstone fences. First-party WebUI now rejects 200
+`{success:true,notFound:true}` no-op receipts; daemon delete/truncate still
+emit that old ambiguous shape, which remains public-HTTP debt rather than
+evidence of successful mutation.
+
+**Remaining gates:** beta.4 cursor-preserving integration and re-review;
+targeted TypeScript and package-lock-aligned WebUI verification; a
+coordinated decision on atomic mutation and active-turn persistence; then
+fork commit/push and exact-SHA CI/portability only when the candidate is
+coherent. No full workflow/matrix/native-installed proof exists for this WIP.
+
 ### A — Atomic `/live` join / `through_sequence` / `replay_gap`
 
 First reproduce a **consumer-observable** loss, duplication or identity

@@ -5,6 +5,10 @@ design and cross-platform GREEN are **NOT YET VERIFIED**.
 
 ## Executed RED evidence — 2026-10-12
 
+The separate [ownership/lifecycle decision proposal](phase-02-pr30-owner-lifecycle-decision.md)
+records the proposed safe acceptance contract and the four maintainer
+decisions needed before any production implementation.
+
 **Outcome:** the current global LRU can delete an unrelated file solely
 because its name matches the JeikCode background-log prefix. This is a proven
 ownership-selection defect in the existing upstream implementation, separate
