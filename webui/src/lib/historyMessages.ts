@@ -1,5 +1,58 @@
 import type { SessionMessage } from '../api';
 
+/**
+ * A history DELETE uses a 200 + notFound receipt for stale targets.
+ * Neither that no-op nor a failed request authorizes an optimistic canvas or
+ * cache removal. The caller's view generation also must remain unchanged:
+ * a response for session A can arrive after the user switches to B (or A→B→A).
+ *
+ * Returning false means nothing was changed locally. The caller is responsible
+ * for any later authoritative reload of a session successfully changed offscreen.
+ */
+export async function applyConfirmedHistoryDelete(
+  deleteRemote: () => Promise<{ success: boolean; notFound?: boolean }>,
+  isCurrentView: () => boolean,
+  applyLocal: () => void,
+): Promise<boolean> {
+  if (!isCurrentView()) return false;
+  const receipt = await deleteRemote();
+  if (receipt.success !== true || receipt.notFound === true) {
+    throw new Error('History deletion was not applied');
+  }
+  if (!isCurrentView()) return false;
+  applyLocal();
+  return true;
+}
+
+/**
+ * The daemon can broadcast session_mutation before the initiating DELETE HTTP
+ * response resolves. If SSE already removed the assistant, a captured render
+ * index now points at the following row. Only remove the original source row;
+ * never fall back to the old display position or remove an ambiguous match.
+ */
+export function removeAssistantHistoryBySourceIndex<T extends { sourceIndex?: number; role: string; id?: string }>(
+  messages: readonly T[],
+  sourceIndex: number | undefined,
+  expectedMessage: T | undefined,
+): T[] | null {
+  if (sourceIndex == null || !expectedMessage || expectedMessage.role !== 'assistant') return null;
+  let found = -1;
+  for (let i = 0; i < messages.length; i += 1) {
+    if (messages[i]?.sourceIndex === sourceIndex && messages[i]?.role === 'assistant') {
+      if (found !== -1) return null;
+      // After SSE or canonical reload, a *different* assistant may inherit an
+      // old source index. Stable message IDs win; legacy ID-less rows must
+      // still be the original in-memory object, never a new same-index row.
+      if (expectedMessage.id != null
+        ? messages[i]?.id !== expectedMessage.id
+        : messages[i] !== expectedMessage) return null;
+      found = i;
+    }
+  }
+  if (found === -1) return null;
+  return [...messages.slice(0, found), ...messages.slice(found + 1)];
+}
+
 const INTERNAL_USER_PREFIXES = [
   '<system-reminder>',
   'You made code edits but have not verified them.',

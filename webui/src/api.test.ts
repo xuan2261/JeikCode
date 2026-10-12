@@ -1,9 +1,54 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { applyConfirmedHistoryDelete } from './lib/historyMessages.ts';
 
 Object.defineProperty(globalThis, 'location', {
   value: new URL('http://localhost/?token=test-token'),
   configurable: true,
+});
+
+test('history DELETE fetch receipts gate local history mutations across HTTP no-op, success and failure', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  let response = new Response(JSON.stringify({ success: true, notFound: true }), {
+    status: 200, headers: { 'Content-Type': 'application/json' },
+  });
+  globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+    calls.push({ url: String(url), init });
+    return response.clone();
+  }) as typeof fetch;
+
+  try {
+    const { deleteSessionMessage } = await import('./api.ts');
+    let localRemovals = 0;
+    const deleteHistory = () => applyConfirmedHistoryDelete(
+      () => deleteSessionMessage('0123456789abcdef', 'test-session', 2, {
+        delete_turn: true, expected_role: 'user', expected_text: 'same text',
+      }),
+      () => true,
+      () => { localRemovals += 1; },
+    );
+
+    await assert.rejects(deleteHistory(), /not applied/i);
+    assert.equal(localRemovals, 0, 'HTTP 200 notFound is not evidence of deletion');
+    assert.equal(calls[0].init?.method, 'DELETE');
+    assert.match(calls[0].url, /\/messages\/2\?/);
+    assert.match(calls[0].url, /delete_turn=true/);
+
+    response = new Response(JSON.stringify({ success: true, revision: 2, source_index: 2 }), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    });
+    assert.equal(await deleteHistory(), true);
+    assert.equal(localRemovals, 1, 'only the applied receipt may update the client');
+
+    response = new Response(JSON.stringify({ error: 'server error' }), {
+      status: 503, headers: { 'Content-Type': 'application/json' },
+    });
+    await assert.rejects(deleteHistory());
+    assert.equal(localRemovals, 1, 'HTTP failure must not perform additional removal');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test('postLiveMessage does not send approval_mode because live mode is global', async () => {

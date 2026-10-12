@@ -156,7 +156,7 @@ import {
   getMemorySession,
 } from '../lib/sessionCache';
 import { gitStore } from '../lib/gitStore';
-import { isInternalHistoryAssistantMessage, isInternalHistoryUserMessage, stripInjectedRemindersForDisplay, stripSteerEnvelopeForDisplay } from '../lib/historyMessages';
+import { applyConfirmedHistoryDelete, isInternalHistoryAssistantMessage, isInternalHistoryUserMessage, removeAssistantHistoryBySourceIndex, stripInjectedRemindersForDisplay, stripSteerEnvelopeForDisplay } from '../lib/historyMessages';
 import {
   loadQueuedFromStorage,
   mergeQueuedIntoDraft,
@@ -6825,6 +6825,8 @@ export function Chat({
 
     const targetMsg = messagesRef.current.find((m) => m.sourceIndex === sourceIndex);
     const expected = expectedText || (targetMsg ? messageText(targetMsg) : undefined);
+    const generation = sessionGenerationRef.current;
+    const isCurrentView = () => activeIdRef.current === sid && sessionGenerationRef.current === generation;
 
     setConfirmModal({
       open: true,
@@ -6835,36 +6837,40 @@ export function Chat({
       cancelLabel: t('common.cancel'),
       onConfirm: async () => {
         try {
-          await deleteSessionMessage(effectiveHash, sid, sourceIndex, {
-            delete_turn: true,
-            expected_text: expected,
-            expected_role: 'user',
-          });
+          await applyConfirmedHistoryDelete(
+            () => deleteSessionMessage(effectiveHash, sid, sourceIndex, {
+              delete_turn: true,
+              expected_text: expected,
+              expected_role: 'user',
+            }),
+            isCurrentView,
+            () => {
+              const previous = messagesRef.current;
+              const idx = previous.findIndex((m) => m.sourceIndex === sourceIndex);
+              if (idx === -1) return;
+              const nextMessages = previous.slice();
+              let end = idx + 1;
+              while (end < nextMessages.length && nextMessages[end]?.role !== 'user') {
+                end += 1;
+              }
+              nextMessages.splice(idx, end - idx);
+              messagesRef.current = nextMessages;
+              messageCacheRef.current.set(sid, nextMessages);
+              setMessages(nextMessages);
+              // Keep existing optimistic cache/navigation updates only after
+              // the server confirms a real deletion for this viewed session.
+              const currentOutline = (turnOutlineRef.current.length > 0 ? turnOutlineRef.current : (turnOutlineBySessionRef.current.get(sid) ?? []))
+                .filter((t) => t.index !== sourceIndex);
+              turnOutlineRef.current = currentOutline;
+              turnOutlineBySessionRef.current.set(sid, currentOutline);
+              setTurnOutline(currentOutline);
+              void saveSessionCache(effectiveHash, sid, nextMessages, activeTodosRef.current, undefined, currentOutline, tokensAuthoritativeRef.current);
+            },
+          );
         } catch (err) {
           console.warn('[Chat] Failed to delete session turn on backend:', err);
+          showToast(t('common.error'), 'error');
         }
-        let nextMessages: Message[] = [];
-        setMessages((prev) => {
-          const idx = prev.findIndex((m) => m.sourceIndex === sourceIndex);
-          if (idx === -1) return prev;
-          const next = prev.slice();
-          let end = idx + 1;
-          while (end < next.length && next[end]?.role !== 'user') {
-            end += 1;
-          }
-          next.splice(idx, end - idx);
-          messagesRef.current = next;
-          messageCacheRef.current.set(sid, next);
-          nextMessages = next;
-          return next;
-        });
-        // 权威反向灌入缓存：同步覆盖 L1 内存和 L2 IndexedDB 与轮次导航！
-        const currentOutline = (turnOutlineRef.current.length > 0 ? turnOutlineRef.current : (turnOutlineBySessionRef.current.get(sid) ?? []))
-          .filter((t) => t.index !== sourceIndex);
-        turnOutlineRef.current = currentOutline;
-        turnOutlineBySessionRef.current.set(sid, currentOutline);
-        setTurnOutline(currentOutline);
-        void saveSessionCache(effectiveHash, sid, nextMessages, activeTodosRef.current, undefined, currentOutline, tokensAuthoritativeRef.current);
       },
     });
   }
@@ -6950,6 +6956,8 @@ export function Chat({
       }
     }
     const resolvedIndex = targetMsg?.sourceIndex ?? (userSourceIndex != null ? userSourceIndex + 1 : sourceIndex);
+    const generation = sessionGenerationRef.current;
+    const isCurrentView = () => activeIdRef.current === sid && sessionGenerationRef.current === generation;
 
     setConfirmModal({
       open: true,
@@ -6960,28 +6968,31 @@ export function Chat({
       cancelLabel: t('common.cancel'),
       onConfirm: async () => {
         try {
-          await deleteSessionMessage(effectiveHash, sid, resolvedIndex, {
-            delete_turn: false,
-            expected_text: expected,
-            expected_role: 'assistant',
-          });
+          await applyConfirmedHistoryDelete(
+            () => deleteSessionMessage(effectiveHash, sid, resolvedIndex, {
+              delete_turn: false,
+              expected_text: expected,
+              expected_role: 'assistant',
+            }),
+            isCurrentView,
+            () => {
+              const nextMessages = removeAssistantHistoryBySourceIndex(
+                messagesRef.current,
+                targetMsg?.sourceIndex,
+                targetMsg,
+              );
+              if (!nextMessages) return; // Session mutation SSE already removed it, or no stable source row.
+              messagesRef.current = nextMessages;
+              messageCacheRef.current.set(sid, nextMessages);
+              setMessages(nextMessages);
+              const currentOutline = turnOutlineRef.current.length > 0 ? turnOutlineRef.current : (turnOutlineBySessionRef.current.get(sid) ?? []);
+              void saveSessionCache(effectiveHash, sid, nextMessages, activeTodosRef.current, undefined, currentOutline, tokensAuthoritativeRef.current);
+            },
+          );
         } catch (err) {
           console.warn('[Chat] Failed to delete assistant message on backend:', err);
+          showToast(t('common.error'), 'error');
         }
-        let nextMessages: Message[] = [];
-        setMessages((prev) => {
-          const next = prev.slice();
-          if (origIdx >= 0 && origIdx < next.length) {
-            next.splice(origIdx, 1);
-          }
-          messagesRef.current = next;
-          messageCacheRef.current.set(sid, next);
-          nextMessages = next;
-          return next;
-        });
-        // 权威反向灌入缓存
-        const currentOutline = turnOutlineRef.current.length > 0 ? turnOutlineRef.current : (turnOutlineBySessionRef.current.get(sid) ?? []);
-        void saveSessionCache(effectiveHash, sid, nextMessages, activeTodosRef.current, undefined, currentOutline, tokensAuthoritativeRef.current);
       },
     });
   }
