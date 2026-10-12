@@ -22,6 +22,12 @@ questions, superseded designs, and externally blocked acceptance.
 The source of truth is **live GitHub comments and immutable Git source**, not
 historical PASS labels. A green fork check is not an upstream approval.
 
+**Latest evidence checkpoint:** [2026-10-12 follow-up](checkpoint-20261012.md)
+records upstream beta `acf6c35`, the PR #28 formatting fix published as
+`d3d38de`, its local fmt/clippy proof and still-unverified new-SHA CI, the
+independent PR #30/#31 source reviews, and PR #44's current conflict status.
+The phase sections below preserve their earlier, revision-bound observations.
+
 ## Scope and inventory
 
 At intake `gh search prs --author xuan2261 --state open` returned **10 open
