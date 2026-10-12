@@ -153,6 +153,10 @@ jobs:
         run: "cargo test -p jeikcode-daemon --lib webui::tests:: --locked"
         env:
           JEIKCODE_HOME: ${{ runner.temp }}/jeikcode-home
+      - name: Test native canonical history mutation handlers
+        run: cargo test --locked -p jeikcode-daemon --lib canonical_history -- --test-threads=1
+        env:
+          JEIKCODE_HOME: ${{ runner.temp }}/jeikcode-home
       - name: Test TUI library contracts
         run: cargo test --locked -p jeikcode-tuix --lib -- --test-threads=1
         env:
