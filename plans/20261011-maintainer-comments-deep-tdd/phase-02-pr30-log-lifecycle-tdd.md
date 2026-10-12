@@ -1,6 +1,77 @@
 # Phase 02 — PR #30: orphan-log lifecycle and owned deletion
 
-**Status:** source diagnosis only; changes require careful lifecycle design.
+**Status:** local targeted RED reproduced on current beta; production lifecycle
+design and cross-platform GREEN are **NOT YET VERIFIED**.
+
+## Executed RED evidence — 2026-10-12
+
+**Outcome:** the current global LRU can delete an unrelated file solely
+because its name matches the JeikCode background-log prefix. This is a proven
+ownership-selection defect in the existing upstream implementation, separate
+from the old PR #30 branch's `tempdir().keep()` orphan-directory leak.
+
+- Immutable upstream beta source: `acf6c35ad2ed156ce1638e77b39729c23bb3eb82`
+  (`v7.2.2-beta.4`), verified against the actual upstream `beta` remote.
+- Isolated local branch and worktree:
+  `test/pr30-log-ownership-red-20261012` in
+  `C:/Work/JeikCode/.worktrees/pr30-log-ownership-red-20261012`.
+- Production source is **unmodified**. The only intentional modification is
+  one added `#[tokio::test]` in
+  `crates/jeikcode-capabilities/src/tools/bash_log.rs`, starting at line 252.
+  Baseline Git blob: `bf69e423cfa8dadf8f43282db1933311486cd192`.
+  The final uncommitted test-only source-file SHA-256 is
+  `6e9b674b8405bd87745509add05f4a5ef53048af6d009655852263ed4ae0daf6`.
+- The test first creates and checks **51 closed, unowned** synthetic
+  `jeikcode-back-*.log` files under one `tempfile::tempdir()`, never in the
+  machine's real shared temp root. It then calls the **production**
+  `enforce_global_lru_pool(dir.path(), MAX_GLOBAL_LOG_FILES)` helper with
+  the actual limit **50**, and asserts that none of these unrelated files
+  were deleted. The outcome does not depend on the ordering of mtimes or
+  which of the 51 files is selected for deletion.
+- Windows command (Rust 1.93, exact source, `--locked`, isolated `JEIKCODE_HOME`
+  and existing local validation target cache):
+
+  ```powershell
+  cargo test -p jeikcode-capabilities --no-default-features --features tools --lib tools::bash_log::tests::test_lru_does_not_delete_unowned_matching_files --locked -- --exact --nocapture
+  ```
+
+- **RED observed twice.** The first run built the test binary and failed
+  at 50 retained vs 51 created; after strengthening the test's initial
+  existence check and formatting it, the final second run again exited
+  **101** with **0 passed, 1 failed, 727 filtered out, 0 ignored**; the
+  failing assertion remains `left: 50`, `right: 51` at `bash_log.rs:275`.
+  Test body took approximately 0.04 seconds on the second run. One unrelated
+  baseline warning set was emitted by dependencies; compilation succeeded.
+- `rustfmt --edition 2021 --check` on this source file and targeted
+  `git diff --check` both passed. A distinct, unrelated
+  `extensions/jetbrains/gradlew.bat` CRLF checkout difference was already
+  present immediately after creating the worktree; it has not been touched,
+  staged or included in any change.
+- **This is RED evidence, not a fixed implementation**. No GREEN, no
+  multi-process liveness test, no native POSIX proof, no CI run for the
+  uncommitted test, and no source-code deployment are claimed. Do not
+  commit/push an intentionally failing test merely to force CI.
+
+**Root cause, source-pinned:** `bash_log.rs:47-50` calls the LRU on the real
+shared system temp directory in production. `:149-178` selects candidates
+only by prefix/suffix and filesystem mtime, then calls `remove_file` without
+an owner token, live writer guard, or file identity check. A matching filename
+alone cannot establish permission to delete that pathname. The RED fixture
+directly exercises the same function with a disposable directory.
+
+**Decision gate before production implementation:** settle the exact
+ownership and orphan-reclamation contract with the maintainer. A proposed
+`<temp>/jeikcode-bg/<random-process-id>/.owner.lock` layout needs a safely
+published owner lock, a nonblocking live-owner check, no-follow identity
+validation, skip-on-unknown behavior and bounded traversal; a post-crash
+directory that has acquired foreign/replaced content must **not** be deleted
+recursively based on a stale owner-lock result. This choice affects cross-run
+lifecycle and must not be silently inferred from the maintainer's sketch.
+
+Next accepted TDD stage, after the contract is aligned: preserve unowned
+matching files, protect live writers, wait for session shutdown to close
+owned log handles, and reclaim only verified orphaned artifacts across process
+restarts. Add native Windows/POSIX tests before claiming GREEN/FORK_VERIFIED.
 
 ## Baseline distinction
 
