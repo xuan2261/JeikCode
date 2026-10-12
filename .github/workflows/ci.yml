@@ -153,6 +153,12 @@ jobs:
         run: "cargo test -p jeikcode-daemon --lib webui::tests:: --locked"
         env:
           JEIKCODE_HOME: ${{ runner.temp }}/jeikcode-home
+      - name: Verify canonical history identity targeting
+        run: |
+          cargo test -p jeikcode-daemon --lib resolve_target_message_index --locked
+          cargo test -p jeikcode-daemon --lib canonical_history --locked
+        env:
+          JEIKCODE_HOME: ${{ runner.temp }}/jeikcode-home
       - name: Test TUI library contracts
         run: cargo test --locked -p jeikcode-tuix --lib -- --test-threads=1
         env:
