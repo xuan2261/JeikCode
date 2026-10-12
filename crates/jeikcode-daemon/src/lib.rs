@@ -5271,6 +5271,7 @@ pub struct TruncateSessionRequest {
 fn resolve_target_message_index(
     messages: &[jeikcode_kernel::message::Message],
     target_index: usize,
+    expected_message_id: Option<&str>,
     expected_text: Option<&str>,
     expected_role: Option<&str>,
 ) -> Option<usize> {
@@ -5327,6 +5328,25 @@ fn resolve_target_message_index(
         }
         false
     };
+
+    // A canonical ID is authoritative; a stale display index or duplicate
+    // text must never silently select a different persisted message.
+    if let Some(expected_id) = expected_message_id {
+        if expected_id.is_empty() {
+            return None;
+        }
+        let mut matching = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.id.as_deref() == Some(expected_id));
+        let (index, message) = matching.next()?;
+        if matching.next().is_some() || !role_matches(&message.role) {
+            return None;
+        }
+        // Text is a display-alignment hint, not a raw-content precondition;
+        // injected reminders and other internal markup may be hidden by UI.
+        return Some(index);
+    }
 
     // 1. 优先命中：物理索引处直接匹配（角色匹配 + 文本一致/无指定文本）
     if let Some(msg) = messages.get(target_index) {
@@ -5466,6 +5486,7 @@ async fn patch_session_message(
         let target_idx = resolve_target_message_index(
             &snapshot.messages,
             index,
+            req.expected_message_id.as_deref(),
             req.expected_text.as_deref(),
             req.expected_role.as_deref(),
         );
@@ -5580,6 +5601,7 @@ async fn delete_session_message(
         let target_idx = resolve_target_message_index(
             &snapshot.messages,
             index,
+            query.expected_message_id.as_deref(),
             query.expected_text.as_deref(),
             query.expected_role.as_deref(),
         );
@@ -5727,6 +5749,7 @@ async fn truncate_session(
         let target_idx = resolve_target_message_index(
             &snapshot.messages,
             req.target_index,
+            req.target_message_id.as_deref(),
             req.expected_text.as_deref(),
             req.expected_role.as_deref(),
         );
@@ -8656,7 +8679,9 @@ async fn chat_watch(
                 Some(after) if after >= 0 && (after as u64) <= buffer_len => {
                     let mut filtered: Vec<(u64, ChatEvent)> = snapshot
                         .into_iter()
-                        .filter(|(seq, e)| !matches!(e, ChatEvent::User { .. }) && *seq >= after as u64)
+                        .filter(|(seq, e)| {
+                            !matches!(e, ChatEvent::User { .. }) && *seq >= after as u64
+                        })
                         .collect();
                     if let Some(user) = maybe_user {
                         filtered.insert(0, user);
@@ -8829,12 +8854,16 @@ async fn chat_watch(
         Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(json))
     });
 
-    let live_seq_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(last_head_seq + 1));
+    let live_seq_counter =
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(last_head_seq + 1));
     let live_stream = UnboundedReceiverStream::new(rx).map(move |event| {
         let seq = live_seq_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok::<_, std::convert::Infallible>(
-            axum::response::sse::Event::default()
-                .data(chat_watch_frame_json(&event, &live_session_id, Some(seq))),
+            axum::response::sse::Event::default().data(chat_watch_frame_json(
+                &event,
+                &live_session_id,
+                Some(seq),
+            )),
         )
     });
     let stream = head_stream.chain(live_stream);
@@ -12675,6 +12704,10 @@ mod tests {
                 _home: home,
             }
         }
+
+        pub(crate) fn path(&self) -> &std::path::Path {
+            self._dir.path()
+        }
     }
 
     fn chat_test_telemetry(home: &ScopedChatHome) -> Arc<Telemetry> {
@@ -15155,6 +15188,60 @@ utun7: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1300
 mod channel_mode_tests {
     use super::*;
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn canonical_history_patch_must_resolve_stable_id_over_stale_index() {
+        use jeikcode_capabilities::session::{PresentationFile, SessionMeta, StorageOwner};
+        use jeikcode_kernel::message::{Message, SessionSnapshot};
+
+        let home = crate::tests::ScopedChatHome::new();
+        let state = crate::tests::chat_test_state(&home);
+        let bucket = response_project_hash(home.path());
+        let id = "11111111-1111-4111-8111-111111111112";
+        let manager =
+            NativeSessionManager::with_root(NativeSessionManager::sessions_root().join(&bucket));
+        let lease = manager.acquire_lease(id).unwrap();
+        let mut first = Message::user("same text");
+        first.id = Some("m-first".into());
+        let mut second = Message::user("same text");
+        second.id = Some("m-second".into());
+        let snapshot = SessionSnapshot::new(vec![first, second]);
+        let mut meta = SessionMeta::new(
+            id,
+            home.path().to_string_lossy().into_owned(),
+            jeikcode_capabilities::session::now_ms(),
+        );
+        meta.owner = StorageOwner::Native;
+        manager
+            .commit_native_import(
+                &lease,
+                Some(&snapshot),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+        drop(lease);
+
+        // Index 1 still points at m-second, but the caller's stable ID is m-first.
+        let response = patch_session_message(
+            State(state),
+            axum::Extension(SessionMode::Vscode),
+            Path((bucket, id.to_owned(), 1)),
+            Json(PatchMessageRequest {
+                text: "patched first".into(),
+                images: None,
+                expected_text: Some("same text".into()),
+                expected_message_id: Some("m-first".into()),
+                expected_role: Some("user".into()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let saved = manager.load_snapshot(id).unwrap();
+        assert_eq!(saved.messages[0].text, "patched first");
+        assert_eq!(saved.messages[1].text, "same text");
+    }
+
     #[test]
     fn resolve_channel_header() {
         assert_eq!(resolve_client_mode("channel"), SessionMode::Channel);
@@ -15473,14 +15560,20 @@ mod channel_mode_tests {
         ];
 
         // 1. 通过正文匹配
-        let idx1 =
-            resolve_target_message_index(&messages, 1, Some("这是正式回答"), Some("assistant"));
+        let idx1 = resolve_target_message_index(
+            &messages,
+            1,
+            None,
+            Some("这是正式回答"),
+            Some("assistant"),
+        );
         assert_eq!(idx1, Some(1));
 
         // 2. 通过思考过程匹配
         let idx2 = resolve_target_message_index(
             &messages,
             1,
+            None,
             Some("这是详细的思考过程"),
             Some("assistant"),
         );
@@ -15488,12 +15581,275 @@ mod channel_mode_tests {
 
         // 3. 通过前端拼接的全文（思考过程 + 正文）匹配
         let combined = "这是详细的思考过程\n这是正式回答";
-        let idx3 = resolve_target_message_index(&messages, 1, Some(combined), Some("assistant"));
+        let idx3 =
+            resolve_target_message_index(&messages, 1, None, Some(combined), Some("assistant"));
         assert_eq!(idx3, Some(1));
 
         // 4. 第二轮助手匹配
-        let idx4 = resolve_target_message_index(&messages, 3, Some("第二答"), Some("assistant"));
+        let idx4 =
+            resolve_target_message_index(&messages, 3, None, Some("第二答"), Some("assistant"));
         assert_eq!(idx4, Some(3));
+    }
+
+    #[test]
+    fn resolve_target_message_index_requires_unique_canonical_id_when_present() {
+        use jeikcode_kernel::message::Message;
+        let mut first = Message::user("same question");
+        first.id = Some("m-first".into());
+        let mut second = Message::user("same question");
+        second.id = Some("m-second".into());
+        let messages = vec![first, second];
+
+        // A stale display index must not select another same-text message.
+        assert_eq!(
+            resolve_target_message_index(
+                &messages,
+                1,
+                Some("m-first"),
+                Some("same question"),
+                Some("user"),
+            ),
+            Some(0),
+        );
+        // A foreign/missing ID must never fall through to text/index selection.
+        assert_eq!(
+            resolve_target_message_index(&messages, 1, Some("foreign-id"), None, Some("user")),
+            None,
+        );
+        assert_eq!(
+            resolve_target_message_index(&messages, 1, Some("m-first"), None, Some("assistant")),
+            None,
+        );
+        assert_eq!(
+            resolve_target_message_index(
+                &messages,
+                1,
+                Some("m-first"),
+                Some("stale text"),
+                Some("user")
+            ),
+            Some(0),
+        );
+        let mut duplicate_ids = messages.clone();
+        duplicate_ids[1].id = Some("m-first".into());
+        assert_eq!(
+            resolve_target_message_index(&duplicate_ids, 1, Some("m-first"), None, Some("user")),
+            None,
+        );
+        // Legacy requests without IDs retain their existing index/text fallback.
+        assert_eq!(
+            resolve_target_message_index(&messages, 1, None, Some("same question"), Some("user")),
+            Some(1),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn canonical_history_mutation_handlers_resolve_ids_after_persistence() {
+        use jeikcode_capabilities::session::{PresentationFile, SessionMeta, StorageOwner};
+        use jeikcode_kernel::message::{Message, SessionSnapshot};
+
+        let home = crate::tests::ScopedChatHome::new();
+        let state = crate::tests::chat_test_state(&home);
+        let bucket = response_project_hash(home.path());
+        let id = "11111111-1111-4111-8111-111111111111";
+        let manager =
+            NativeSessionManager::with_root(NativeSessionManager::sessions_root().join(&bucket));
+        let lease = manager.acquire_lease(id).unwrap();
+        let make = |role: &str, text: &str, key: &str| {
+            let mut message = if role == "assistant" {
+                Message::assistant(text, Vec::new())
+            } else {
+                Message::user(text)
+            };
+            message.id = Some(key.into());
+            message
+        };
+        let initial = SessionSnapshot::new(vec![
+            make("user", "same text", "u0"),
+            make("assistant", "same answer", "a0"),
+            // The UI hides this internal message, but raw agent-delete must
+            // stop at its User role instead of crossing the hidden boundary.
+            make(
+                "user",
+                "You made code edits but have not verified them.",
+                "hidden-u",
+            ),
+            make("assistant", "same answer", "a1"),
+            make("user", "same text", "u1"),
+            make("assistant", "same answer", "a2"),
+        ]);
+        let mut meta = SessionMeta::new(
+            id,
+            home.path().to_string_lossy().into_owned(),
+            jeikcode_capabilities::session::now_ms(),
+        );
+        meta.owner = StorageOwner::Native;
+        manager
+            .commit_native_import(
+                &lease,
+                Some(&initial),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+        drop(lease);
+        let (watch_tx, mut watch_rx) = mpsc::unbounded_channel();
+        assert!(matches!(
+            state.active_chats.subscribe_or_standby(id, &watch_tx).await,
+            WatchOutcome::Standby
+        ));
+
+        let patch = patch_session_message(
+            State(state.clone()),
+            axum::Extension(SessionMode::Vscode),
+            Path((bucket.clone(), id.to_owned(), 4)),
+            Json(PatchMessageRequest {
+                text: "patched u0".into(),
+                images: None,
+                expected_text: Some("projected stale text".into()),
+                expected_message_id: Some("u0".into()),
+                expected_role: Some("user".into()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(patch.status(), StatusCode::OK);
+        let snapshot = manager.load_snapshot(id).unwrap();
+        assert_eq!(snapshot.messages[0].text, "patched u0");
+        assert_eq!(snapshot.messages[4].text, "same text");
+        assert!(matches!(
+            watch_rx.try_recv(),
+            Ok(ChatEvent::SessionMutation {
+                action, message_id: Some(message_id), source_index: Some(0), ..
+            }) if action == "patch" && message_id == "u0"
+        ));
+
+        let stale = patch_session_message(
+            State(state.clone()),
+            axum::Extension(SessionMode::Vscode),
+            Path((bucket.clone(), id.to_owned(), 4)),
+            Json(PatchMessageRequest {
+                text: "must not persist".into(),
+                images: None,
+                expected_text: None,
+                expected_message_id: Some("foreign-id".into()),
+                expected_role: Some("user".into()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(stale.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            manager.load_snapshot(id).unwrap().messages[4].text,
+            "same text"
+        );
+        assert!(
+            watch_rx.try_recv().is_err(),
+            "failed ID guard cannot emit mutation"
+        );
+
+        let deleted = delete_session_message(
+            State(state.clone()),
+            axum::Extension(SessionMode::Vscode),
+            Path((bucket.clone(), id.to_owned(), 1)),
+            Query(DeleteMessageQuery {
+                delete_turn: Some(false),
+                expected_text: None,
+                expected_message_id: Some("a1".into()),
+                expected_role: Some("assistant".into()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(deleted.status(), StatusCode::OK);
+        let after_delete = manager.load_snapshot(id).unwrap();
+        let ids: Vec<_> = after_delete
+            .messages
+            .iter()
+            .map(|m| m.id.as_deref().unwrap_or(""))
+            .collect();
+        assert_eq!(ids, ["u0", "a0", "hidden-u", "u1", "a2"]);
+        assert!(matches!(
+            watch_rx.try_recv(),
+            Ok(ChatEvent::SessionMutation {
+                action, message_id: Some(message_id), source_index: Some(3), ..
+            }) if action == "delete" && message_id == "a1"
+        ));
+
+        // A missing stable identity must not fall through to a valid index,
+        // persist anything, or send a misleading peer mutation event.
+        let stale_delete = delete_session_message(
+            State(state.clone()),
+            axum::Extension(SessionMode::Vscode),
+            Path((bucket.clone(), id.to_owned(), 1)),
+            Query(DeleteMessageQuery {
+                delete_turn: Some(false),
+                expected_text: Some("same answer".into()),
+                expected_message_id: Some("foreign-id".into()),
+                expected_role: Some("assistant".into()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(stale_delete.status(), StatusCode::OK);
+        let stale_delete_bytes = axum::body::to_bytes(stale_delete.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let stale_delete_receipt: serde_json::Value =
+            serde_json::from_slice(&stale_delete_bytes).unwrap();
+        assert_eq!(stale_delete_receipt["notFound"], true);
+        assert_eq!(manager.load_snapshot(id).unwrap().messages.len(), 5);
+        assert!(watch_rx.try_recv().is_err());
+
+        let stale_truncate = truncate_session(
+            State(state.clone()),
+            axum::Extension(SessionMode::Vscode),
+            Path((bucket.clone(), id.to_owned())),
+            Json(TruncateSessionRequest {
+                target_index: 0,
+                target_message_id: Some("foreign-id".into()),
+                expected_text: Some("same text".into()),
+                expected_role: Some("user".into()),
+                inclusive: Some(true),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(stale_truncate.status(), StatusCode::OK);
+        let stale_truncate_bytes = axum::body::to_bytes(stale_truncate.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let stale_truncate_receipt: serde_json::Value =
+            serde_json::from_slice(&stale_truncate_bytes).unwrap();
+        assert_eq!(stale_truncate_receipt["notFound"], true);
+        assert_eq!(manager.load_snapshot(id).unwrap().messages.len(), 5);
+        assert!(watch_rx.try_recv().is_err());
+
+        let truncated = truncate_session(
+            State(state),
+            axum::Extension(SessionMode::Vscode),
+            Path((bucket, id.to_owned())),
+            Json(TruncateSessionRequest {
+                target_index: 0,
+                target_message_id: Some("u1".into()),
+                expected_text: None,
+                expected_role: Some("user".into()),
+                inclusive: Some(true),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(truncated.status(), StatusCode::OK);
+        let final_snapshot = manager.load_snapshot(id).unwrap();
+        assert_eq!(final_snapshot.messages.len(), 4);
+        assert_eq!(final_snapshot.messages[3].id.as_deref(), Some("u1"));
+        assert!(matches!(
+            watch_rx.try_recv(),
+            Ok(ChatEvent::SessionMutation {
+                action, target_message_id: Some(message_id),
+                source_index: _, target_index: Some(4), ..
+            }) if action == "truncate" && message_id == "u1"
+        ));
     }
 
     #[test]
@@ -15516,9 +15872,14 @@ mod channel_mode_tests {
         ];
 
         // 模拟删除问题1的 Agent 回复（从中间输出到最终回答，保留问题1的 User 消息）
-        let target_idx =
-            resolve_target_message_index(&messages, 3, Some("问题1最终回答"), Some("assistant"))
-                .unwrap();
+        let target_idx = resolve_target_message_index(
+            &messages,
+            3,
+            None,
+            Some("问题1最终回答"),
+            Some("assistant"),
+        )
+        .unwrap();
         assert_eq!(target_idx, 3);
 
         // 模拟 delete_turn: false 下的 Agent 范围清理逻辑
