@@ -790,3 +790,39 @@ test('直播思考流式输出中的重复词句绝不被误杀吞字', () => {
   assert.equal(part.text, '首先检查缓存一致性问题。接着再次确认缓存一致性问题，问题已被彻底定位。');
 });
 
+test('live reasoning after a tool preserves a new authoritative part id', () => {
+  const canvas = [{
+    role: 'assistant',
+    id: 'm-1',
+    parts: [
+      { kind: 'reasoning' as const, text: 'before tool', id: 'm-1:1:reasoning' },
+      { kind: 'tool' as const, tool: { id: 'call-1', name: 'bash', args: '{}', status: 'done' as const } },
+    ],
+  }];
+
+  // The daemon assigns a distinct part id after crossing a tool boundary.
+  const resumed = paintAssistantReasoning(canvas, 'after tool', false, 'm-1', 'm-1:3:reasoning');
+  assert.deepEqual(resumed[0]?.parts.map((part) => part.kind), ['reasoning', 'tool', 'reasoning']);
+  assert.equal((resumed[0]?.parts[0] as { text: string }).text, 'before tool');
+  assert.equal((resumed[0]?.parts[2] as { id?: string }).id, 'm-1:3:reasoning');
+
+  const continued = paintAssistantReasoning(resumed, ' and continued', false, 'm-1', 'm-1:3:reasoning');
+  assert.equal((continued[0]?.parts[2] as { text: string }).text, 'after tool and continued');
+  const lateFirst = paintAssistantReasoning(continued, ' earlier suffix', false, 'm-1', 'm-1:1:reasoning');
+  assert.equal((lateFirst[0]?.parts[0] as { text: string }).text, 'before tool earlier suffix');
+  assert.equal((lateFirst[0]?.parts[2] as { text: string }).text, 'after tool and continued');
+});
+
+test('adjacent live reasoning with a distinct wire part id cannot inherit the old id', () => {
+  const canvas = [{
+    role: 'assistant',
+    id: 'm-1',
+    parts: [{ kind: 'reasoning' as const, text: 'first part', id: 'm-1:1:reasoning' }],
+  }];
+  const next = paintAssistantReasoning(canvas, 'second part', false, 'm-1', 'm-1:3:reasoning');
+  assert.deepEqual(next[0]?.parts.map((part) => (part as { id?: string }).id), [
+    'm-1:1:reasoning', 'm-1:3:reasoning',
+  ]);
+  assert.equal((next[0]?.parts[0] as { text: string }).text, 'first part');
+  assert.equal((next[0]?.parts[1] as { text: string }).text, 'second part');
+});

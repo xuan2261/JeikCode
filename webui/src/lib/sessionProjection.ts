@@ -438,10 +438,12 @@ function mergeReasoningIntoParts(parts: MsgPart[], content: string, replay: bool
         next[index] = { ...p, text: (p.text || '') + content };
         return next;
       }
+      // A new wire part id must open a new part, even when earlier reasoning
+      // exists across a tool/text boundary. Do not give the delta the old id.
+      return [...parts, { kind: 'reasoning', text: content, id: partId }];
     }
     const tail = parts[parts.length - 1];
-    const isDifferentPart = !!tail && tail.kind === 'reasoning' && !!tail.id && !!partId && tail.id !== partId;
-    if (tail && tail.kind === 'reasoning' && !isDifferentPart) {
+    if (tail && tail.kind === 'reasoning') {
       const next = parts.slice();
       next[next.length - 1] = { kind: 'reasoning', text: (tail.text || '') + content, id: tail.id ?? partId };
       return next;
