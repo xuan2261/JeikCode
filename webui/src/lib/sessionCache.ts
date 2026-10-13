@@ -23,6 +23,43 @@ const MAX_MEMORY_ENTRIES = 30;
 // L1 内存 LRU 缓存 (0.00ms 极速响应)
 const memoryCache = new Map<string, CachedSessionData>();
 
+// Only in-flight operations need a fence. Keeping these tokens scoped to pending
+// requests avoids an unbounded per-session version map for long-lived clients.
+type CacheOperation = { kind: 'read' | 'write' | 'delete' | 'clear'; invalidated: boolean };
+const pendingByKey = new Map<string, Set<CacheOperation>>();
+const pendingClears = new Set<CacheOperation>();
+
+function trackKeyOperation(key: string, kind: CacheOperation['kind']): CacheOperation {
+  const op: CacheOperation = { kind, invalidated: false };
+  let pending = pendingByKey.get(key);
+  if (!pending) {
+    pending = new Set();
+    pendingByKey.set(key, pending);
+  }
+  pending.add(op);
+  return op;
+}
+
+function finishKeyOperation(key: string, op: CacheOperation): void {
+  const pending = pendingByKey.get(key);
+  pending?.delete(op);
+  if (pending?.size === 0) pendingByKey.delete(key);
+}
+
+function invalidateKeyOperations(key: string): void {
+  for (const op of pendingByKey.get(key) ?? []) op.invalidated = true;
+}
+
+function hasPendingRemoval(key: string): boolean {
+  for (const op of pendingClears) {
+    if (!op.invalidated) return true;
+  }
+  for (const op of pendingByKey.get(key) ?? []) {
+    if (op.kind === 'delete' && !op.invalidated) return true;
+  }
+  return false;
+}
+
 function makeKey(projectHash: string, sessionId: string): string {
   return `${projectHash}:${sessionId}`;
 }
@@ -89,29 +126,39 @@ export async function getSessionCache(
   const mem = getMemorySession(projectHash, sessionId);
   if (mem) return mem;
 
-  const db = await getDB();
-  if (!db) return null;
+  const key = makeKey(projectHash, sessionId);
+  // A removal awaiting IndexedDB.open must not trigger a read of the old row.
+  if (hasPendingRemoval(key)) return null;
+  const op = trackKeyOperation(key, 'read');
+  try {
+    const db = await getDB();
+    if (op.invalidated || hasPendingRemoval(key)) return getMemorySession(projectHash, sessionId);
+    if (!db) return null;
 
-  return new Promise((resolve) => {
-    try {
-      const tx = db.transaction(STORE_SESSIONS, 'readonly');
-      const store = tx.objectStore(STORE_SESSIONS);
-      const req = store.get(makeKey(projectHash, sessionId));
-      req.onsuccess = () => {
-        const result = req.result as CachedSessionData | undefined;
-        if (result && Array.isArray(result.messages)) {
-          // 回填至 L1 内存
-          setMemorySession(projectHash, sessionId, result);
-          resolve(result);
-        } else {
-          resolve(null);
-        }
-      };
-      req.onerror = () => resolve(null);
-    } catch {
-      resolve(null);
-    }
-  });
+    const disk = await new Promise<CachedSessionData | null>((resolve) => {
+      try {
+        const tx = db.transaction(STORE_SESSIONS, 'readonly');
+        const req = tx.objectStore(STORE_SESSIONS).get(key);
+        req.onsuccess = () => {
+          const result = req.result as CachedSessionData | undefined;
+          resolve(result && Array.isArray(result.messages) ? result : null);
+        };
+        req.onerror = () => resolve(null);
+      } catch {
+        resolve(null);
+      }
+    });
+
+    // Any newer save/delete/clear wins, even when the old IDB read was already
+    // dispatched. Return the latest L1 snapshot instead of resurrecting L2.
+    if (op.invalidated || hasPendingRemoval(key)) return getMemorySession(projectHash, sessionId);
+    const newerMemory = getMemorySession(projectHash, sessionId);
+    if (newerMemory) return newerMemory;
+    if (disk) setMemorySession(projectHash, sessionId, disk);
+    return disk;
+  } finally {
+    finishKeyOperation(key, op);
+  }
 }
 
 function setMemorySession(projectHash: string, sessionId: string, data: CachedSessionData): void {
@@ -149,22 +196,29 @@ export async function saveSessionCache(
     mtime_ms,
   };
 
+  const key = makeKey(projectHash, sessionId);
+  invalidateKeyOperations(key);
+  const op = trackKeyOperation(key, 'write');
+
   // 1. 同步更新 L1 内存
   setMemorySession(projectHash, sessionId, data);
 
-  // 2. 异步落盘至 L2 IndexedDB
-  const db = await getDB();
-  if (!db) return;
-
+  // 2. Async writes that have not entered an IDB transaction can be superseded.
+  // Once a transaction is enqueued, IndexedDB orders overlapping readwrite
+  // transactions; do not attempt to cancel transactions already dispatched.
   try {
+    const db = await getDB();
+    if (!db || op.invalidated) return;
     const tx = db.transaction(STORE_SESSIONS, 'readwrite');
     const store = tx.objectStore(STORE_SESSIONS);
     store.put({
-      key: makeKey(projectHash, sessionId),
+      key,
       ...data,
     });
   } catch (err) {
     console.warn('[SessionCache] Failed to write to IndexedDB:', err);
+  } finally {
+    finishKeyOperation(key, op);
   }
 }
 
@@ -179,14 +233,18 @@ export async function deleteSessionCache(
   sessionId: string,
 ): Promise<void> {
   const key = makeKey(projectHash, sessionId);
+  invalidateKeyOperations(key);
+  const op = trackKeyOperation(key, 'delete');
   memoryCache.delete(key);
-  const db = await getDB();
-  if (!db) return;
   try {
+    const db = await getDB();
+    if (!db || op.invalidated) return;
     const tx = db.transaction(STORE_SESSIONS, 'readwrite');
     tx.objectStore(STORE_SESSIONS).delete(key);
   } catch (err) {
     console.warn('[SessionCache] Failed to delete from IndexedDB:', err);
+  } finally {
+    finishKeyOperation(key, op);
   }
 }
 
@@ -215,13 +273,21 @@ export function appendMessageToSessionCache(
  * Ctrl + F5 强制清理：一网打尽清空所有 L1 内存与 L2 IndexedDB 缓存
  */
 export async function clearAllSessionCache(): Promise<void> {
+  for (const pending of pendingByKey.values()) {
+    for (const op of pending) op.invalidated = true;
+  }
+  for (const op of pendingClears) op.invalidated = true;
+  const op: CacheOperation = { kind: 'clear', invalidated: false };
+  pendingClears.add(op);
   memoryCache.clear();
-  const db = await getDB();
-  if (!db) return;
   try {
+    const db = await getDB();
+    if (!db || op.invalidated) return;
     const tx = db.transaction(STORE_SESSIONS, 'readwrite');
     tx.objectStore(STORE_SESSIONS).clear();
   } catch {
     // 忽略清空错误
+  } finally {
+    pendingClears.delete(op);
   }
 }
