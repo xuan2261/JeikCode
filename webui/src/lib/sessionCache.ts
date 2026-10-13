@@ -122,6 +122,7 @@ export function getMemorySession(projectHash: string, sessionId: string): Cached
 export async function getSessionCache(
   projectHash: string,
   sessionId: string,
+  options?: { hydrateMemory?: boolean },
 ): Promise<CachedSessionData | null> {
   const mem = getMemorySession(projectHash, sessionId);
   if (mem) return mem;
@@ -154,7 +155,12 @@ export async function getSessionCache(
     if (op.invalidated || hasPendingRemoval(key)) return getMemorySession(projectHash, sessionId);
     const newerMemory = getMemorySession(projectHash, sessionId);
     if (newerMemory) return newerMemory;
-    if (disk) setMemorySession(projectHash, sessionId, disk);
+    // Idle prefetch may only be checking whether L2 has an entry. Its history
+    // admission guards live in Chat, so the probe must not install potentially
+    // obsolete disk bytes into L1 before those guards have been rechecked.
+    if (disk && options?.hydrateMemory !== false) {
+      setMemorySession(projectHash, sessionId, disk);
+    }
     return disk;
   } finally {
     finishKeyOperation(key, op);

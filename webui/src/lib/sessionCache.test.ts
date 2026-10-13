@@ -300,3 +300,15 @@ test('a mutation in project A does not invalidate project B using the same sessi
     assert.equal(cache.getMemorySession('project-B', 'same-id')?.messages[0].content, 'B-original');
   });
 });
+
+test('idle prefetch L2 existence probe must not hydrate an obsolete row into L1', async () => {
+  await withControlledIDB(async ({ cache, open, reads }) => {
+    const pendingProbe = cache.getSessionCache('p', 's', { hydrateMemory: false });
+    open();
+    await Promise.resolve();
+    assert.equal(reads.length, 1);
+    reads[0].resolve(diskValue('p', 's', 'OLD'));
+    assert.equal((await pendingProbe)?.messages[0].content, 'OLD');
+    assert.equal(cache.hasMemorySession('p', 's'), false);
+  });
+});

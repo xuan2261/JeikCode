@@ -154,7 +154,9 @@ import {
   saveSessionCache,
   clearAllSessionCache,
   getMemorySession,
+  hasMemorySession,
 } from '../lib/sessionCache';
+import { applyGuardedSessionPrefetch, mergePrefetchActiveSnapshot, recordPrefetchActivity } from '../lib/sessionPrefetch';
 import { gitStore } from '../lib/gitStore';
 import { applyConfirmedHistoryDelete, applyConfirmedHistoryPatch, isInternalHistoryAssistantMessage, isInternalHistoryUserMessage, patchUserHistoryBySourceIndex, removeAssistantHistoryBySourceIndex, stripInjectedRemindersForDisplay, stripSteerEnvelopeForDisplay } from '../lib/historyMessages';
 import {
@@ -1601,6 +1603,13 @@ export function Chat({
   // the session id would let the first A's late active-check/cancel result
   // mutate the replacement A view.
   const sessionGenerationRef = useRef(0);
+  // Only local *observed* history mutations fence idle prefetch GETs. This is
+  // not a durable/cross-tab revision and must never be treated as one.
+  const historyMutationEpochRef = useRef(0);
+  // Observer-only activity is not runtime ownership. Use it solely to avoid
+  // caching an offscreen turn's lagging disk snapshot during a remote run.
+  const prefetchRunningSessionsRef = useRef<Set<string>>(new Set());
+  const prefetchActivityRefreshRef = useRef<{ newerActivities: Map<string, boolean> } | null>(null);
   const renderedSessionIdRef = useRef(sessionId);
   if (renderedSessionIdRef.current !== sessionId) {
     // Advance during render, before a passive effect can abort the old reader.
@@ -2297,10 +2306,50 @@ export function Chat({
     });
   }, [onLiveReview, sessionId, livePending, userInputReq]);
   // 跨实例增量：待交互卡在别处被解决时，同步清掉本画布的待批准/待回答状态；同步压缩状态。
-  useEffect(
-    () =>
-      onGlobalEvent((event) => {
+  useEffect(() => {
+    let disposed = false;
+    const unsubscribe = onGlobalEvent((event) => {
+        if (event.type === 'sync') {
+          // After an /events reconnect, activity(false) may have been missed.
+          // Refresh this prefetch-only observer set without changing runtime
+          // ownership. Later activity events win over the HTTP snapshot.
+          const refresh = { newerActivities: new Map<string, boolean>() };
+          prefetchActivityRefreshRef.current = refresh;
+          historyMutationEpochRef.current += 1;
+          void getActiveChatSessions()
+            .then((activeIds) => {
+              if (disposed || prefetchActivityRefreshRef.current !== refresh) return;
+              prefetchRunningSessionsRef.current = mergePrefetchActiveSnapshot(
+                activeIds, refresh.newerActivities,
+              );
+              historyMutationEpochRef.current += 1;
+              // Only a successful active-list response can establish that
+              // unobserved offscreen sessions are no longer running.
+              prefetchActivityRefreshRef.current = null;
+            })
+            .catch(() => {
+              // Fail closed: an empty observed Set cannot establish that all
+              // remote sessions are idle. Only another successful sync may
+              // clear this UNKNOWN admission barrier.
+            });
+          return;
+        }
+        if (event.type === 'session_deleted' || event.type === 'session_upsert') {
+          // A remote deletion or newly settled turn can invalidate a pending
+          // prefetch even when that session has never had an in-memory row.
+          // A metadata-only upsert may cancel extra work; it cannot corrupt it.
+          historyMutationEpochRef.current += 1;
+          if (event.type === 'session_deleted') {
+            prefetchRunningSessionsRef.current.delete(event.session_id);
+            prefetchActivityRefreshRef.current?.newerActivities.set(event.session_id, false);
+          }
+        }
         if (event.type === 'activity') {
+          recordPrefetchActivity(prefetchRunningSessionsRef.current, event);
+          prefetchActivityRefreshRef.current?.newerActivities.set(event.session_id, event.running);
+          // Activity can start before an active turn reaches the persisted
+          // transcript; reject a prefetch GET begun before this observation.
+          historyMutationEpochRef.current += 1;
           const sid = activeIdRef.current;
           if (sid && event.session_id === sid) {
             setIsCompacting(event.status === 'compacting');
@@ -2313,9 +2362,13 @@ export function Chat({
         setUserInputReq((cur) =>
           cur && cur.request_id === event.request_id ? null : cur,
         );
-      }),
-    [],
-  );
+    });
+    return () => {
+      disposed = true;
+      unsubscribe();
+      prefetchActivityRefreshRef.current = null;
+    };
+  }, []);
   /** Project hash for the session on screen, including before App metadata arrives. */
   const viewedProjectHashRef = useRef<string | null>(activeSession?.project_hash ?? null);
   /** Last freshness signature we already parsed. Unchanged files are not read. */
@@ -3116,6 +3169,7 @@ export function Chat({
   useEffect(() => {
     const curHash = activeSession?.project_hash || projectHashBySessionRef.current.get(sessionId || '') || viewedProjectHashRef.current;
     if (!curHash || loading || busy) return;
+    const prefetchViewGeneration = sessionGenerationRef.current;
     let timer: number | null = null;
     let cancelled = false;
 
@@ -3125,23 +3179,65 @@ export function Chat({
         const projectSessions = await listProjectSessions(curHash);
         const candidates = (projectSessions || []).slice(0, 5);
         for (const cand of candidates) {
-          if (cancelled || busy) break;
+          if (cancelled || busyRef.current) break;
+          if (sessionGenerationRef.current !== prefetchViewGeneration) break;
+          // A newly subscribed/reconnected /events stream may not have seen
+          // activity(true) for an already-running session. Do not prefetch any
+          // candidate until its /chat/active reconciliation has settled.
+          if (prefetchActivityRefreshRef.current !== null) continue;
+          // A mutation affects the current candidate only. Later candidates
+          // may still be prefetched once the observed event is accounted for.
+          const candidateMutationEpoch = historyMutationEpochRef.current;
           if (cand.id === sessionId) continue;
-          if (messageCacheRef.current.has(cand.id)) continue;
-          const existing = await getSessionCache(curHash, cand.id);
+          if (prefetchRunningSessionsRef.current.has(cand.id)) continue;
+          if (messageCacheRef.current.has(cand.id) || hasMemorySession(curHash, cand.id)) continue;
+          // Probe L2 without hydrating L1; the mutation/active-view fence must
+          // run before any old disk bytes can be admitted into memory.
+          const existing = await getSessionCache(curHash, cand.id, { hydrateMemory: false });
+          if (cancelled || busyRef.current || sessionGenerationRef.current !== prefetchViewGeneration) break;
+          if (prefetchActivityRefreshRef.current !== null) continue;
+          if (historyMutationEpochRef.current !== candidateMutationEpoch) continue;
           if (existing) continue;
 
           // 随机 5~10 秒延迟加载一个，防网络与 I/O 拥塞
           const delay = 5000 + Math.random() * 5000;
           await new Promise((r) => setTimeout(r, delay));
-          if (cancelled || busy) break;
+          if (cancelled || busyRef.current || sessionGenerationRef.current !== prefetchViewGeneration) break;
+          if (prefetchActivityRefreshRef.current !== null) continue;
+          if (historyMutationEpochRef.current !== candidateMutationEpoch) continue;
 
-          const res = await getSession(curHash, cand.id, { tail: HISTORY_PAGE });
-          if (res && Array.isArray(res.messages)) {
-            const loaded = sessionMessagesToDisplay(res.messages, res.offset ?? 0);
-            messageCacheRef.current.set(cand.id, loaded);
-            await saveSessionCache(curHash, cand.id, loaded, res.todos, undefined, res.turns, res.token_usage);
-          }
+          await applyGuardedSessionPrefetch(
+            async () => {
+              const res = await getSession(curHash, cand.id, { tail: HISTORY_PAGE });
+              return res && Array.isArray(res.messages) ? res : null;
+            },
+            {
+              isCancelled: () =>
+                cancelled ||
+                prefetchActivityRefreshRef.current !== null ||
+                sessionGenerationRef.current !== prefetchViewGeneration ||
+                historyMutationEpochRef.current !== candidateMutationEpoch,
+              isBusy: () => busyRef.current,
+              isCandidateActive: () =>
+                activeIdRef.current === cand.id ||
+                sessionId === cand.id ||
+                prefetchRunningSessionsRef.current.has(cand.id) ||
+                backgroundRunningSessionsRef.current.has(cand.id) ||
+                localTurnSessionsRef.current.has(cand.id),
+              hasCachedSession: () =>
+                messageCacheRef.current.has(cand.id) ||
+                hasMemorySession(curHash, cand.id),
+              currentViewGeneration: () => sessionGenerationRef.current,
+              currentMutationEpoch: () => historyMutationEpochRef.current,
+            },
+            async (res) => {
+              // L1 is updated synchronously before the first await. There is
+              // no opportunity for an older GET to bypass the second guard.
+              const loaded = sessionMessagesToDisplay(res.messages, res.offset ?? 0);
+              messageCacheRef.current.set(cand.id, loaded);
+              await saveSessionCache(curHash, cand.id, loaded, res.todos, undefined, res.turns, res.token_usage);
+            },
+          );
         }
       } catch {}
     }, 4000);
@@ -4895,6 +4991,11 @@ export function Chat({
    * 彻底实现：后台任务完成后切回会话，最后一条正文与工具结果 0ms 纯内存即现，无需刷新，绝不丢失！
    */
   function applyEventToSessionCache(targetSid: string, event: SSEEvent) {
+    if (event.type === 'session_mutation') {
+      // Even without an L1 entry, an observed history mutation must reject a
+      // prefetch GET that started before this event arrived.
+      historyMutationEpochRef.current += 1;
+    }
     if (event.type === 'steered') {
       foldSteeredInputs(event.inputs ?? [], event.client_input_ids, targetSid);
       return;
@@ -5835,6 +5936,7 @@ export function Chat({
       }
       case 'session_mutation': {
         const mutation = event as SessionMutationEvent;
+        historyMutationEpochRef.current += 1;
         // 会话变更改写了权威转录：本会话的续传游标立即作废（两条流都作废），
         // 否则带旧游标重连会把变更前发出的旧帧补回来 —— 已删内容会复活。
         clearStreamCursor(mutation.session_id);
