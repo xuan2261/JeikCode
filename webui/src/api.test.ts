@@ -51,6 +51,78 @@ test('history DELETE fetch receipts gate local history mutations across HTTP no-
   }
 });
 
+test('TRUNCATE refuses definite no-op and unsuccessful receipts before caller side effects', async () => {
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ url: string; init?: RequestInit }> = [];
+  let status = 200;
+  let payload: unknown = { success: true, notFound: true };
+  globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+    requests.push({ url: String(url), init });
+    return new Response(JSON.stringify(payload), {
+      status, headers: { 'Content-Type': 'application/json' },
+    });
+  }) as typeof fetch;
+  try {
+    const { truncateSession } = await import('./api.ts');
+    let postConfirmSideEffects = 0;
+    const rollbackOrRegenerate = (inclusive = false) => truncateSession(
+      '0123456789abcdef', 'test-session', {
+        target_index: 4,
+        expected_text: 'original prompt',
+        expected_role: 'user',
+        inclusive,
+      },
+    ).then((receipt) => { postConfirmSideEffects++; return receipt; });
+
+    for (const rejected of [
+      { success: true, notFound: true },
+      { success: true, notFound: true, revision: 2, target_index: 4 },
+      { success: false },
+      { success: false, target_index: 4, revision: 2 },
+      null,
+    ]) {
+      payload = rejected;
+      await assert.rejects(rollbackOrRegenerate(), /not applied/i);
+      assert.equal(postConfirmSideEffects, 0);
+    }
+    assert.match(requests[0].url, /\/truncate$/);
+    assert.equal(requests[0].init?.method, 'POST');
+    assert.deepEqual(JSON.parse(String(requests[0].init?.body)), {
+      target_index: 4,
+      expected_text: 'original prompt',
+      expected_role: 'user',
+      inclusive: false,
+    });
+
+    payload = { success: true, target_index: 4, revision: 3 };
+    assert.deepEqual(await rollbackOrRegenerate(), payload);
+    assert.equal(postConfirmSideEffects, 1);
+    payload = { success: true, target_index: 5, revision: 4 };
+    assert.deepEqual(await rollbackOrRegenerate(true), payload);
+    assert.equal(postConfirmSideEffects, 2, 'inclusive=true uses the persisted keep-count boundary');
+
+    // The current daemon may persist a re-resolved physical index before
+    // reporting its actual boundary. It is unsafe to surface a retryable
+    // failure after that definite applied receipt.
+    payload = { success: true, target_index: 5, revision: 5 };
+    assert.deepEqual(await rollbackOrRegenerate(), payload);
+    assert.equal(postConfirmSideEffects, 3, 'applied shifted target keeps legacy Promise semantics');
+    payload = { success: true };
+    assert.deepEqual(await rollbackOrRegenerate(), payload);
+    assert.equal(postConfirmSideEffects, 4, 'do not reject a potentially applied legacy success as retryable');
+
+    status = 503;
+    payload = { success: false, error: 'upstream failed' };
+    await assert.rejects(rollbackOrRegenerate());
+    assert.equal(postConfirmSideEffects, 4);
+    globalThis.fetch = (async () => { throw new Error('connection lost'); }) as typeof fetch;
+    await assert.rejects(rollbackOrRegenerate(), /connection lost/);
+    assert.equal(postConfirmSideEffects, 4);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('postLiveMessage does not send approval_mode because live mode is global', async () => {
   const calls: Array<{ url: string; init?: RequestInit }> = [];
   const originalFetch = globalThis.fetch;

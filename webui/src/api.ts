@@ -1030,7 +1030,22 @@ export async function truncateSession(
       body: JSON.stringify(params),
     },
   );
-  return readApiJson(resp);
+  const receipt = await readApiJson<{
+    success: boolean;
+    revision: number;
+    target_index?: number;
+    notFound?: boolean;
+  }>(resp);
+  // HTTP 200 {success:true,notFound:true} means the daemon did not truncate.
+  // Both callers await this promise before modifying canvas/cache or sending
+  // a replacement prompt. Reject only definite no-op/failed receipts:
+  // daemon text/role fallback may ALREADY have persisted a different raw
+  // target_index, so rejecting that applied receipt would expose an unsafe
+  // retry in ConfirmDialog. Canonical target routing is a separate fix.
+  if (!receipt || receipt.success !== true || receipt.notFound === true) {
+    throw new Error('History truncation was not applied');
+  }
+  return receipt;
 }
 
 // --- Config types ---
@@ -2583,6 +2598,5 @@ export async function dismissUpgradeDiffs(): Promise<{ success: boolean }> {
   }
   return resp.json();
 }
-
 
 
