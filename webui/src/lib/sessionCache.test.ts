@@ -268,3 +268,35 @@ test('cache keeps the thirty-entry LRU budget with in-flight async writes', asyn
     await Promise.all(writes);
   });
 });
+
+test('a delayed disk read cannot rehydrate old text after its newer L1 winner was evicted', async () => {
+  await withControlledIDB(async ({ cache, open, reads }) => {
+    const pendingRead = cache.getSessionCache('p', 'target');
+    open();
+    await Promise.resolve();
+    assert.equal(reads.length, 1);
+    await cache.saveSessionCache('p', 'target', [{ content: 'NEW' }]);
+    for (let i = 0; i < 31; i += 1) {
+      await cache.saveSessionCache('p', `filler-${i}`, [{ content: String(i) }]);
+    }
+    assert.equal(cache.hasMemorySession('p', 'target'), false);
+    reads[0].resolve(diskValue('p', 'target', 'OLD'));
+    assert.equal(await pendingRead, null, 'eviction is a cache miss, not permission to restore OLD');
+    assert.equal(cache.hasMemorySession('p', 'target'), false);
+  });
+});
+
+test('a mutation in project A does not invalidate project B using the same session id', async () => {
+  await withControlledIDB(async ({ cache, open, reads }) => {
+    const readB = cache.getSessionCache('project-B', 'same-id');
+    open();
+    await Promise.resolve();
+    assert.equal(reads[0].key, 'project-B:same-id');
+    const writeA = cache.saveSessionCache('project-A', 'same-id', [{ content: 'A-new' }]);
+    reads[0].resolve(diskValue('project-B', 'same-id', 'B-original'));
+    assert.equal((await readB)?.messages[0].content, 'B-original');
+    await writeA;
+    assert.equal(cache.getMemorySession('project-A', 'same-id')?.messages[0].content, 'A-new');
+    assert.equal(cache.getMemorySession('project-B', 'same-id')?.messages[0].content, 'B-original');
+  });
+});
