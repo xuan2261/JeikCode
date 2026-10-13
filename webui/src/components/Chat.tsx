@@ -156,7 +156,7 @@ import {
   getMemorySession,
 } from '../lib/sessionCache';
 import { gitStore } from '../lib/gitStore';
-import { applyConfirmedHistoryDelete, isInternalHistoryAssistantMessage, isInternalHistoryUserMessage, removeAssistantHistoryBySourceIndex, stripInjectedRemindersForDisplay, stripSteerEnvelopeForDisplay } from '../lib/historyMessages';
+import { applyConfirmedHistoryDelete, applyConfirmedHistoryPatch, isInternalHistoryAssistantMessage, isInternalHistoryUserMessage, patchUserHistoryBySourceIndex, removeAssistantHistoryBySourceIndex, stripInjectedRemindersForDisplay, stripSteerEnvelopeForDisplay } from '../lib/historyMessages';
 import {
   loadQueuedFromStorage,
   mergeQueuedIntoDraft,
@@ -6720,36 +6720,61 @@ export function Chat({
     if (!sid || !effectiveHash) return;
 
     const targetMsg = messagesRef.current.find((m) => m.sourceIndex === sourceIndex);
-    const expectedText = targetMsg ? messageText(targetMsg) : undefined;
+    // A displayed source index must identify exactly one original user row.
+    // When older/filtered history maps a click ambiguously, fail closed before
+    // asking the daemon to mutate persisted data.
+    if (!patchUserHistoryBySourceIndex(messagesRef.current, sourceIndex, targetMsg, (row) => row)) return;
+    const expectedText = messageText(targetMsg!);
+    const generation = sessionGenerationRef.current;
+    const isCurrentView = () => activeIdRef.current === sid && sessionGenerationRef.current === generation;
 
     try {
-      await patchSessionMessage(effectiveHash, sid, sourceIndex, {
-        text: newText,
-        images: newImages,
-        expected_text: expectedText,
-        expected_role: 'user',
-      });
-      // 乐观更新：画布与内存缓存同步更新！
-      let nextMessages: Message[] = [];
-      setMessages((prev) => {
-        const next = prev.slice();
-        const idx = next.findIndex((m) => m.sourceIndex === sourceIndex);
-        if (idx !== -1) {
-          next[idx] = {
-            ...next[idx],
-            parts: [{ kind: 'text', text: newText }],
-            images: newImages.length ? newImages : undefined,
-          };
-        }
-        messagesRef.current = next;
-        messageCacheRef.current.set(sid, next);
-        nextMessages = next;
-        return next;
-      });
-      // 权威反向灌入缓存：同步覆盖 L1 内存和 L2 IndexedDB (杜绝刷新延时与时间差)
-      const currentOutline = turnOutlineRef.current.length > 0 ? turnOutlineRef.current : (turnOutlineBySessionRef.current.get(sid) ?? []);
-      void saveSessionCache(effectiveHash, sid, nextMessages, activeTodosRef.current, undefined, currentOutline, tokensAuthoritativeRef.current);
-      setEditingSourceIndex(null);
+      let shiftedTarget = false;
+      const applied = await applyConfirmedHistoryPatch(
+        () => patchSessionMessage(effectiveHash, sid, sourceIndex, {
+          text: newText,
+          images: newImages,
+          expected_text: expectedText,
+          expected_role: 'user',
+        }),
+        isCurrentView,
+        (receipt) => {
+          // The daemon may resolve expected_text/role to a different raw row
+          // and persist before ACK. Never paint the requested row after the
+          // server confirmed a different one; the corresponding SSE may
+          // already have projected that actual row.
+          const appliedSourceIndex = receipt.source_index ?? sourceIndex;
+          shiftedTarget = appliedSourceIndex !== sourceIndex;
+          if (shiftedTarget) return false; // Applied remotely, but cannot safely patch this editor's row.
+          const nextMessages = patchUserHistoryBySourceIndex(
+            messagesRef.current,
+            sourceIndex,
+            targetMsg,
+            (row) => ({
+              ...row,
+              parts: [{ kind: 'text', text: newText }],
+              images: newImages.length ? newImages : undefined,
+            }),
+          );
+          if (!nextMessages) return false; // SSE/reload removed or replaced the original target.
+          // Build synchronously from the current ref; never save the initial
+          // [] before a framework state updater has actually executed.
+          messagesRef.current = nextMessages;
+          messageCacheRef.current.set(sid, nextMessages);
+          setMessages(nextMessages);
+          const currentOutline = turnOutlineRef.current.length > 0
+            ? turnOutlineRef.current : (turnOutlineBySessionRef.current.get(sid) ?? []);
+          void saveSessionCache(effectiveHash, sid, nextMessages, activeTodosRef.current, undefined, currentOutline, tokensAuthoritativeRef.current);
+          setEditingSourceIndex(null);
+          return true;
+        },
+      );
+      if (isCurrentView() && (shiftedTarget || !applied)) {
+        // An applied but different/hidden target is not a retryable HTTP
+        // failure. Close the editor rather than encouraging another mutation.
+        setEditingSourceIndex(null);
+        showToast(t('common.error'), 'error');
+      }
     } catch (e) {
       showToast(t('common.error') + ': ' + (e instanceof Error ? e.message : String(e)), 'error');
     }

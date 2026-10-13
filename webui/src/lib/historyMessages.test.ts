@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { applyConfirmedHistoryDelete, isInternalHistoryUserMessage, removeAssistantHistoryBySourceIndex, sessionMessagesToMarkdownLines, stripInjectedRemindersForDisplay, stripSteerEnvelopeForDisplay } from './historyMessages.ts';
+import { applyConfirmedHistoryDelete, applyConfirmedHistoryPatch, isInternalHistoryUserMessage, patchUserHistoryBySourceIndex, removeAssistantHistoryBySourceIndex, sessionMessagesToMarkdownLines, stripInjectedRemindersForDisplay, stripSteerEnvelopeForDisplay } from './historyMessages.ts';
 import type { SessionMessage } from '../api.ts';
 
 test('stripInjectedRemindersForDisplay keeps only the user question', () => {
@@ -231,4 +231,136 @@ test('assistant deletion by source identity refuses missing, duplicate and wrong
   const legacy = { role: 'assistant', sourceIndex: 8, text: 'legacy response without id' };
   assert.deepEqual(removeAssistantHistoryBySourceIndex([legacy], 8, legacy), []);
   assert.equal(removeAssistantHistoryBySourceIndex([{ ...legacy }], 8, legacy), null);
+});
+
+test('PATCH ACK applies a synchronous source-scoped canvas/cache snapshot', async () => {
+  const target = { role: 'user', id: 'user-4', sourceIndex: 4, text: 'original' };
+  const nextTurn = { role: 'user', id: 'user-7', sourceIndex: 7, text: 'leave alone' };
+  let messages = [target, nextTurn];
+  let cached = messages;
+  let saves = 0;
+  const events: string[] = [];
+  const patched = await applyConfirmedHistoryPatch(
+    async () => { events.push('remote'); return { success: true, revision: 8, source_index: 4 }; },
+    () => true,
+    () => {
+      const next = patchUserHistoryBySourceIndex(messages, 4, target, (row) => ({ ...row, text: 'edited' }));
+      if (!next) return false;
+      messages = next;
+      cached = next;
+      saves++;
+      events.push('cache');
+      return true;
+    },
+  );
+  assert.equal(patched, true);
+  assert.deepEqual(events, ['remote', 'cache']);
+  assert.equal(saves, 1);
+  assert.equal(messages[0].text, 'edited');
+  assert.equal(messages[1], nextTurn);
+  assert.equal(cached, messages, 'one snapshot drives canvas and cache without async state-updater timing');
+});
+
+test('PATCH shifted applied receipt cannot paint another row or report a retryable HTTP failure', async () => {
+  const requested = { role: 'user', id: 'u4', sourceIndex: 4, text: 'should stay' };
+  // SSE may already have updated the actual row before HTTP ACK is observed.
+  const actuallyPatched = { role: 'user', id: 'u5', sourceIndex: 5, text: 'updated by SSE' };
+  let canvas = [requested, actuallyPatched];
+  let cached = canvas;
+  let writes = 0;
+  const result = await applyConfirmedHistoryPatch(
+    async () => ({ success: true, source_index: 5, revision: 7 }),
+    () => true,
+    (receipt) => {
+      if (receipt.source_index !== 4) return false; // Already persisted elsewhere; not retryable.
+      const next = patchUserHistoryBySourceIndex(canvas, 4, requested, (m) => ({ ...m, text: 'edited' }));
+      if (next) { canvas = next; cached = next; writes++; }
+      return next !== null;
+    },
+  );
+  assert.equal(result, false, 'a real server mutation is not a successful local rewrite of the requested row');
+  assert.equal(writes, 0);
+  assert.equal(canvas[0], requested, 'do not paint the untouched originally requested row');
+  assert.equal(canvas[1], actuallyPatched, 'do not overwrite the SSE-reconciled actual row');
+  assert.equal(cached, canvas);
+});
+
+test('PATCH applied shifted receipt does not become retryable when its actual row is hidden or ambiguous', async () => {
+  const requested = { role: 'user', id: 'u4', sourceIndex: 4, text: 'original' };
+  let writes = 0;
+  assert.equal(await applyConfirmedHistoryPatch(
+    async () => ({ success: true, revision: 9, source_index: 5 }),
+    () => true,
+    (receipt) => {
+      const next = patchUserHistoryBySourceIndex([requested], receipt.source_index ?? 4, requested, (m) => ({ ...m, text: 'edited' }));
+      if (next) writes++;
+      return next !== null;
+    },
+  ), false);
+  assert.equal(writes, 0);
+});
+
+test('PATCH missing/not-applied receipt and network error cannot write local history', async () => {
+  for (const receipt of [{ success: false }, { success: true, notFound: true }, null]) {
+    let localWrites = 0;
+    await assert.rejects(applyConfirmedHistoryPatch(
+      async () => receipt as { success: boolean },
+      () => true,
+      () => { localWrites++; return true; },
+    ), /not applied/i);
+    assert.equal(localWrites, 0);
+  }
+  let localWrites = 0;
+  await assert.rejects(applyConfirmedHistoryPatch(
+    async () => { throw new Error('offline'); },
+    () => true,
+    () => { localWrites++; return true; },
+  ), /offline/);
+  assert.equal(localWrites, 0);
+});
+
+test('PATCH stale confirm before POST and A→B→A after ACK cannot mutate another view', async () => {
+  let sid = 'A';
+  let generation = 10;
+  const captured = generation;
+  let requested = 0;
+  let applied = 0;
+  assert.equal(await applyConfirmedHistoryPatch(
+    async () => { requested++; return { success: true }; },
+    () => sid === 'A' && generation === captured + 1,
+    () => { applied++; return true; },
+  ), false);
+  assert.equal(requested, 0);
+
+  assert.equal(await applyConfirmedHistoryPatch(
+    async () => {
+      requested++;
+      sid = 'B';
+      generation++;
+      sid = 'A';
+      generation++;
+      return { success: true };
+    },
+    () => sid === 'A' && generation === captured,
+    () => { applied++; return true; },
+  ), false);
+  assert.equal(requested, 1);
+  assert.equal(applied, 0);
+});
+
+test('PATCH source resolver refuses stale, duplicate, wrong-role, reused-ID and replaced legacy row', () => {
+  const target = { role: 'user', sourceIndex: 4, id: 'u4', text: 'before' };
+  const assistant = { role: 'assistant', sourceIndex: 5, id: 'a5', text: 'answer' };
+  assert.deepEqual(
+    patchUserHistoryBySourceIndex([target, assistant], 4, target, (row) => ({ ...row, text: 'after' })),
+    [{ ...target, text: 'after' }, assistant],
+  );
+  assert.equal(patchUserHistoryBySourceIndex([target], 99, target, (row) => row), null);
+  assert.equal(patchUserHistoryBySourceIndex([assistant], 5, assistant, (row) => row), null);
+  assert.equal(patchUserHistoryBySourceIndex([target, { ...target, id: 'other' }], 4, target, (row) => row), null);
+  assert.equal(patchUserHistoryBySourceIndex([{ ...target, id: 'reused' }], 4, target, (row) => row), null);
+  assert.equal(patchUserHistoryBySourceIndex([{ ...target, text: 'newer SSE' }], 4, target, (row) => row), null);
+  const legacy = { role: 'user', sourceIndex: 6, text: 'legacy' };
+  assert.deepEqual(patchUserHistoryBySourceIndex([legacy], 6, legacy, (row) => ({ ...row, text: 'changed' })), [{ ...legacy, text: 'changed' }]);
+  assert.equal(patchUserHistoryBySourceIndex([{ ...legacy }], 6, legacy, (row) => row), null);
 });

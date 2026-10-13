@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { applyConfirmedHistoryDelete } from './lib/historyMessages.ts';
+import { applyConfirmedHistoryDelete, applyConfirmedHistoryPatch } from './lib/historyMessages.ts';
 
 Object.defineProperty(globalThis, 'location', {
   value: new URL('http://localhost/?token=test-token'),
@@ -120,6 +120,68 @@ test('TRUNCATE refuses definite no-op and unsuccessful receipts before caller si
     assert.equal(postConfirmSideEffects, 4);
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test('PATCH real-fetch receipts do not authorize client cache writes on 404, HTTP failures or 200 unsuccessful', async () => {
+  const previousFetch = globalThis.fetch;
+  let status = 404;
+  let body: unknown = { success: false, error: 'message not found' };
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+    calls.push({ url: String(url), init });
+    return new Response(JSON.stringify(body), {
+      status, headers: { 'Content-Type': 'application/json' },
+    });
+  }) as typeof fetch;
+  try {
+    const { patchSessionMessage } = await import('./api.ts');
+    let cacheWrites = 0;
+    const acknowledgedIndices: Array<number | undefined> = [];
+    const saveRewrite = () => applyConfirmedHistoryPatch(
+      () => patchSessionMessage('0123456789abcdef', 'session-a', 4, {
+        text: 'edited prompt', images: [], expected_text: 'original prompt', expected_role: 'user',
+      }),
+      () => true,
+      (receipt) => {
+        acknowledgedIndices.push(receipt.source_index);
+        cacheWrites++;
+        return true;
+      },
+    );
+    await assert.rejects(saveRewrite(), /message not found/);
+    assert.equal(cacheWrites, 0);
+    assert.equal(calls[0].init?.method, 'PATCH');
+    assert.match(calls[0].url, /\/messages\/4$/);
+    assert.deepEqual(JSON.parse(String(calls[0].init?.body)), {
+      text: 'edited prompt', images: [], expected_text: 'original prompt', expected_role: 'user',
+    });
+
+    status = 200;
+    body = { success: false };
+    await assert.rejects(saveRewrite(), /not applied/i);
+    assert.equal(cacheWrites, 0);
+
+    body = { success: true, revision: 11, source_index: 4 };
+    assert.equal(await saveRewrite(), true);
+    assert.equal(cacheWrites, 1);
+
+    // Native may have already PATCHed a re-resolved persisted physical row.
+    // The view guard must not turn an applied response into a retryable error.
+    body = { success: true, revision: 12, source_index: 5 };
+    assert.equal(await saveRewrite(), true);
+    assert.equal(cacheWrites, 2);
+    assert.deepEqual(acknowledgedIndices, [4, 5], 'the applied source_index must reach WebUI reconciliation unchanged');
+
+    status = 503;
+    body = { error: 'server unavailable' };
+    await assert.rejects(saveRewrite(), /server unavailable/);
+    assert.equal(cacheWrites, 2);
+    globalThis.fetch = (async () => { throw new Error('network lost'); }) as typeof fetch;
+    await assert.rejects(saveRewrite(), /network lost/);
+    assert.equal(cacheWrites, 2);
+  } finally {
+    globalThis.fetch = previousFetch;
   }
 });
 

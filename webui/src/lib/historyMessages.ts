@@ -25,6 +25,70 @@ export async function applyConfirmedHistoryDelete(
 }
 
 /**
+ * A PATCH acknowledgement can arrive after the user switches sessions (even
+ * A→B→A). It never authorizes mutation of a different/current view. HTTP
+ * failures already reject in the API, while a malformed/unsuccessful 200 must
+ * not write into the canvas or cache.
+ *
+ * A persisted acknowledgement received offscreen cannot project onto the
+ * newer view or its caches. Authoritative source-session refresh across
+ * A→B→A and multi-client writes needs a separate revision/GET contract.
+ */
+export interface HistoryPatchReceipt {
+  success: boolean;
+  notFound?: boolean;
+  source_index?: number;
+  revision?: number;
+}
+
+export async function applyConfirmedHistoryPatch(
+  patchRemote: () => Promise<HistoryPatchReceipt | null>,
+  isCurrentView: () => boolean,
+  applyLocal: (receipt: HistoryPatchReceipt) => boolean,
+): Promise<boolean> {
+  if (!isCurrentView()) return false;
+  const receipt = await patchRemote();
+  if (!receipt || receipt.success !== true || receipt.notFound === true) {
+    throw new Error('History patch was not applied');
+  }
+  if (!isCurrentView()) return false;
+  return applyLocal(receipt);
+}
+
+/** Resolve one original user row against the live transcript, not a captured
+ * render index. This is a pure/synchronous snapshot builder: the same returned
+ * array must be installed in messagesRef, the canvas and both cache layers.
+ *
+ * Even with a stable ID, a new object may be an SSE-first update from this
+ * PATCH or a newer peer PATCH. Never overwrite that replacement with a stale
+ * ACK. Refuse ambiguous/reused indexes and non-user rows.
+ */
+export function patchUserHistoryBySourceIndex<
+  T extends { sourceIndex?: number; role: string; id?: string }
+>(
+  messages: readonly T[],
+  sourceIndex: number,
+  expectedUser: T | undefined,
+  update: (message: T) => T,
+): T[] | null {
+  if (!Number.isSafeInteger(sourceIndex) || sourceIndex < 0
+    || !expectedUser || expectedUser.role !== 'user'
+    || expectedUser.sourceIndex !== sourceIndex) return null;
+  let position = -1;
+  for (let i = 0; i < messages.length; i += 1) {
+    const current = messages[i];
+    if (current.sourceIndex !== sourceIndex) continue;
+    // Any second row with this raw index is ambiguous, including a non-user.
+    if (position !== -1 || current.role !== 'user' || current !== expectedUser) return null;
+    position = i;
+  }
+  if (position < 0) return null;
+  const next = messages.slice();
+  next[position] = update(messages[position]);
+  return next;
+}
+
+/**
  * The daemon can broadcast session_mutation before the initiating DELETE HTTP
  * response resolves. If SSE already removed the assistant, a captured render
  * index now points at the following row. Only remove the original source row;
