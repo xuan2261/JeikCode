@@ -6752,7 +6752,7 @@ export function Chat({
             targetMsg,
             (row) => ({
               ...row,
-              parts: [{ kind: 'text', text: newText }],
+              parts: [{ kind: 'text' as const, text: newText }],
               images: newImages.length ? newImages : undefined,
             }),
           );

@@ -92,6 +92,20 @@ one synchronously computed transcript instead of saving an uninitialized
   required `Co-Authored-By: JeikCode <code@jeikcode.top>`, non-force push to
   fork, remote HEAD exact SHA.
 - [ ] Exact-SHA fork GitHub Actions applicable matrix.
+- [x] Initial commit `f9218b69b35be5633fd9aee696aa755ab44d1bbe`
+  was pushed non-force, fork HEAD matched, and CI
+  [38338959862](https://github.com/xuan2261/JeikCode/actions/runs/38338959862)
+  ran at that exact SHA. **RESULT: FAIL**, not PASS: 3 jobs SUCCESS
+  (Version consistency and Windows/Ubuntu installer integrity);
+  WebUI quality failed on `tsc` because the new `parts` array's
+  `kind` inferred `string` rather than literal `'text'` at
+  `Chat.tsx:6755`; Rust quality was **SKIPPED**. This failed SHA cannot
+  certify WebUI correctness.
+- [x] Focused candidate postcommit correction: keep `kind: 'text' as const`
+  in the PATCH projection callback. No behavior/contract change.
+- [ ] Review exact follow-up patch, run targeted test, commit new SHA,
+  push non-force and dispatch/verify **new exact-SHA CI** before promotion
+  to FORK_VERIFIED.
 - [ ] Real browser (session switch, SSE ordering), multi-tab,
   installed Desktop/Mobile/native proof: **NOT YET VERIFIED**.
 
