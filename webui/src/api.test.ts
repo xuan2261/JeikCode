@@ -6,6 +6,100 @@ Object.defineProperty(globalThis, 'location', {
   configurable: true,
 });
 
+test('legacy queue helpers remain best-effort for existing callers', async () => {
+  const originalFetch = globalThis.fetch;
+  const requests: string[] = [];
+  globalThis.fetch = (async (url: RequestInfo | URL) => {
+    requests.push(String(url));
+    return new Response('unavailable', { status: 503 });
+  }) as typeof fetch;
+  try {
+    const { getChatQueue, saveChatQueue } = await import('./api.ts');
+    assert.deepEqual(await getChatQueue('session-a'), []);
+    await saveChatQueue('session-a', []);
+    assert.deepEqual(requests, ['/chat/queue?session_id=session-a', '/chat/queue']);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('confirmed queue GET rejects transport failure or malformed data rather than returning empty', async () => {
+  const originalFetch = globalThis.fetch;
+  let status = 200;
+  let payload = '[{"id":"rejected-chat:request-a","text":"retry","kind":"queue","approval_mode":"plan","images":[{"media_type":"image/png","data":"mock"}]}]';
+  const paths: string[] = [];
+  globalThis.fetch = (async (url: RequestInfo | URL) => {
+    paths.push(String(url));
+    return new Response(payload, { status });
+  }) as typeof fetch;
+  try {
+    const { getChatQueueConfirmed } = await import('./api.ts');
+    assert.deepEqual(await getChatQueueConfirmed('session/a'), [
+      {
+        id: 'rejected-chat:request-a', text: 'retry', kind: 'queue', approval_mode: 'plan',
+        images: [{ media_type: 'image/png', data: 'mock' }],
+      },
+    ]);
+    status = 503;
+    await assert.rejects(getChatQueueConfirmed('session/a'), /HTTP 503/);
+    status = 200;
+    for (const invalid of ['{"error":"unavailable"}', '[null]', '[{"id":"x","text":"retry"}]',
+      '[{"id":"x","kind":"queue"}]', '[{"text":"retry","kind":"queue"}]',
+      '[{"id":"x","text":"retry","kind":"queue","images":"invalid"}]',
+      '[{"id":"x","text":"retry","kind":"queue","images":[{"media_type":1,"data":"x"}]}]',
+      '[{"id":"x","text":"retry","kind":"queue","images":[{"media_type":"image/png","data":null}]}]',
+      '[{"id":"x","text":"retry","kind":"queue","approval_mode":"unsupported"}]',
+      '[{"id":"x","text":"retry","kind":"queue","approval_mode":42}]']) {
+      payload = invalid;
+      await assert.rejects(getChatQueueConfirmed('session/a'), /invalid payload/);
+    }
+    // Beta daemon serializes absent serde Option fields as null. Strict
+    // consumers should see a valid optional TypeScript shape, not nulls.
+    payload = '[{"id":4,"text":"ordinary","kind":"queue","images":null,"approval_mode":null}]';
+    assert.deepEqual(await getChatQueueConfirmed('session/a'), [
+      { id: 4, text: 'ordinary', kind: 'queue' },
+    ]);
+    payload = '';
+    await assert.rejects(getChatQueueConfirmed('session/a'), /JSON|Unexpected end/);
+    assert.ok(paths.every((path) => path === '/chat/queue?session_id=session%2Fa'));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('confirmed queue POST resolves only on an HTTP success with success:true receipt', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls: unknown[] = [];
+  let status = 200;
+  let payload = '{"success":true}';
+  globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+    assert.equal(String(url), '/chat/queue');
+    assert.equal(init?.method, 'POST');
+    calls.push(JSON.parse(String(init?.body)));
+    return new Response(payload, { status });
+  }) as typeof fetch;
+  try {
+    const { saveChatQueueConfirmed } = await import('./api.ts');
+    const queue = [{
+      id: 'rejected-chat:request-b', text: 'retry with an image', kind: 'queue' as const,
+      images: [{ media_type: 'image/png', data: 'mock-image' }], approval_mode: 'build' as const,
+    }];
+    await saveChatQueueConfirmed('session-b', queue);
+    assert.deepEqual(calls[0], { session_id: 'session-b', items: queue });
+    status = 503;
+    await assert.rejects(saveChatQueueConfirmed('session-b', []), /HTTP 503/);
+    status = 200;
+    payload = '{"success":false}';
+    await assert.rejects(saveChatQueueConfirmed('session-b', []), /not acknowledged/);
+    payload = '{}';
+    await assert.rejects(saveChatQueueConfirmed('session-b', []), /not acknowledged/);
+    payload = '';
+    await assert.rejects(saveChatQueueConfirmed('session-b', []), /JSON|Unexpected end/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('postLiveMessage does not send approval_mode because live mode is global', async () => {
   const calls: Array<{ url: string; init?: RequestInit }> = [];
   const originalFetch = globalThis.fetch;
@@ -404,6 +498,29 @@ test('postChatPrompt submits prompt via RPC and returns 202 prompt ack', async (
         ? headers.get('Accept')
         : (headers as Record<string, string> | undefined)?.['Accept'];
     assert.equal(acceptHeader, 'application/json');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('postChatPrompt exposes exact HTTP 409 status even if rejection JSON is unreadable', async () => {
+  const originalFetch = globalThis.fetch;
+  let reply = '{"code":"session_busy","error":"session is busy"}';
+  globalThis.fetch = (async () => new Response(reply, { status: 409 })) as typeof fetch;
+  try {
+    const { postChatPrompt } = await import('./api.ts');
+    await assert.rejects(
+      () => postChatPrompt({ message: 'queue original', session_id: 'session-a' }),
+      (error: unknown) => error instanceof Error
+        && (error as Error & { status?: number; code?: string }).status === 409
+        && (error as Error & { code?: string }).code === 'session_busy',
+    );
+    reply = '';
+    await assert.rejects(
+      () => postChatPrompt({ message: 'queue original', session_id: 'session-a' }),
+      (error: unknown) => error instanceof Error
+        && (error as Error & { status?: number }).status === 409,
+    );
   } finally {
     globalThis.fetch = originalFetch;
   }
