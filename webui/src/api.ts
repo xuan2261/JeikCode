@@ -426,6 +426,74 @@ export async function getChatQueue(sessionId: string): Promise<QueuedMessageApiI
   }
 }
 
+/**
+ * Strict transport/schema validation for future queue reconciliation callers.
+ * HTTP errors, unreadable JSON and malformed arrays must never be presented
+ * as an authoritative empty queue. A 200 [] still cannot prove disk health
+ * on older daemons that suppress their own persistence/read errors.
+ */
+export async function getChatQueueConfirmed(sessionId: string): Promise<QueuedMessageApiItem[]> {
+  const resp = await apiFetch(`/chat/queue?session_id=${encodeURIComponent(sessionId)}`, {
+    headers: authHeaders(),
+  });
+  if (!resp.ok) throw new Error(`Queue lookup rejected: HTTP ${resp.status}`);
+  const list: unknown = await resp.json();
+  if (!Array.isArray(list)) throw new Error('Queue lookup returned an invalid payload');
+  const validated: QueuedMessageApiItem[] = [];
+  for (const entry of list) {
+    if (entry == null || typeof entry !== 'object') {
+      throw new Error('Queue lookup returned an invalid payload');
+    }
+    const item = entry as Record<string, unknown>;
+    const images = item.images;
+    const mode = item.approval_mode;
+    if ((typeof item.id !== 'string' && typeof item.id !== 'number')
+      || typeof item.text !== 'string'
+      || (item.kind !== 'queue' && item.kind !== 'steer' && item.kind !== 'steering')
+      || (images != null && (!Array.isArray(images)
+        || !images.every((image) => image != null && typeof image === 'object'
+          && typeof image.media_type === 'string' && typeof image.data === 'string')))
+      || (mode != null && mode !== 'build' && mode !== 'plan'
+        && mode !== 'bypass' && mode !== 'accept_edits')) {
+      throw new Error('Queue lookup returned an invalid payload');
+    }
+    // Beta's native Option fields can serialize as null. Remove those nulls
+    // instead of exposing a value incompatible with ImageData[]/ApprovalMode.
+    // Preserve opaque server extension fields without treating them as
+    // validated admission identities. Future wire additions need their own
+    // explicit validation before a safety-critical consumer trusts them.
+    const normalized = { ...item };
+    if (images == null) delete normalized.images;
+    if (mode == null) delete normalized.approval_mode;
+    validated.push(normalized as unknown as QueuedMessageApiItem);
+  }
+  return validated;
+}
+
+/**
+ * Wait for a positive HTTP JSON queue-update receipt on the existing route.
+ * This proves only what the daemon REPORTED; current beta daemons may report
+ * success:true even when queue-file I/O fails. It is NOT a durable write or
+ * a subsequent /chat user-admission receipt.
+ */
+export async function saveChatQueueConfirmed(
+  sessionId: string,
+  items: QueuedMessageApiItem[],
+): Promise<void> {
+  const resp = await apiFetch('/chat/queue', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ session_id: sessionId, items }),
+  });
+  if (!resp.ok) throw new Error(`Queue update rejected: HTTP ${resp.status}`);
+  const acknowledgement: unknown = await resp.json();
+  if (acknowledgement == null || typeof acknowledgement !== 'object'
+    || !('success' in acknowledgement) || acknowledgement.success !== true) {
+    throw new Error('Queue update not acknowledged');
+  }
+}
+
+/** Historical fire-and-forget callers retain best-effort semantics. */
 export async function saveChatQueue(sessionId: string, items: QueuedMessageApiItem[]): Promise<void> {
   await apiFetch('/chat/queue', {
     method: 'POST',
