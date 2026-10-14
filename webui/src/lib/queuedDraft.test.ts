@@ -3,12 +3,21 @@ import { test } from 'node:test';
 import {
   appendRejectedChatRetry,
   dispatchRejectedChatRetryAfterQueueClear,
+  findConfirmedChatAdmission,
+  hasUnresolvedChatAdmission,
   isUnacceptedChatRetry,
   mergeQueuedIntoDraft,
+  mergeQueueAdmissionHints,
   queueAfterSessionActiveCheck,
+  reconcileQueuedAdmissionSnapshot,
+  releaseOwnedQueueHydration,
   queuedItemAlreadyDelivered,
   queuedPayloadHasContent,
+  queuedWriteDisposition,
+  preserveClearedRetryBarrier,
+  rejectedRetryNeedsReconciliation,
   rejectedChatRetryId,
+  retryAfterChatAdmission,
   restoreRejectedChatRetry,
   shouldHydrateServerQueuedItem,
   queuedSendStillOwnsView,
@@ -17,6 +26,7 @@ import {
   serializeSessionQueueWrite,
   stashSessionQueued,
   restoreSessionQueued,
+  unresolvedChatAdmissionRequestId,
 } from './queuedDraft.ts';
 
 test('409 retry retains distinct repeated prompts, images and approval modes until submitted', () => {
@@ -87,7 +97,7 @@ test('accepted rejected-chat retry is not sent before acknowledged server queue 
   let sends = 0;
   let restored = 0;
   const dispatch = dispatchRejectedChatRetryAfterQueueClear(
-    () => waiting, () => true, () => { sends++; }, () => { restored++; },
+    () => waiting, () => true, async () => { sends++; return { status: 'admitted' as const }; }, () => { restored++; },
   );
   assert.equal(sends, 0, 'admission must not race queue-clear receipt');
   acceptClear?.();
@@ -97,17 +107,308 @@ test('accepted rejected-chat retry is not sent before acknowledged server queue 
 
   const failed = await dispatchRejectedChatRetryAfterQueueClear(
     async () => { throw new Error('server unavailable'); },
-    () => true, () => { sends++; }, () => { restored++; },
+    () => true, async () => { sends++; return { status: 'admitted' as const }; }, () => { restored++; },
   );
   assert.equal(failed, false);
   assert.equal(sends, 1, 'failed queue removal cannot produce an accepted/stale retry');
   assert.equal(restored, 1);
   const switched = await dispatchRejectedChatRetryAfterQueueClear(
-    async () => {}, () => false, () => { sends++; }, () => { restored++; },
+    async () => {}, () => false, async () => { sends++; return { status: 'admitted' as const }; }, () => { restored++; },
   );
   assert.equal(switched, false, 'a queued retry cannot submit into another viewed session');
   assert.equal(sends, 1);
   assert.equal(restored, 2);
+});
+
+test('a queue-clear ACK alone cannot consume a rejected retry before chat admission', async () => {
+  let acknowledgeAdmission: ((outcome: { status: 'admitted' | 'rejected' }) => void) | undefined;
+  const admission = new Promise<{ status: 'admitted' | 'rejected' }>((resolve) => { acknowledgeAdmission = resolve; });
+  let started = 0;
+  let restored = 0;
+  let settled = false;
+  const dispatch = dispatchRejectedChatRetryAfterQueueClear(
+    async () => {},
+    () => true,
+    async () => { started++; return admission; },
+    () => { restored++; },
+  );
+  void dispatch.then(() => { settled = true; });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(started, 1, 'chat submission must start after the clear receipt');
+  assert.equal(settled, false, 'the retry is reserved until chat admission resolves');
+  acknowledgeAdmission?.({ status: 'rejected' });
+  assert.equal(await dispatch, false, 'a failed chat admission must not count as delivery');
+  assert.equal(restored, 1, 'failed admission restores the exact retry once');
+});
+
+test('a thrown chat admission preserves its retry; a positive receipt consumes it once', async () => {
+  let restored = 0;
+  const rejected = await dispatchRejectedChatRetryAfterQueueClear(
+    async () => {}, () => true,
+    async () => { throw new Error('HTTP 409'); },
+    () => { restored++; },
+  );
+  assert.equal(rejected, false);
+  assert.equal(restored, 1);
+  const accepted = await dispatchRejectedChatRetryAfterQueueClear(
+    async () => {}, () => true,
+    async () => ({ status: 'admitted' as const }),
+    () => { restored++; },
+  );
+  assert.equal(accepted, true);
+  assert.equal(restored, 1);
+});
+
+test('uncertain POST receipt is not a rejection and must retain exact admission identity', async () => {
+  const outcomes: Array<{ status: string; requestId?: string }> = [];
+  const result = await dispatchRejectedChatRetryAfterQueueClear(
+    async () => {}, () => true,
+    async () => ({ status: 'unknown' as const, requestId: 'attempt-42' }),
+    (outcome) => { outcomes.push(outcome); },
+  );
+  assert.equal(result, false);
+  assert.deepEqual(outcomes, [{ status: 'unknown', requestId: 'attempt-42' }]);
+
+  const item = retryAfterChatAdmission(
+    { id: rejectedChatRetryId('original-409'), kind: 'queue' },
+    { status: 'unknown', requestId: 'attempt-42' },
+  );
+  assert.equal(queuedItemAlreadyDelivered(item, (id) => id === 'attempt-41'), false);
+  assert.equal(queuedItemAlreadyDelivered(item, (id) => id === 'attempt-42'), true,
+    'only the exact authoritative admitted user echo may consume a pending retry');
+});
+
+test('unknown admission retains the exact request in original queued payload across storage and blocks all drain', () => {
+  const original = {
+    id: rejectedChatRetryId('first-409'), text: 'continue', kind: 'queue' as const,
+    images: [{ media_type: 'image/png', data: 'unique-image' }],
+    approvalMode: 'plan' as const,
+  };
+  const uncertain = retryAfterChatAdmission(original, { status: 'unknown', requestId: 'attempt-42' });
+  assert.equal(uncertain.id, original.id);
+  assert.equal(uncertain.clientInputId, 'chat-unknown:attempt-42');
+  assert.equal(unresolvedChatAdmissionRequestId(uncertain), 'attempt-42');
+  assert.deepEqual(uncertain.images, original.images);
+  assert.equal(uncertain.approvalMode, 'plan');
+  assert.equal(rejectedRetryNeedsReconciliation(uncertain), true);
+  assert.equal(hasUnresolvedChatAdmission([{
+    id: 33, text: 'later', kind: 'queue' as const, approvalMode: 'build' as const,
+  }, uncertain]), true, 'later queue items cannot bypass an unknown earlier admission');
+  const serialized = JSON.parse(JSON.stringify(serializeQueuedForServer([uncertain])))[0];
+  assert.equal(serialized.client_input_id, 'chat-unknown:attempt-42');
+  const afterReload = restoreQueuedFromServer(serialized, 'build');
+  assert.equal(afterReload.clientInputId, 'chat-unknown:attempt-42');
+  assert.equal(rejectedRetryNeedsReconciliation(afterReload), true);
+  const stale = { ...original, clientInputId: undefined };
+  assert.equal(restoreRejectedChatRetry([stale], uncertain, true)[0].clientInputId, 'chat-unknown:attempt-42',
+    'reconciliation identity must replace a same-ID stale in-memory item');
+  assert.equal(queuedItemAlreadyDelivered(afterReload, (id) => id === 'different-request'), false);
+  assert.equal(queuedItemAlreadyDelivered(afterReload, (id) => id === 'attempt-42'), true);
+  const onceConfirmed = [afterReload].filter((item) => !queuedItemAlreadyDelivered(item, (id) => id === 'attempt-42'));
+  assert.equal(hasUnresolvedChatAdmission(onceConfirmed), false);
+  assert.strictEqual(retryAfterChatAdmission(original, { status: 'rejected' }), original,
+    'a definite pre-admission rejection is safely retryable without a stale identity marker');
+});
+
+test('ambiguous callback error without a request ID fails closed rather than blindly retrying', async () => {
+  const source = { id: rejectedChatRetryId('source'), kind: 'queue' as const, text: 'prompt' };
+  let retained = source as typeof source & { clientInputId?: string };
+  const result = await dispatchRejectedChatRetryAfterQueueClear(
+    async () => {}, () => true,
+    async () => { throw new Error('network died after potential admission'); },
+    (outcome) => { retained = retryAfterChatAdmission(source, outcome); },
+  );
+  assert.equal(result, false);
+  assert.equal(retained.clientInputId, `chat-unknown:unresolved:${source.id}`);
+  assert.equal(unresolvedChatAdmissionRequestId(retained), null);
+  assert.equal(rejectedRetryNeedsReconciliation(retained), true);
+  assert.equal(queuedItemAlreadyDelivered(retained, (id) => id === 'unrelated'), false);
+  assert.equal(queuedItemAlreadyDelivered(retained, (id) => id === 'attempt-after-failure'), false,
+    'a real request ID cannot accidentally match the local fail-closed sentinel');
+});
+
+test('a rejected chat retry reverting from an ordinary steer is not an unknown chat admission', () => {
+  const rid = rejectedChatRetryId('prior-chat-409');
+  const definiteSteerFailure = { id: rid, kind: 'queue' as const, clientInputId: 'steer-attempt-17' };
+  const unmergedSteerAfterTurn = { id: rid, kind: 'queue' as const, clientInputId: 'steer-attempt-18' };
+  for (const item of [definiteSteerFailure, unmergedSteerAfterTurn]) {
+    assert.equal(rejectedRetryNeedsReconciliation(item), false,
+      'the Steer identity does not mean a /chat HTTP 202 was lost');
+    assert.equal(unresolvedChatAdmissionRequestId(item), null);
+    assert.equal(hasUnresolvedChatAdmission([item]), false);
+    assert.equal(queuedItemAlreadyDelivered(item, (id) => id === item.clientInputId), false,
+      'an ordinary queued item is not auto-consumed as an admitted /chat retry');
+  }
+  const afterUnknownChat = retryAfterChatAdmission(definiteSteerFailure,
+    { status: 'unknown', requestId: 'chat-attempt-99' });
+  assert.equal(rejectedRetryNeedsReconciliation(afterUnknownChat), true);
+  assert.equal(unresolvedChatAdmissionRequestId(afterUnknownChat), 'chat-attempt-99');
+  assert.equal(queuedItemAlreadyDelivered(afterUnknownChat, (id) => id === 'steer-attempt-17'), false);
+  assert.equal(queuedItemAlreadyDelivered(afterUnknownChat, (id) => id === 'chat-attempt-99'), true);
+});
+
+test('an old queue GET cannot rehydrate R after unknown admission or its exact confirmation', () => {
+  const id = rejectedChatRetryId('original-rejected-id');
+  const oldGetSnapshot = [{ id, kind: 'queue' as const, text: 'original' }];
+  const barriers = new Set<string>([id]); // strict clear was acknowledged
+  const lostAck = { status: 'unknown' as const, requestId: 'admitted-request' };
+  if (!preserveClearedRetryBarrier(lostAck)) barriers.delete(id);
+  assert.equal(shouldHydrateServerQueuedItem(oldGetSnapshot[0], barriers), false,
+    'old GET cannot overwrite unknown/admitting state');
+  const retained = retryAfterChatAdmission(oldGetSnapshot[0], lostAck);
+  const admitted = queuedItemAlreadyDelivered(retained, (candidate) => candidate === 'admitted-request');
+  assert.equal(admitted, true);
+  assert.equal(shouldHydrateServerQueuedItem(oldGetSnapshot[0], barriers), false,
+    'once the exact user is admitted, an older GET still cannot resurrect the cleared ID');
+
+  const definite409 = { status: 'rejected' as const };
+  if (!preserveClearedRetryBarrier(definite409)) barriers.delete(id);
+  assert.equal(shouldHydrateServerQueuedItem(oldGetSnapshot[0], barriers), true,
+    'an explicitly rejected, never-admitted retry may intentionally reappear');
+});
+
+test('a same-ID server UNKNOWN upgrades stale localStorage instead of silently re-sending R', () => {
+  const id = rejectedChatRetryId('original-409');
+  const plain = { id, kind: 'queue' as const, text: 'repeat', approvalMode: 'plan' as const };
+  const serverUnknown = retryAfterChatAdmission(plain, { status: 'unknown', requestId: 'accepted-42' });
+  const another = { id: 77, kind: 'queue' as const, text: 'new prompt', approvalMode: 'build' as const };
+  const merged = mergeQueueAdmissionHints([plain, another], [serverUnknown]);
+  assert.deepEqual(merged.map((entry) => entry.id), [id, 77]);
+  assert.equal(merged[0]?.clientInputId, 'chat-unknown:accepted-42');
+  assert.equal(merged[0]?.text, plain.text);
+  assert.equal(hasUnresolvedChatAdmission(merged), true);
+  assert.equal(queuedItemAlreadyDelivered(merged[0]!, (attempt) => attempt === 'accepted-42'), true);
+  assert.strictEqual(mergeQueueAdmissionHints(merged, [serverUnknown]), merged,
+    'unchanged admission identity must not churn the queue or trigger a new POST');
+
+  const staleServer = [plain];
+  assert.strictEqual(mergeQueueAdmissionHints(merged, staleServer), merged,
+    'a delayed older GET cannot downgrade a newer UNKNOWN local marker');
+  const appended = mergeQueueAdmissionHints(merged, [{ ...another, id: 78 }]);
+  assert.deepEqual(appended.map((item) => item.id), [id, 77, 78]);
+});
+
+test('canonical exact user consumes a same-ID stale local retry only after server UNKNOWN is merged', () => {
+  const id = rejectedChatRetryId('original-409');
+  const localPlain = { id, kind: 'queue' as const, text: 'same text', approvalMode: 'plan' as const };
+  const serverUnknown = retryAfterChatAdmission(localPlain,
+    { status: 'unknown', requestId: 'already-admitted-42' });
+  const seen = (requestId: string) => requestId === 'already-admitted-42';
+  const after = reconcileQueuedAdmissionSnapshot([localPlain], [serverUnknown], seen);
+  assert.deepEqual(after, [], 'exact admitted user must remove the same original R, not strand it');
+  const different = reconcileQueuedAdmissionSnapshot([localPlain], [serverUnknown],
+    (requestId) => requestId === 'another-user');
+  assert.equal(different.length, 1);
+  assert.equal(different[0].clientInputId, 'chat-unknown:already-admitted-42');
+  assert.equal(hasUnresolvedChatAdmission(different), true);
+});
+
+test('server queue missing a stale local rejected retry cannot silently authorize re-admission', () => {
+  const old = {
+    id: rejectedChatRetryId('earlier-409'),
+    kind: 'queue' as const,
+    text: 'original text',
+    approvalMode: 'plan' as const,
+    images: [{ media_type: 'image/png', data: 'original-image' }],
+  };
+  const other = { id: 123, kind: 'queue' as const, text: 'ordinary prompt', approvalMode: 'build' as const };
+  const merged = mergeQueueAdmissionHints([old, other], [], true);
+  assert.equal(merged.length, 2, 'missing server rows cannot discard locally retained content');
+  assert.equal(merged[0].id, old.id);
+  assert.equal(merged[0].text, old.text);
+  assert.equal(merged[0].clientInputId, `chat-unknown:unresolved:${old.id}`);
+  assert.equal(unresolvedChatAdmissionRequestId(merged[0]), null);
+  assert.equal(hasUnresolvedChatAdmission(merged), true);
+  assert.equal(merged[1], other, 'ordinary queued prompts keep their original payload');
+  assert.strictEqual(mergeQueueAdmissionHints(merged, [], true), merged,
+    'an already-unknown source must not churn state on repeated empty snapshots');
+  const eventualServerReceipt = retryAfterChatAdmission(old,
+    { status: 'unknown', requestId: 'eventually-persisted-attempt' });
+  const upgraded = mergeQueueAdmissionHints(merged, [eventualServerReceipt], true);
+  assert.equal(unresolvedChatAdmissionRequestId(upgraded[0]), 'eventually-persisted-attempt',
+    'a real authoritative server identity upgrades an unmatchable local fail-closed sentinel');
+});
+
+test('A→B→A stale queue GET cannot clear a replacement A hydration fence', () => {
+  const owners = new Map<string, number>();
+  owners.set('A', 11); // first viewed A
+  owners.set('B', 12);
+  owners.set('A', 13); // A re-entered while GET(A, 11) is still pending
+  assert.equal(releaseOwnedQueueHydration(owners, 'A', 11, true), false);
+  assert.equal(owners.get('A'), 13);
+  assert.equal(releaseOwnedQueueHydration(owners, 'B', 12, true), true);
+  assert.equal(owners.has('B'), false);
+  assert.equal(releaseOwnedQueueHydration(owners, 'A', 13, false), false,
+    'a failed current queue GET must retain the admission barrier');
+  assert.equal(owners.get('A'), 13);
+  assert.equal(releaseOwnedQueueHydration(owners, 'A', 13, true), true);
+  assert.equal(owners.has('A'), false);
+});
+
+test('queue writes are suspended until authoritative same-session queue hydration', () => {
+  const pending = new Map<string, number>([['A', 13]]);
+  assert.equal(queuedWriteDisposition(pending, 'A', true), 'skip',
+    'restoring stale localStorage is never a server queue write');
+  assert.equal(queuedWriteDisposition(pending, 'A', false), 'defer',
+    'a queue mutation, Cancel, or Steer may not overwrite UNKNOWN on server while GET pending');
+  assert.equal(queuedWriteDisposition(pending, 'B', false), 'write',
+    'one pending session must not freeze another session queue');
+  assert.equal(releaseOwnedQueueHydration(pending, 'A', 11, true), false,
+    'a stale A1 success cannot release current A3');
+  assert.equal(queuedWriteDisposition(pending, 'A', false), 'defer');
+  assert.equal(releaseOwnedQueueHydration(pending, 'A', 13, false), false,
+    'a failed GET cannot enable stale queued writes');
+  assert.equal(queuedWriteDisposition(pending, 'A', false), 'defer');
+  assert.equal(releaseOwnedQueueHydration(pending, 'A', 13, true), true);
+  assert.equal(queuedWriteDisposition(pending, 'A', false), 'write',
+    'only a successfully reconciled current GET releases the queue POST gate');
+});
+
+test('exact canonical admission lookup checks beyond a long first-paint history tail', async () => {
+  const attemptId = 'attempt-42';
+  const user = { role: 'user' as const, content: 'original', client_input_id: attemptId };
+  const longTail = {
+    offset: 100,
+    messages: Array.from({ length: 48 }, () => ({ role: 'tool' as const, content: 'tool output' })),
+  };
+  let fullReads = 0;
+  const accepted = await findConfirmedChatAdmission(attemptId,
+    async () => longTail,
+    async () => {
+      fullReads++;
+      return { offset: 0, messages: [user, ...longTail.messages] };
+    },
+  );
+  assert.equal(accepted, true);
+  assert.equal(fullReads, 1, 'one full read only for the uncommon long-turn case');
+
+  fullReads = 0;
+  assert.equal(await findConfirmedChatAdmission(attemptId,
+    async () => ({ offset: 95, messages: [user] }),
+    async () => { fullReads++; return longTail; },
+  ), true);
+  assert.equal(fullReads, 0, 'a matching tail never needs the full transcript');
+
+  assert.equal(await findConfirmedChatAdmission(attemptId,
+    async () => ({ offset: 0, messages: [{ role: 'user', content: 'same text', client_input_id: 'other' }] }),
+    async () => { throw new Error('must not full-read a complete first page'); },
+  ), false, 'neither text similarity nor a snapshot missing the exact identity proves admission');
+});
+
+test('definite 409 retry failure restores the original id, not another retry id', async () => {
+  const retry = {
+    id: rejectedChatRetryId('original-409'), text: 'same prompt', kind: 'queue',
+    images: [{ media_type: 'image/png', data: 'original' }], approvalMode: 'plan',
+  };
+  let queue = [retry];
+  const result = await dispatchRejectedChatRetryAfterQueueClear(
+    async () => { queue = []; }, () => true,
+    async () => ({ status: 'rejected' as const }),
+    () => { queue = restoreRejectedChatRetry(queue, retry); },
+  );
+  assert.equal(result, false);
+  assert.deepEqual(queue, [retry]);
+  assert.strictEqual(restoreRejectedChatRetry(queue, retry), queue);
 });
 
 test('server queue writes stay ordered per session and clear follows a delayed enqueue', async () => {

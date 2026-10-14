@@ -228,6 +228,7 @@ export const vi: Record<keyof typeof en, string> = {
   'chat.detachedStopped': 'Đã yêu cầu dừng lượt hiện tại; bạn có thể gửi lại.',
   'chat.activeCheckFailed': 'Không thể xác minh trạng thái thực thi của phiên: {error}',
   'chat.recoveryBlocked': 'Kết nối trực tiếp đã mất. Gửi tin sẽ ngắt lượt hiện tại; nút Dừng vẫn hoạt động.',
+  'chat.retryAwaitingConfirmation': 'Đang xác minh tin nhắn đã được nhận hay chưa; sẽ không gửi lại trước khi xác nhận.',
   'chat.detachedSendBlocked': 'Đang theo dõi phiên này. Gửi tin sẽ ngắt lượt hiện tại và đồng bộ mọi giao diện.',
   'chat.inputPlaceholder': 'Tin nhắn…  (/ để chọn kỹ năng, @ để chọn tệp)',
   'chat.kbdHint': 'Enter để gửi · Shift+Enter để xuống dòng',

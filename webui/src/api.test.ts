@@ -6,6 +6,35 @@ Object.defineProperty(globalThis, 'location', {
   configurable: true,
 });
 
+test('strict queue hydration rejects failed and malformed responses instead of treating them as empty', async () => {
+  const oldFetch = globalThis.fetch;
+  let status = 200;
+  let payload = '[{"id":"rejected-chat:original","kind":"queue","text":"first","client_input_id":"chat-unknown:attempt"}]';
+  globalThis.fetch = (async (url: RequestInfo | URL) => {
+    assert.equal(String(url), '/chat/queue?session_id=origin%2Fa');
+    return new Response(payload, { status });
+  }) as typeof fetch;
+  try {
+    const { getChatQueueConfirmed } = await import('./api.ts');
+    const list = await getChatQueueConfirmed('origin/a');
+    assert.equal(list.length, 1);
+    assert.equal(list[0].client_input_id, 'chat-unknown:attempt');
+    status = 503;
+    await assert.rejects(getChatQueueConfirmed('origin/a'), /HTTP 503/);
+    status = 200;
+    payload = '{"error":"unexpected shape"}';
+    await assert.rejects(getChatQueueConfirmed('origin/a'), /invalid payload/);
+    payload = '[null]';
+    await assert.rejects(getChatQueueConfirmed('origin/a'), /invalid payload/);
+    payload = '[{"id":"rejected-chat:original","text":"missing kind"}]';
+    await assert.rejects(getChatQueueConfirmed('origin/a'), /invalid payload/);
+    payload = '';
+    await assert.rejects(getChatQueueConfirmed('origin/a'), /JSON|Unexpected end/);
+  } finally {
+    globalThis.fetch = oldFetch;
+  }
+});
+
 test('strict queued retry removal requires an acknowledged /chat/queue write', async () => {
   const originalFetch = globalThis.fetch;
   const bodies: unknown[] = [];

@@ -32,7 +32,7 @@ import { createTimelineFollow } from '../lib/timelineFollow';
 
 /** First paint / page size for long transcripts. Older messages load on demand. */
 const HISTORY_PAGE = 48;
-import { postChatPrompt, stopChat, postChatSteer, cancelChatSteer, postSystemNotify, getActiveChatSessions, getChatPending, watchChatSession, SSEEvent, getSession, getSessionFreshness, SessionMetaWithProject, listProjectSessions, getModels, ModelInfo, ImageData, streamLive, postLiveMessage, postLiveStop, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, LiveWireEvent, SessionMessage, SessionTokenUsage, SessionTurnOutline, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postMcpReload, getMcpStatus, postLiveMcpTrust, postCommand, postLiveCompact, setDefaultProvider, uploadSessionFiles, type CommandResult, type UploadProgress, UserInputRequestEvent, getChatQueue, saveChatQueueConfirmed, type QueuedMessageApiItem, patchSessionMessage, deleteSessionMessage, truncateSession, type SessionMutationEvent } from '../api';
+import { postChatPrompt, stopChat, postChatSteer, cancelChatSteer, postSystemNotify, getActiveChatSessions, getChatPending, watchChatSession, SSEEvent, getSession, getSessionFreshness, SessionMetaWithProject, listProjectSessions, getModels, ModelInfo, ImageData, streamLive, postLiveMessage, postLiveStop, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, LiveWireEvent, SessionMessage, SessionTokenUsage, SessionTurnOutline, getSkills, SkillInfo, listDir, changeDir, postConfigReload, postMcpReload, getMcpStatus, postLiveMcpTrust, postCommand, postLiveCompact, setDefaultProvider, uploadSessionFiles, type CommandResult, type UploadProgress, UserInputRequestEvent, getChatQueueConfirmed, saveChatQueueConfirmed, type QueuedMessageApiItem, patchSessionMessage, deleteSessionMessage, truncateSession, type SessionMutationEvent } from '../api';
 import { InlineBubbleEditor } from './InlineBubbleEditor';
 import { ConfirmDialog } from './ConfirmDialog';
 import {
@@ -168,12 +168,21 @@ import { isInternalHistoryAssistantMessage, isInternalHistoryUserMessage, stripI
 import {
   appendRejectedChatRetry,
   dispatchRejectedChatRetryAfterQueueClear,
+  findConfirmedChatAdmission,
+  hasUnresolvedChatAdmission,
   isUnacceptedChatRetry,
   loadQueuedFromStorage,
   mergeQueuedIntoDraft,
+  mergeQueueAdmissionHints,
   queueAfterSessionActiveCheck,
   queuedItemAlreadyDelivered,
   queuedPayloadHasContent,
+  queuedWriteDisposition,
+  reconcileQueuedAdmissionSnapshot,
+  releaseOwnedQueueHydration,
+  preserveClearedRetryBarrier,
+  rejectedRetryNeedsReconciliation,
+  retryAfterChatAdmission,
   rejectedChatRetryId,
   restoreRejectedChatRetry,
   shouldHydrateServerQueuedItem,
@@ -184,6 +193,8 @@ import {
   saveQueuedToStorage,
   stashSessionQueued,
   restoreSessionQueued,
+  unresolvedChatAdmissionRequestId,
+  type QueuedChatAdmission,
 } from '../lib/queuedDraft';
 import {
   chatRecoveryPolicy,
@@ -1140,6 +1151,13 @@ export function Chat({
   // During OR after an acknowledged clear, an older GET snapshot may not
   // rehydrate its request ID. Remove the barrier if clearing fails/defers.
   const queueClearBarriersRef = useRef(new Map<string, Set<string>>());
+  // A stale localStorage R cannot drain before its server queue snapshot has
+  // had a chance to supply a stronger UNKNOWN chat-admission marker. Failed
+  // lookups remain UNKNOWN until a fresh session load successfully reconciles.
+  const queueHydrationPendingRef = useRef(new Map<string, number>());
+  const queueWritesDeferredRef = useRef(new Set<string>());
+  const deferredQueueActionRef = useRef(new Map<string, { generation: number; action: 'restore' | 'discard' }>());
+  const retryHistoryLookupsRef = useRef(new Set<string>());
   function setRetryQueueClearBarrier(sid: string, id: string, active: boolean) {
     const entries = queueClearBarriersRef.current.get(sid) ?? new Set<string>();
     if (active) entries.add(id);
@@ -1148,6 +1166,14 @@ export function Chat({
     else queueClearBarriersRef.current.delete(sid);
   }
   function persistSessionQueue(sid: string, items: QueuedMessage[]): Promise<void> {
+    // All write paths, including originating-session Steer and Cancel, must
+    // obey the current session's authoritative hydration barrier. A rejected
+    // Promise ensures strict queue-clear callers never mistake deferral for
+    // an acknowledged delete and submit a duplicate /chat turn.
+    if (queueHydrationPendingRef.current.has(sid)) {
+      queueWritesDeferredRef.current.add(sid);
+      return Promise.reject(new Error('Queue hydration pending; write deferred'));
+    }
     return serializeSessionQueueWrite(queueSaveTailsRef.current, sid, () =>
       saveChatQueueConfirmed(sid, serializeQueuedForServer(items)));
   }
@@ -1169,23 +1195,110 @@ export function Chat({
       }
       saveQueuedToStorage(queuedBySessionRef.current);
       // 跨设备后端队列同步持久化：换别的手机打开或刷新卡片永不丢失
-      if (!options?.skipServerWrite) void persistSessionQueue(sid, next).catch(() => {});
+      const disposition = queuedWriteDisposition(queueHydrationPendingRef.current, sid,
+        options?.skipServerWrite === true);
+      if (disposition === 'defer') queueWritesDeferredRef.current.add(sid);
+      else if (disposition === 'write') void persistSessionQueue(sid, next).catch(() => {});
     }
     setQueuedState(next);
   }
-  function keepRejectedRetryForLater(sid: string, item: QueuedMessage) {
-    setRetryQueueClearBarrier(sid, String(item.id), false);
+  function keepRejectedRetryForLater(sid: string, item: QueuedMessage, keepClearFence = false) {
+    // Once the strict clear has ACKed, its fence must survive an UNKNOWN POST
+    // and even exact confirmation. An older in-flight queue GET can otherwise
+    // resurrect R after it was already admitted. Definite rejection/defer is
+    // different: that original row is intentionally retryable again.
+    if (!keepClearFence) setRetryQueueClearBarrier(sid, String(item.id), false);
     const existing = queuedBySessionRef.current.get(sid) ?? [];
-    const restored = restoreRejectedChatRetry(existing, item);
+    const restored = restoreRejectedChatRetry(existing, item, !!item.clientInputId);
     if (queueDrainMountedRef.current && activeIdRef.current === sid) {
       // Do not immediately retry a failed queue-clear in a tight loop.
       blockQueueDrainRef.current = true;
-      setQueued((current) => restoreRejectedChatRetry(current, item));
+      setQueued((current) => restoreRejectedChatRetry(current, item, !!item.clientInputId));
     } else {
       queuedBySessionRef.current.set(sid, restored);
       saveQueuedToStorage(queuedBySessionRef.current);
       void persistSessionQueue(sid, restored).catch(() => {});
     }
+  }
+  function reconcileUnknownRetryFromHistory(sid: string, item: QueuedMessage, generation: number) {
+    const attemptId = unresolvedChatAdmissionRequestId(item);
+    if (!attemptId || !queueDrainMountedRef.current || activeIdRef.current !== sid
+      || sessionGenerationRef.current !== generation) return;
+    const hash = projectHashBySessionRef.current.get(sid)
+      || (activeSession?.id === sid ? activeSession.project_hash : undefined)
+      || viewedProjectHashRef.current || '';
+    if (!hash) return;
+    const key = `${sid}\u0000${generation}\u0000${item.id}\u0000${attemptId}`;
+    if (retryHistoryLookupsRef.current.has(key)) return;
+    retryHistoryLookupsRef.current.add(key);
+    // A reload or A→B→A may restore an UNKNOWN from the queue server without
+    // the first submitter's callback. Use the SAME positive-only canonical
+    // check in both cases, not merely the visible 48-message history tail.
+    void findConfirmedChatAdmission(
+      attemptId,
+      () => getSession(hash, sid, { tail: HISTORY_PAGE }),
+      () => getSession(hash, sid),
+    ).then(async (confirmed) => {
+      if (!confirmed || activeIdRef.current !== sid
+        || sessionGenerationRef.current !== generation || !queueDrainMountedRef.current) return;
+      if (!queuedRef.current.some((retry) =>
+        retry.id === item.id && retry.clientInputId === item.clientInputId)) return;
+      // A queue GET started before this exact confirmation may still arrive.
+      // Fence the consumed row before publishing the local queue removal.
+      setRetryQueueClearBarrier(sid, String(item.id), true);
+      setQueued((current) => current.filter((retry) =>
+        !(retry.id === item.id && retry.clientInputId === item.clientInputId)));
+      const active = await getActiveChatSessions().catch(() => null);
+      if (active === null || activeIdRef.current !== sid
+        || sessionGenerationRef.current !== generation || !queueDrainMountedRef.current) return;
+      if (!active.includes(sid) && !busyRef.current
+        && !backgroundRunningSessionsRef.current.has(sid)
+        && !localTurnSessionsRef.current.has(sid)) {
+        transitionChatRecovery({ type: 'authoritative_terminal' });
+      }
+    }).catch(() => {
+      // Never interpret a failed or missing historical read as rejection.
+    }).finally(() => {
+      retryHistoryLookupsRef.current.delete(key);
+    });
+  }
+  function keepRejectedRetryAfterAdmission(
+    sid: string,
+    item: QueuedMessage,
+    outcome: Exclude<QueuedChatAdmission, { status: 'admitted' }>,
+  ) {
+    const restored = retryAfterChatAdmission(item, outcome);
+    keepRejectedRetryForLater(sid, restored, preserveClearedRetryBarrier(outcome));
+    if (outcome.status !== 'unknown' || !queueDrainMountedRef.current
+      || activeIdRef.current !== sid || renderedSessionIdRef.current !== sid) return;
+    const generation = sessionGenerationRef.current;
+    if (!attachedToLiveRuntime()) {
+      const hash = projectHashBySessionRef.current.get(sid)
+        || (activeSession?.id === sid ? activeSession.project_hash : undefined)
+        || viewedProjectHashRef.current || '';
+      if (hash) startIdleWatch(hash, sid, generation, { replayIfLive: true });
+    }
+    reconcileUnknownRetryFromHistory(sid, restored, generation);
+  }
+  function queueItemAwaitingReconciliation(item: QueuedMessage): boolean {
+    return rejectedRetryNeedsReconciliation(item)
+      || (!!activeIdRef.current && queueHydrationPendingRef.current.has(activeIdRef.current));
+  }
+  function queueActionsAwaitReconciliation(items: QueuedMessage[]): boolean {
+    return items.some(queueItemAwaitingReconciliation);
+  }
+  function deferQueueActionUntilHydrated(action: 'restore' | 'discard'): boolean {
+    const sid = activeIdRef.current;
+    if (!sid || !queueHydrationPendingRef.current.has(sid)) return false;
+    // An ordinary local queue can also be missing a server UNKNOWN retry.
+    // Defer even an all-ordinary Stop until the authoritative GET finishes.
+    deferredQueueActionRef.current.set(sid, { generation: sessionGenerationRef.current, action });
+    blockQueueDrainRef.current = true;
+    return true;
+  }
+  function discardQueuedPreservingUnknown() {
+    if (deferQueueActionUntilHydrated('discard')) return;
+    setQueued((current) => current.filter(queueItemAwaitingReconciliation));
   }
   const queueIdRef = useRef(0);
   // Stop restores the queue into the composer. Block one drain so a busy→idle
@@ -2054,6 +2167,17 @@ export function Chat({
 
     const detail = await getSession(hash, id, { tail: HISTORY_PAGE });
     if (activeIdRef.current !== id || !detail || !Array.isArray(detail.messages)) return null;
+    // A finished turn may already be persisted while its HTTP 202 was lost.
+    // This exact server transcript identity is sufficient to settle the
+    // source retry even if the guarded canvas chooses not to repaint disk.
+    const knownAdmittedIds = new Set(detail.messages
+      .filter((m) => m.role === 'user' && m.client_input_id)
+      .map((m) => m.client_input_id!));
+    if (knownAdmittedIds.size && queuedRef.current.some((item) =>
+      queuedItemAlreadyDelivered(item, (clientId) => knownAdmittedIds.has(clientId)))) {
+      setQueued((items) => items.filter((item) =>
+        !queuedItemAlreadyDelivered(item, (clientId) => knownAdmittedIds.has(clientId))));
+    }
     const disk = sessionMessagesToDisplay(detail.messages, detail.offset ?? 0);
     const canvas = messagesRef.current;
     const diskHasUser = diskHasCanvasUser(disk, canvas);
@@ -2651,11 +2775,28 @@ export function Chat({
       const stashedQueued = restoreSessionQueued(queuedBySessionRef.current, sessionId).filter(
         (item) => !queuedItemAlreadyDelivered(item, isAlreadyOnCanvas),
       );
-      setQueued(stashedQueued);
+      // Even when localStorage contains only an ordinary Q (or nothing), the
+      // server may hold an UNKNOWN R from this session. Gate every queue POST
+      // and drain until a successful authoritative queue GET reconciles them.
+      if (sessionId) {
+        queueHydrationPendingRef.current.set(sessionId, switchGeneration);
+      }
+      // This localStorage snapshot may predate a newer server-side UNKNOWN
+      // admission. Never publish it back before the strict queue GET.
+      setQueued(stashedQueued, { skipServerWrite: true });
+      if (sessionId) {
+        for (const retry of stashedQueued) {
+          if (rejectedRetryNeedsReconciliation(retry)) {
+            reconcileUnknownRetryFromHistory(sessionId, retry, switchGeneration);
+          }
+        }
+      }
       // 异步与后端同步队列（跨设备/换手机打开该会话时无缝同步恢复）
       if (sessionId) {
-        void getChatQueue(sessionId).then((serverItems) => {
-          if (activeIdRef.current === sessionId && sessionGenerationRef.current === switchGeneration && serverItems && serverItems.length > 0) {
+        let queueSyncSucceeded = false;
+        void getChatQueueConfirmed(sessionId).then((serverItems) => {
+          if (queueDrainMountedRef.current && activeIdRef.current === sessionId
+            && sessionGenerationRef.current === switchGeneration) {
             setQueued((current) => {
               // 排除已经在正文消息流中出现的已发送提问，杜绝已被消费的卡片复活
               const validServerItems = serverItems
@@ -2667,20 +2808,52 @@ export function Chat({
                 // An image-only rejected retry is still a real user input.
                 // Do not discard it just because the transcript text is empty.
                 const hasContent = queuedPayloadHasContent(clean, item.images);
-                return hasContent && !queuedItemAlreadyDelivered(item, isAlreadyOnCanvas);
+                return hasContent;
               });
-              if (validServerItems.length === 0) return current;
-              if (current.length === 0) {
-                return validServerItems;
+              // Merge authoritative server admission hints by ID. If local
+              // storage failed to record `chat-unknown:<attempt>`, an older
+              // local R must not shadow the same-ID server UNKNOWN and send
+              // a duplicate turn on the next idle drain. Filter exact already
+              // admitted user identities only AFTER merging these hints.
+              // A missing server R is also ambiguous when local storage is
+              // stale. Keep that source payload, but require manual resolution.
+              return reconcileQueuedAdmissionSnapshot(current, validServerItems, isAlreadyOnCanvas);
+            }, { skipServerWrite: true });
+            for (const retry of queuedRef.current) {
+              if (rejectedRetryNeedsReconciliation(retry)) {
+                reconcileUnknownRetryFromHistory(sessionId, retry, switchGeneration);
               }
-              // 合并服务端队列项，避免重复
-              const existingIds = new Set(current.map((item) => String(item.id)));
-              const toAdd = validServerItems.filter((item) => !existingIds.has(String(item.id)));
-              return toAdd.length > 0 ? [...current, ...toAdd] : current;
-            });
+            }
           }
+          // A successful HTTP GET is not sufficient. If A went offscreen
+          // while this result was in flight, its UNKNOWN server markers were
+          // intentionally not merged and must NOT release A's write fence.
+          // A later A view installs a new generation-owned hydration.
+          queueSyncSucceeded = queueDrainMountedRef.current
+            && activeIdRef.current === sessionId
+            && sessionGenerationRef.current === switchGeneration;
         }).catch((error: unknown) => {
           console.warn('[Chat] Failed to restore session queue:', error);
+        }).finally(() => {
+          if (!releaseOwnedQueueHydration(queueHydrationPendingRef.current,
+            sessionId, switchGeneration, queueSyncSucceeded)) return;
+          // Even an empty successful snapshot resolves the pending lookup.
+          // Trigger a queue-drain eligibility recheck when merge made no edits.
+          if (queueDrainMountedRef.current && activeIdRef.current === sessionId
+            && sessionGenerationRef.current === switchGeneration) {
+            const needsFlush = queueWritesDeferredRef.current.delete(sessionId);
+            const deferred = deferredQueueActionRef.current.get(sessionId);
+            if (deferred && deferred.generation === switchGeneration) {
+              deferredQueueActionRef.current.delete(sessionId);
+              if (deferred.action === 'restore') restoreQueuedToComposer();
+              else discardQueuedPreservingUnknown();
+            } else if (needsFlush) {
+              void persistSessionQueue(sessionId, queuedRef.current).catch(() => {});
+              setQueuedState([...queuedRef.current]);
+            } else {
+              setQueuedState([...queuedRef.current]);
+            }
+          }
         });
       }
       setLivePending(null);
@@ -3786,7 +3959,10 @@ export function Chat({
         }
         if (queueDisposition.discardQueued) {
           // 只过滤未发送的普通排队消息，绝对不能丢弃已经发送给后端的转向消息 (kind === 'steer' / 'steering')！
-          setQueued((arr) => arr.filter((item) => item.kind === 'steer' || item.kind === 'steering'));
+          if (!deferQueueActionUntilHydrated('discard')) {
+            setQueued((arr) => arr.filter((item) => item.kind === 'steer'
+              || item.kind === 'steering' || queueItemAwaitingReconciliation(item)));
+          }
           pushCommandNotice(t('sync.reconnectTerminalUnknown'));
         }
         setLivePending(null);
@@ -4083,7 +4259,9 @@ export function Chat({
           // next turn; only confirmed steers are recoverable at this terminal.
           restorePendingSteers(false);
           if (lifecycle.terminal.discardQueued) {
-            setQueued([]);
+            // An unresolved /chat admission is not discardable queue input:
+            // the server may already own that exact turn despite a lost 202.
+            discardQueuedPreservingUnknown();
             pushNoticeToLastAssistant(t('chat.incomplete', { msg: lifecycle.terminal.detail }));
           }
           // 回合结束（idle）时不可能再有待批准项：清掉因对端(TUI)批准或回合收尾而
@@ -5204,7 +5382,7 @@ export function Chat({
           ]);
           return;
         }
-        return deliver(text, [], modeState.confirmedMode);
+        return deliver(text, [], modeState.confirmedMode).then(() => {});
       },
       execServerCommand: async (command, arg) => {
         const SESSION_MUTATING = new Set(['undo', 'compact']);
@@ -6305,14 +6483,15 @@ export function Chat({
     approvalMode: ApprovalMode = modeState.confirmedMode,
     onAccepted?: (acceptedSessionId?: string) => void,
     overrideProvider?: string,
-  ) {
+    queuedRetryId?: string,
+  ): Promise<QueuedChatAdmission> {
     if (!chatRecoveryPolicy(chatRecoveryRef.current).allowSend) {
       pushCommandNotice(
         chatRecoveryRef.current === 'detached_active'
           ? t('chat.detachedSendBlocked')
           : t('chat.recoveryBlocked'),
       );
-      return;
+      return { status: 'rejected' };
     }
     // Next user turn: freeze sticky todos under prior assistant, clear sticky.
     commitActiveTodosIntoLastAssistant();
@@ -6409,6 +6588,7 @@ export function Chat({
       // Register before the HTTP round-trip. A very fast round boundary can
       // emit `steered` on SSE before the submit response reaches this tab.
       setPendingSteers((pending) => [...pending, pendingSteer]);
+      let liveAdmitted = false;
       try {
         const receipt = await postLiveMessage(
           text,
@@ -6417,6 +6597,7 @@ export function Chat({
           activeIdRef.current,
           pendingSteer.id,
         );
+        liveAdmitted = true;
         onAccepted?.(sid ?? undefined);
         // The receipt is authoritative. The browser's busy flag can race a
         // terminal event, so reconcile pending ownership in either direction.
@@ -6440,6 +6621,10 @@ export function Chat({
           }
         }
       } catch (error) {
+        if (liveAdmitted) {
+          console.warn('[Chat] Live message admitted but local reconciliation failed:', error);
+          return { status: 'admitted' };
+        }
         // Roll back the optimistic append — the send never reached the server.
         const echoIndex = pendingSelfEchoRef.current.findIndex(
           (pending) => pending.id === pendingSteer.id,
@@ -6453,11 +6638,11 @@ export function Chat({
         } else {
           setBusyAndClock(false);
         }
-        setQueued([]);
+        if (!queuedRetryId) discardQueuedPreservingUnknown();
         setHistoryHint(t('chat.connError', { msg: String(error) }));
-        return;
+        return { status: 'unknown', requestId: pendingSteer.id };
       }
-      return;
+      return { status: 'admitted' };
     }
 
     // ── Normal path ──
@@ -6511,6 +6696,7 @@ export function Chat({
     let boundSessionId = sessionId ?? activeIdRef.current;
     let acceptedWithoutSession = false;
     let keepStopAlias = false;
+    let admissionConfirmed = false;
 
     try {
       const targetProvider = overrideProvider || provider || undefined;
@@ -6525,6 +6711,7 @@ export function Chat({
       };
 
       const ack = await postChatPrompt(body, controller.signal);
+      admissionConfirmed = true;
       const effectiveSid = ack.session_id || boundSessionId || turnOwnerSid;
       const ownsAckView = queueDrainMountedRef.current
         && sessionGenerationRef.current === requestGeneration
@@ -6564,6 +6751,10 @@ export function Chat({
         startDetachedHistoryPoll(currentProjectHash, effectiveSid, sessionGenerationRef.current);
       }
     } catch (err: unknown) {
+      if (admissionConfirmed) {
+        console.warn('[Chat] Chat admitted but local reconciliation failed:', err);
+        return { status: 'admitted' };
+      }
       const stillCurrent =
         !controller.signal.aborted &&
         (!boundSessionId || !activeIdRef.current || activeIdRef.current === boundSessionId) &&
@@ -6586,6 +6777,11 @@ export function Chat({
         msg.includes('Conflict') ||
         msg.includes('session_busy') ||
         msg.includes('already has an active chat operation');
+      // String matching remains a presentation/backward-compatibility hint;
+      // it cannot prove an HTTP rejection after a POST that might have been
+      // admitted. Only the actual API status/code may make a retry automatic.
+      const definitivelyRejected = (err as any)?.status === 409
+        || (err as any)?.code === 'session_busy';
       // An A submission can be rejected after the user has already switched
       // to B. The response is stale for B's viewport, NOT for the still-owned
       // A submission: repair only A's cache/queue, never the foreground UI.
@@ -6607,15 +6803,17 @@ export function Chat({
               turnOutlineBySessionRef.current.get(rejectedSid));
           }
         }
-        const retry: QueuedMessage = {
-          id: rejectedChatRetryId(requestId), text, images, approvalMode, kind: 'queue',
-        };
-        const preserved = appendRejectedChatRetry(
-          queuedBySessionRef.current.get(rejectedSid) ?? [], retry,
-        );
-        queuedBySessionRef.current.set(rejectedSid, preserved);
-        saveQueuedToStorage(queuedBySessionRef.current);
-        void persistSessionQueue(rejectedSid, preserved).catch(() => {});
+        if (!queuedRetryId) {
+          const retry: QueuedMessage = {
+            id: rejectedChatRetryId(requestId), text, images, approvalMode, kind: 'queue',
+          };
+          const preserved = appendRejectedChatRetry(
+            queuedBySessionRef.current.get(rejectedSid) ?? [], retry,
+          );
+          queuedBySessionRef.current.set(rejectedSid, preserved);
+          saveQueuedToStorage(queuedBySessionRef.current);
+          void persistSessionQueue(rejectedSid, preserved).catch(() => {});
+        }
         localActiveStreamsBySessionRef.current.delete(rejectedSid);
         localTurnSessionsRef.current.delete(rejectedSid);
         const echos = pendingSelfEchoBySessionRef.current.get(rejectedSid) ?? [];
@@ -6657,11 +6855,11 @@ export function Chat({
             }
             return next;
           });
-          setQueued((prev) => {
-            return appendRejectedChatRetry(prev, {
+          if (!queuedRetryId) {
+            setQueued((prev) => appendRejectedChatRetry(prev, {
               id: rejectedChatRetryId(requestId), text, images, approvalMode, kind: 'queue' as const,
-            });
-          });
+            }));
+          }
           pushCommandNotice(t('chat.sessionBusyQueued'));
         } else {
           appendToLastAssistant('\n\n' + t('chat.connError', { msg }));
@@ -6720,6 +6918,9 @@ export function Chat({
           },
         );
       }
+      return definitivelyRejected && !aborted
+        ? { status: 'rejected' }
+        : { status: 'unknown', requestId };
     } finally {
       if (abortRef.current === controller) abortRef.current = null;
       if (activeStreamRequestIdRef.current === requestId) activeStreamRequestIdRef.current = null;
@@ -6729,6 +6930,7 @@ export function Chat({
         !keepStopAlias
       ) requestIdRef.current = null;
     }
+    return { status: 'admitted' };
   }
 
   async function sendMessage() {
@@ -6857,12 +7059,46 @@ export function Chat({
     await deliver(messageText, images, modeState.confirmedMode, recordAcceptedInput);
   }
 
+  // Exact user echo can settle an UNKNOWN HTTP outcome even while recovery
+  // disables queue drain. Never infer admission from repeated text or busy.
+  useEffect(() => {
+    const sid = activeIdRef.current || sessionId;
+    if (!sid || !hasUnresolvedChatAdmission(queued)) return;
+    const known = [
+      ...messages,
+      ...(messageCacheRef.current.get(sid) ?? []),
+    ];
+    const admittedIds = new Set(known.filter((m) => m.role === 'user' && m.clientInputId)
+      .map((m) => m.clientInputId!));
+    if (!queued.some((item) => queuedItemAlreadyDelivered(item, (id) => admittedIds.has(id)))) return;
+    setQueued((current) => current.filter((item) => !queuedItemAlreadyDelivered(item, (id) => admittedIds.has(id))));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [queued, messages, sessionId]);
+
+  // During refresh the session ID can arrive before its project hash. The
+  // session-switch callback may have already attempted (and skipped) UNKNOWN
+  // reconciliation with no hash. Retry exactly that positive-only lookup
+  // once metadata becomes available, even if sessionId never changes again.
+  useEffect(() => {
+    const sid = activeIdRef.current || sessionId;
+    if (!sid || !queueDrainMountedRef.current || !activeSession?.project_hash) return;
+    if (activeIdRef.current !== sid || renderedSessionIdRef.current !== sid) return;
+    const generation = sessionGenerationRef.current;
+    for (const retry of queuedRef.current) {
+      if (rejectedRetryNeedsReconciliation(retry)) {
+        reconcileUnknownRetryFromHistory(sid, retry, generation);
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSession?.project_hash, sessionId, queued]);
+
   // 当前回合结束(done)后，依次发送仍在排队的消息。已转向的消息由内核在下一步并入本轮，不再另开一回合。
   useEffect(() => {
     // Strict rejected-retry clearing is asynchronous. Never drain a second
     // queue item while that exact server receipt is still pending.
     const currentSid = activeIdRef.current || sessionId;
     if (currentSid && queueDispatchesRef.current.has(currentSid)) return;
+    if (currentSid && queueHydrationPendingRef.current.has(currentSid)) return;
     if (blockQueueDrainRef.current) {
       blockQueueDrainRef.current = false;
       return;
@@ -6897,10 +7133,17 @@ export function Chat({
       return;
     }
 
+    // An earlier unresolved admission may still own the session; do not send
+    // even a later queued item ahead of it before exact-history reconciliation.
+    if (hasUnresolvedChatAdmission(queued)) return;
+
     const next = queued.find((item) => item.kind === 'queue');
     if (!next) return;
     if (isUnacceptedChatRetry(next)) {
       if (!currentSid) return;
+      // A missing POST acknowledgement may follow an accepted turn. Never
+      // auto-submit the same payload under a new request identity.
+      if (rejectedRetryNeedsReconciliation(next)) return;
       const sid = currentSid;
       const generation = sessionGenerationRef.current;
       const itemId = String(next.id);
@@ -6924,8 +7167,8 @@ export function Chat({
             && !backgroundRunningSessionsRef.current.has(sid)
             && !localTurnSessionsRef.current.has(sid);
         },
-        () => { void deliver(next.text, next.images ?? [], next.approvalMode); },
-        () => keepRejectedRetryForLater(sid, next),
+        () => deliver(next.text, next.images ?? [], next.approvalMode, undefined, undefined, itemId),
+        (outcome) => keepRejectedRetryAfterAdmission(sid, next, outcome),
       ).finally(() => {
         if (queueDispatchesRef.current.get(sid) === itemId) queueDispatchesRef.current.delete(sid);
       });
@@ -6941,8 +7184,18 @@ export function Chat({
   function restoreQueuedToComposer() {
     const items = queuedRef.current;
     if (items.length === 0) return;
+    if (deferQueueActionUntilHydrated('restore')) {
+      pushCommandNotice(t('chat.retryAwaitingConfirmation'));
+      return;
+    }
+    const retained = items.filter(queueItemAwaitingReconciliation);
+    const movable = items.filter((item) => !queueItemAwaitingReconciliation(item));
+    if (movable.length === 0) {
+      pushCommandNotice(t('chat.retryAwaitingConfirmation'));
+      return;
+    }
     blockQueueDrainRef.current = true;
-    const steerItems = items.filter((item) => item.kind === 'steer' || item.kind === 'steering');
+    const steerItems = movable.filter((item) => item.kind === 'steer' || item.kind === 'steering');
     if (steerItems.length > 0) {
       const targetSid = sessionId ?? activeIdRef.current ?? requestIdRef.current;
       if (targetSid) {
@@ -6951,9 +7204,9 @@ export function Chat({
         }
       }
     }
-    setQueued([]);
-    setInput((current) => mergeQueuedIntoDraft(items, current, []).text);
-    const queuedImages = items.flatMap((item) => item.images ?? []);
+    setQueued(retained);
+    setInput((current) => mergeQueuedIntoDraft(movable, current, []).text);
+    const queuedImages = movable.flatMap((item) => item.images ?? []);
     if (queuedImages.length > 0) {
       setPendingAttach((current) => [
         ...current,
@@ -6971,6 +7224,10 @@ export function Chat({
 
   /** 用户点击排队消息上的 × 撤回：从队列移除并完整回填文字与全部图片到输入框，避免输入前功尽弃。 */
   function handleCancelQueuedMessage(q: QueuedMessage) {
+    if (queueActionsAwaitReconciliation(queuedRef.current)) {
+      pushCommandNotice(t('chat.retryAwaitingConfirmation'));
+      return;
+    }
     // 关键防线：如果该消息已经作为转向投递给了后端（kind === 'steer' 或 'steering'），
     // 必须立即通知后端撤回内核缓冲区中的该转向，防止下一小步或下一轮被执行！
     if (q.kind === 'steer' || q.kind === 'steering') {
@@ -7023,6 +7280,10 @@ export function Chat({
    */
   async function handleSteerQueuedMessage(q: QueuedMessage) {
     if (q.kind !== 'queue') return;
+    if (queueActionsAwaitReconciliation(queuedRef.current)) {
+      pushCommandNotice(t('chat.retryAwaitingConfirmation'));
+      return;
+    }
     // request id is an admission alias before session_assigned lands on a new chat.
     const sid = sessionId ?? activeIdRef.current ?? requestIdRef.current;
     if (sid) {
@@ -7067,6 +7328,10 @@ export function Chat({
    * 停止当前正在运行的回合（按停止键），并立即以该消息发起新回合（点发送键）。
    */
   async function handleSendImmediately(q: QueuedMessage) {
+    if (queueActionsAwaitReconciliation(queuedRef.current)) {
+      pushCommandNotice(t('chat.retryAwaitingConfirmation'));
+      return;
+    }
     const textToSend = q.text;
     const imagesToSend = q.images ?? [];
     const modeToSend = q.approvalMode ?? modeState.confirmedMode;
@@ -7159,8 +7424,17 @@ export function Chat({
       releaseSendReservation();
       return;
     }
-    releaseSendReservation();
-    void deliver(textToSend, imagesToSend, modeToSend);
+    try {
+      const outcome = await deliver(
+        textToSend, imagesToSend, modeToSend, undefined, undefined,
+        isRejectedRetry ? String(q.id) : undefined,
+      );
+      if (outcome.status !== 'admitted' && isRejectedRetry && targetSid) {
+        keepRejectedRetryAfterAdmission(targetSid, q, outcome);
+      }
+    } finally {
+      releaseSendReservation();
+    }
   }
 
   function captureHistoryMutationContext(sid = activeIdRef.current || sessionId || activeSession?.id): HistoryMutationContext | null {
@@ -8753,7 +9027,9 @@ export function Chat({
               )}
               <div class="queued-head">
                 <span class="queued-tag">
-                  {q.kind === 'steer'
+                  {rejectedRetryNeedsReconciliation(q)
+                    ? t('chat.retryAwaitingConfirmation')
+                    : q.kind === 'steer'
                     ? t('chat.steered')
                     : q.kind === 'steering'
                       ? t('chat.steering')
@@ -8769,8 +9045,9 @@ export function Chat({
                     type="button"
                     class="queued-action-btn queued-btn-steer"
                     onClick={() => void handleSteerQueuedMessage(q)}
-                    title={t('chat.steerQueued')}
-                    aria-label={t('chat.steerAction')}
+                    disabled={queueActionsAwaitReconciliation(queued)}
+                    title={queueActionsAwaitReconciliation(queued) ? t('chat.retryAwaitingConfirmation') : t('chat.steerQueued')}
+                    aria-label={queueActionsAwaitReconciliation(queued) ? t('chat.retryAwaitingConfirmation') : t('chat.steerAction')}
                   >
                     <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                       <path d="M3 11.5V8.5a3.5 3.5 0 0 1 3.5-3.5H12" />
@@ -8785,8 +9062,9 @@ export function Chat({
                     type="button"
                     class="queued-action-btn queued-btn-send-now"
                     onClick={() => void handleSendImmediately(q)}
-                    title={t('chat.sendNowTitle')}
-                    aria-label={t('chat.sendNow')}
+                    disabled={queueActionsAwaitReconciliation(queued)}
+                    title={queueActionsAwaitReconciliation(queued) ? t('chat.retryAwaitingConfirmation') : t('chat.sendNowTitle')}
+                    aria-label={queueActionsAwaitReconciliation(queued) ? t('chat.retryAwaitingConfirmation') : t('chat.sendNow')}
                   >
                     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                       <polygon points="5 3 19 12 5 21 5 3" fill="currentColor" />
@@ -8799,9 +9077,9 @@ export function Chat({
                   type="button"
                   class="queued-action-btn queued-btn-cancel"
                   onClick={() => handleCancelQueuedMessage(q)}
-                  disabled={q.kind === 'steering'}
-                  title={t('chat.removeQueued')}
-                  aria-label={t('chat.cancelAction')}
+                  disabled={q.kind === 'steering' || queueActionsAwaitReconciliation(queued)}
+                  title={queueActionsAwaitReconciliation(queued) ? t('chat.retryAwaitingConfirmation') : t('chat.removeQueued')}
+                  aria-label={queueActionsAwaitReconciliation(queued) ? t('chat.retryAwaitingConfirmation') : t('chat.cancelAction')}
                 >
                   <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <line x1="18" y1="6" x2="6" y2="18" />

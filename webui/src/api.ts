@@ -391,6 +391,24 @@ export async function getChatQueue(sessionId: string): Promise<QueuedMessageApiI
   }
 }
 
+/** A safety-critical retry hydration cannot interpret a failed/malformed GET
+ * as an authoritative empty queue. Keep the best-effort getChatQueue API for
+ * older callers; this strict companion uses the same wire endpoint. */
+export async function getChatQueueConfirmed(sessionId: string): Promise<QueuedMessageApiItem[]> {
+  const resp = await apiFetch(`/chat/queue?session_id=${encodeURIComponent(sessionId)}`, {
+    headers: authHeaders(),
+  });
+  if (!resp.ok) throw new Error(`Queue lookup rejected: HTTP ${resp.status}`);
+  const list: unknown = await resp.json();
+  if (!Array.isArray(list) || !list.every((item) => item != null
+    && typeof item === 'object' && (typeof item.id === 'number' || typeof item.id === 'string')
+    && typeof item.text === 'string'
+    && (item.kind === 'queue' || item.kind === 'steering' || item.kind === 'steer'))) {
+    throw new Error('Queue lookup returned an invalid payload');
+  }
+  return list as QueuedMessageApiItem[];
+}
+
 /** An admitted retry must never race a failed/late queue-clear write. */
 export async function saveChatQueueConfirmed(sessionId: string, items: QueuedMessageApiItem[]): Promise<void> {
   const resp = await apiFetch('/chat/queue', {

@@ -1,4 +1,4 @@
-import type { ApprovalMode, ImageData, QueuedMessageApiItem } from '../api';
+import type { ApprovalMode, ImageData, QueuedMessageApiItem, SessionDetail } from '../api';
 
 export interface QueuedDraftItem {
   text: string;
@@ -9,6 +9,10 @@ export interface QueuedDraftItem {
 // request identity survives local and server storage without a new wire field
 // or guessing delivery from repeated user text.
 const REJECTED_CHAT_RETRY_PREFIX = 'rejected-chat:';
+// A queued retry can also carry an ordinary steer client-input ID. That is
+// NOT evidence of an UNKNOWN /chat admission. Namespace only the latter in
+// the existing string field; decode it before exact transcript correlation.
+const UNKNOWN_CHAT_ADMISSION_PREFIX = 'chat-unknown:';
 
 export function rejectedChatRetryId(requestId: string): string {
   return REJECTED_CHAT_RETRY_PREFIX + requestId;
@@ -33,9 +37,14 @@ export function appendRejectedChatRetry<T extends { id: number | string }>(
 /** After a failed server-clear receipt keep the retry ahead of later queued
  * prompts, without adding a duplicate after another view restored the ID. */
 export function restoreRejectedChatRetry<T extends { id: number | string }>(
-  queued: T[], retry: T,
+  queued: T[], retry: T, refreshExisting = false,
 ): T[] {
-  return queued.some((item) => item.id === retry.id) ? queued : [retry, ...queued];
+  const index = queued.findIndex((item) => item.id === retry.id);
+  if (index < 0) return [retry, ...queued];
+  if (!refreshExisting || queued[index] === retry) return queued;
+  const refreshed = [...queued];
+  refreshed[index] = retry;
+  return refreshed;
 }
 
 /** A GET issued before a confirmed queue-clear may resolve afterward with an
@@ -65,9 +74,108 @@ export function queuedItemAlreadyDelivered<T extends { id: number | string; kind
   identityAppearsInTranscript: (id: string) => boolean,
 ): boolean {
   // Unaccepted inputs cannot be consumed by an older identical prompt. Only
-  // an accepted steer with the exact echoed client identity proves delivery.
-  return item.kind === 'steer' && !!item.clientInputId
-    && identityAppearsInTranscript(item.clientInputId);
+  // a user's exact echoed client identity proves admission of a steer or an
+  // unacknowledged rejected-chat retry.
+  if (!item.clientInputId) return false;
+  if (item.kind === 'steer') return identityAppearsInTranscript(item.clientInputId);
+  const requestId = unresolvedChatAdmissionRequestId(item);
+  return !!requestId && identityAppearsInTranscript(requestId);
+}
+
+/** A POST with no admission receipt may already have been accepted. Its exact
+ * client input ID survives queue storage and prohibits blind re-admission. */
+export function rejectedRetryNeedsReconciliation(item: { id: number | string; kind?: string; clientInputId?: string }): boolean {
+  return isUnacceptedChatRetry(item) && item.kind === 'queue'
+    && !!item.clientInputId && item.clientInputId.startsWith(UNKNOWN_CHAT_ADMISSION_PREFIX);
+}
+
+export function unresolvedChatAdmissionRequestId(item: { id: number | string; kind?: string; clientInputId?: string }): string | null {
+  if (!rejectedRetryNeedsReconciliation(item)) return null;
+  const id = item.clientInputId!.slice(UNKNOWN_CHAT_ADMISSION_PREFIX.length);
+  return id.startsWith('unresolved:') ? null : id;
+}
+
+export function hasUnresolvedChatAdmission<T extends { id: number | string; kind?: string; clientInputId?: string }>(items: T[]): boolean {
+  return items.some(rejectedRetryNeedsReconciliation);
+}
+
+/** Reconcile a server queue snapshot without downgrading an already-observed
+ * UNKNOWN admission to an older same-ID plain queue item. An authoritative
+ * unknown marker also upgrades stale local storage when its write failed.
+ * Preserve the user's existing payload and relative order for matching IDs. */
+export function mergeQueueAdmissionHints<T extends {
+  id: number | string;
+  kind?: string;
+  clientInputId?: string;
+}>(local: T[], server: T[], failClosedMissingRetries = false): T[] {
+  let merged = local;
+  if (failClosedMissingRetries) {
+    const serverIds = new Set(server.map((item) => String(item.id)));
+    for (const [index, item] of local.entries()) {
+      // A stale local R absent from the authoritative queue might already
+      // have passed queue-clear and been admitted while storage was down.
+      // With no attempt ID, it must never be resubmitted automatically.
+      if (isUnacceptedChatRetry(item) && item.kind === 'queue'
+        && !rejectedRetryNeedsReconciliation(item) && !serverIds.has(String(item.id))) {
+        if (merged === local) merged = [...local];
+        merged[index] = retryAfterChatAdmission(item, { status: 'unknown' });
+      }
+    }
+  }
+  for (const item of server) {
+    const index = merged.findIndex((existing) => String(existing.id) === String(item.id));
+    if (index < 0) {
+      if (merged === local) merged = [...local];
+      merged.push(item);
+    } else if (merged[index]!.kind === 'queue'
+      && rejectedRetryNeedsReconciliation(item)
+      && (!rejectedRetryNeedsReconciliation(merged[index]!)
+        || (!unresolvedChatAdmissionRequestId(merged[index]!)
+          && !!unresolvedChatAdmissionRequestId(item)))) {
+      if (merged === local) merged = [...local];
+      merged[index] = { ...merged[index]!, clientInputId: item.clientInputId };
+    }
+  }
+  return merged;
+}
+
+/** Resolve a stale local R against a newer server UNKNOWN hint *before*
+ * consulting canonical admitted-user IDs. Filtering the server hint first
+ * would leave the local row without its request identity and strand it. */
+export function reconcileQueuedAdmissionSnapshot<T extends {
+  id: number | string;
+  kind?: string;
+  clientInputId?: string;
+}>(local: T[], server: T[], hasAdmittedIdentity: (id: string) => boolean): T[] {
+  const merged = mergeQueueAdmissionHints(local, server, true);
+  const remaining = merged.filter((item) => !queuedItemAlreadyDelivered(item, hasAdmittedIdentity));
+  return remaining.length === merged.length ? merged : remaining;
+}
+
+/** A→B→A may leave two strict queue GETs in flight. Only the current
+ * view generation may release A's admission-blocking hydration barrier;
+ * an older successful response has no authority over the replacement A. */
+export function releaseOwnedQueueHydration(
+  owners: Map<string, number>,
+  sid: string,
+  generation: number,
+  succeeded: boolean,
+): boolean {
+  if (!succeeded || owners.get(sid) !== generation) return false;
+  owners.delete(sid);
+  return true;
+}
+
+/** Never POST a stale local queue vector while its same-session authoritative
+ * GET may still supply a stronger UNKNOWN admission marker. Independent
+ * sessions continue writing normally. */
+export function queuedWriteDisposition(
+  pending: ReadonlyMap<string, number>,
+  sid: string,
+  skipServerWrite: boolean,
+): 'skip' | 'defer' | 'write' {
+  if (skipServerWrite) return 'skip';
+  return pending.has(sid) ? 'defer' : 'write';
 }
 
 /** Queued image-only submissions are valid even without any visible text. */
@@ -75,27 +183,78 @@ export function queuedPayloadHasContent(text: string, images?: ImageData[]): boo
   return text.trim().length > 0 || (images?.length ?? 0) > 0;
 }
 
-/** A rejected submission may be sent only after the daemon confirms its
- * persisted queue entry is gone. If removal fails, or its view/owner changed,
- * preserve the payload to retry later instead of risking duplicate delivery. */
+export type QueuedChatAdmission =
+  | { status: 'admitted' }
+  | { status: 'rejected' }
+  | { status: 'unknown'; requestId?: string };
+
+/** A successful queue clear must remain fenced through admission confirmation.
+ * Only a definite failure/defer may intentionally allow the original queued
+ * row to be hydrated again from a pre-clear GET. */
+export function preserveClearedRetryBarrier(
+  outcome: Exclude<QueuedChatAdmission, { status: 'admitted' }>,
+): boolean {
+  return outcome.status === 'unknown';
+}
+
+/** An unacknowledged `/chat` may have finished before its watcher connected.
+ * Query the small first-paint tail in the common case; fall back to exactly one
+ * full GET only when the target might sit beyond that window (e.g. a long tool
+ * turn). Never interpret absence in either snapshot as rejection. */
+export async function findConfirmedChatAdmission(
+  requestId: string,
+  readTail: () => Promise<Pick<SessionDetail, 'offset' | 'messages'>>,
+  readFull: () => Promise<Pick<SessionDetail, 'offset' | 'messages'>>,
+): Promise<boolean> {
+  if (!requestId) return false;
+  const hasExactUser = (snapshot: Pick<SessionDetail, 'messages'>) =>
+    snapshot.messages.some((message) => message.role === 'user'
+      && message.client_input_id === requestId);
+  const tail = await readTail();
+  if (hasExactUser(tail)) return true;
+  return (tail.offset ?? 0) > 0 && hasExactUser(await readFull());
+}
+
+export function retryAfterChatAdmission<T extends { id: number | string; clientInputId?: string }>(
+  item: T,
+  outcome: Exclude<QueuedChatAdmission, { status: 'admitted' }>,
+): T & { clientInputId?: string } {
+  if (outcome.status === 'rejected') return item;
+  // If the HTTP call itself failed before revealing an attempt identity, a
+  // sentinel prevents unsafe resubmission. It is NOT an authoritative ID and
+  // will never match a different user's confirmed transcript event.
+  return { ...item, clientInputId: UNKNOWN_CHAT_ADMISSION_PREFIX
+    + (outcome.requestId ?? `unresolved:${String(item.id)}`) };
+}
+
+/** Clear ACK and chat admission are separate receipts. An unknown HTTP outcome
+ * is not a safe negative receipt and must be reconciled by exact user identity. */
 export async function dispatchRejectedChatRetryAfterQueueClear(
   clearQueue: () => Promise<void>,
   stillOwnedAndIdle: () => boolean,
-  deliver: () => void,
-  restore: () => void,
+  deliver: () => Promise<QueuedChatAdmission>,
+  restore: (outcome: Exclude<QueuedChatAdmission, { status: 'admitted' }>) => void,
 ): Promise<boolean> {
   try {
     await clearQueue();
-    if (!stillOwnedAndIdle()) {
-      restore();
-      return false;
-    }
-    deliver();
-    return true;
   } catch {
-    restore();
+    restore({ status: 'rejected' });
     return false;
   }
+  if (!stillOwnedAndIdle()) {
+    restore({ status: 'rejected' });
+    return false;
+  }
+  let outcome: QueuedChatAdmission;
+  try {
+    outcome = await deliver();
+  } catch {
+    // A thrown delivery callback cannot prove that POST was never admitted.
+    outcome = { status: 'unknown' };
+  }
+  if (outcome.status === 'admitted') return true;
+  restore(outcome);
+  return false;
 }
 
 /** Preserve this tab's per-session queue write order across async POSTs.
