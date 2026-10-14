@@ -409,6 +409,29 @@ test('postChatPrompt submits prompt via RPC and returns 202 prompt ack', async (
   }
 });
 
+test('postChatPrompt exposes exact HTTP 409 status even if rejection JSON is unreadable', async () => {
+  const originalFetch = globalThis.fetch;
+  let reply = '{"code":"session_busy","error":"session is busy"}';
+  globalThis.fetch = (async () => new Response(reply, { status: 409 })) as typeof fetch;
+  try {
+    const { postChatPrompt } = await import('./api.ts');
+    await assert.rejects(
+      () => postChatPrompt({ message: 'queue original', session_id: 'session-a' }),
+      (error: unknown) => error instanceof Error
+        && (error as Error & { status?: number; code?: string }).status === 409
+        && (error as Error & { code?: string }).code === 'session_busy',
+    );
+    reply = '';
+    await assert.rejects(
+      () => postChatPrompt({ message: 'queue original', session_id: 'session-a' }),
+      (error: unknown) => error instanceof Error
+        && (error as Error & { status?: number }).status === 409,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('getActiveChatSessions reads the authoritative detached chat registry', async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async (url: RequestInfo | URL) => {

@@ -1,11 +1,29 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
+  isDefiniteChatConflict,
   mergeQueuedIntoDraft,
   queueAfterSessionActiveCheck,
   stashSessionQueued,
   restoreSessionQueued,
 } from './queuedDraft.ts';
+
+test('only a structured HTTP 409 is a definite chat rejection eligible for retry', () => {
+  assert.equal(isDefiniteChatConflict({ status: 409, code: 'session_busy' }), true);
+  assert.equal(isDefiniteChatConflict({ status: 409, code: 'request_busy' }), true);
+  assert.equal(isDefiniteChatConflict({ status: 409 }), true);
+  // A resolved 202 may be followed by a UI/session callback throwing its
+  // own status:409. That is NOT a rejection of the admitted /chat POST.
+  assert.equal(isDefiniteChatConflict({ status: 409, code: 'session_busy' }, true), false);
+  assert.equal(isDefiniteChatConflict({ status: 500, code: 'session_busy' }), false);
+  assert.equal(isDefiniteChatConflict(Object.assign(new Error('Conflict 409'), { code: 'session_busy' })), false);
+  assert.equal(isDefiniteChatConflict(new Error('409 Conflict')), false);
+  assert.equal(isDefiniteChatConflict(new Error('session_busy')), false);
+  assert.equal(isDefiniteChatConflict(new Error('already has an active chat operation')), false);
+  assert.equal(isDefiniteChatConflict(new TypeError('network 409 gateway error')), false);
+  assert.equal(isDefiniteChatConflict(null), false);
+  assert.equal(isDefiniteChatConflict('409 Conflict'), false);
+});
 
 test('mergeQueuedIntoDraft keeps queue order ahead of the current draft', () => {
   const merged = mergeQueuedIntoDraft(
@@ -97,5 +115,4 @@ test('loadQueuedFromStorage and saveQueuedToStorage round-trip across simulated 
     (globalThis as any).window = original;
   }
 });
-
 

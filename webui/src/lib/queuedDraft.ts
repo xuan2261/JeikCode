@@ -5,6 +5,22 @@ export interface QueuedDraftItem {
   images?: ImageData[];
 }
 
+/**
+ * Only an actual HTTP 409 status is evidence that the server rejected a
+ * particular /chat admission. A transport error can quote "409 Conflict" or
+ * "session_busy" in its message even after the server accepted the request;
+ * that text is never permission to create an automatic retry.
+ */
+export function isDefiniteChatConflict(
+  error: unknown,
+  operationReceiptObserved = false,
+): boolean {
+  // The surrounding Chat try/catch also executes post-ACK UI callbacks.
+  // Their errors cannot turn an already reserved /chat into an HTTP 409.
+  return !operationReceiptObserved && error !== null && typeof error === 'object'
+    && 'status' in error && error.status === 409;
+}
+
 export const STORAGE_KEY_QUEUED_MESSAGES = 'jeikcode_queued_messages_v2';
 export const LEGACY_STORAGE_KEY_QUEUED_MESSAGES = 'jeikcode_queued_messages';
 

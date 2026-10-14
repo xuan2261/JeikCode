@@ -158,6 +158,7 @@ import {
 import { gitStore } from '../lib/gitStore';
 import { isInternalHistoryAssistantMessage, isInternalHistoryUserMessage, stripInjectedRemindersForDisplay, stripSteerEnvelopeForDisplay } from '../lib/historyMessages';
 import {
+  isDefiniteChatConflict,
   loadQueuedFromStorage,
   mergeQueuedIntoDraft,
   queueAfterSessionActiveCheck,
@@ -6206,6 +6207,9 @@ export function Chat({
     let boundSessionId = sessionId ?? activeIdRef.current;
     let acceptedWithoutSession = false;
     let keepStopAlias = false;
+    // Distinguish a real /chat rejection from a later UI callback failure.
+    // HTTP 202 reserves an operation, but is not canonical user admission.
+    let operationReceiptObserved = false;
 
     try {
       const targetProvider = overrideProvider || provider || undefined;
@@ -6220,6 +6224,7 @@ export function Chat({
       };
 
       const ack = await postChatPrompt(body, controller.signal);
+      operationReceiptObserved = true;
       const effectiveSid = ack.session_id || boundSessionId || turnOwnerSid;
       if (effectiveSid) {
         boundSessionId = effectiveSid;
@@ -6260,13 +6265,9 @@ export function Chat({
           ));
       const aborted = err instanceof Error && err.name === 'AbortError';
       const msg = err instanceof Error ? err.message : String(err);
-      const isConflict =
-        (err as any)?.status === 409 ||
-        (err as any)?.code === 'session_busy' ||
-        msg.includes('409') ||
-        msg.includes('Conflict') ||
-        msg.includes('session_busy') ||
-        msg.includes('already has an active chat operation');
+      // Only the structured status from postChatPrompt proves this request
+      // was rejected. Never turn text-only transport errors into auto-retries.
+      const isConflict = isDefiniteChatConflict(err, operationReceiptObserved);
       if (!aborted && stillCurrent) {
         keepStopAlias = true;
         transitionChatRecovery({ type: 'transport_lost' });
