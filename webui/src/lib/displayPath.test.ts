@@ -4,6 +4,7 @@ import {
   collapseHomePath,
   displayPath,
   fsBreadcrumbs,
+  fsBreadcrumbsForPicker,
   isLoopbackHost,
   joinFsChild,
   pathBasename,
@@ -82,6 +83,22 @@ test('breadcrumbs never surface a ? segment for extended Windows paths', () => {
   assert.equal(unc[0].fullPath, '//server/share');
   assert.equal(unc[1].fullPath, '//server/share/src');
   assert.ok(!unc.some((c) => c.label === '?'));
+});
+
+test('repair breadcrumbs cannot normalize a rejected raw path into a clickable navigation target', () => {
+  const rejectedRaw = '\\\\?\\C:\\Work\\JeikCode';
+  // The ordinary cwd display intentionally normalizes this path; repair must
+  // not render it until a local-only listing supplied a validated loadedPath.
+  assert.equal(fsBreadcrumbs(rejectedRaw)[0].fullPath, 'C:\\');
+  assert.deepEqual(fsBreadcrumbsForPicker(rejectedRaw, '', true), []);
+  assert.deepEqual(
+    fsBreadcrumbsForPicker(rejectedRaw, 'C:\\Work\\JeikCode', true),
+    fsBreadcrumbs('C:\\Work\\JeikCode'),
+  );
+  assert.deepEqual(
+    fsBreadcrumbsForPicker(rejectedRaw, '', false),
+    fsBreadcrumbs(rejectedRaw),
+  );
 });
 
 test('loopback hosts may open a native folder dialog', () => {
