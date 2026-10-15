@@ -3,9 +3,16 @@ import { test } from 'node:test';
 import { extractMath, looksLikeCurrency } from './markdownMath.ts';
 import { markdownToHtml } from './markdownRender.ts';
 
-test('looksLikeCurrency rejects $100-style amounts', () => {
+test('looksLikeCurrency rejects $100-style amounts but preserves numeric TeX formulas', () => {
   assert.equal(looksLikeCurrency('100'), true);
+  assert.equal(looksLikeCurrency('1,299.00'), true);
+  assert.equal(looksLikeCurrency('50k'), true);
+  assert.equal(looksLikeCurrency('100万'), true);
   assert.equal(looksLikeCurrency('x=1'), false);
+  assert.equal(looksLikeCurrency('3 \\times 72 = 216'), false);
+  assert.equal(looksLikeCurrency('1 + 1 = 2'), false);
+  assert.equal(looksLikeCurrency('10^5'), false);
+  assert.equal(looksLikeCurrency('2x'), false);
 });
 
 test('extractMath keeps $$ formulas and skips fenced code', () => {
@@ -45,6 +52,12 @@ test('inline $x^2$ renders and currency stays literal', () => {
   assert.match(html, /\$100/);
 });
 
+test('inline numeric-prefixed formulas like $3 \\times 72 = 216$ render via KaTeX', () => {
+  const html = markdownToHtml('时有 $3 \\times 72 = 216$ 个计算线程');
+  assert.match(html, /katex/);
+  assert.doesNotMatch(html, /\$3 \\times 72 = 216\$/);
+});
+
 test('unclosed or cross-paragraph backticks do not swallow subsequent LaTeX formulas', () => {
   const md = [
     '正文的 `` 标记（未在当前段闭合）',
@@ -61,5 +74,27 @@ test('unclosed or cross-paragraph backticks do not swallow subsequent LaTeX form
   assert.match(html, /≻/);
   assert.doesNotMatch(html, /\$\\rightleftharpoons\$/);
   assert.doesNotMatch(html, /\$\\succ\$/);
+});
+
+test('untrusted TeX cannot create links, images, or HTML attributes', () => {
+  const expressions = [
+    String.raw`\href{javascript:alert(1)}{click}`,
+    String.raw`\includegraphics{https://attacker.invalid/tracker.png}`,
+    String.raw`\htmlData{onclick=alert(1)}{click}`,
+  ];
+
+  for (const expression of expressions) {
+    const html = markdownToHtml(`$${expression}$`);
+    assert.match(html, /katex/);
+    assert.doesNotMatch(html, /<a\b|<img\b|\s(?:href|src|onclick|data-onclick)=/i);
+  }
+});
+
+test('invalid TeX stays visible without exposing markup or breaking later math', () => {
+  const html = markdownToHtml(String.raw`$\frac{<script>alert(1)</script>$ then $x^2$`);
+  assert.match(html, /&lt;script&gt;/);
+  assert.doesNotMatch(html, /<script\b/i);
+  assert.match(html, /class="katex"/);
+  assert.doesNotMatch(html, /\$x\^2\$/);
 });
 

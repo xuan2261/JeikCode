@@ -16,9 +16,9 @@ const RULES: &str = r#"Your task: find the real problems introduced by this diff
 ## About the DIFF and the Workspace
 
 - The DIFF under review is provided by the review tool. Its source may be uncommitted changes, the staging area, a base ref, a PR, or an external diff file. You need not care about the source — treat this DIFF as the authoritative scope of this review.
-- You may use `read_file` / `grep` to read repository code for additional context, but do not assume the workspace code equals the post-change state of the DIFF — under some invocation modes (e.g. feeding a diff file without switching branches), the on-disk code may not match the DIFF.
-- When the code read via `read_file` does not match the hunk content in the DIFF, the DIFF takes precedence; for conclusions that rely on workspace context (rather than the DIFF itself), lower `confidence` accordingly.
-- If this task explicitly states that "the workspace is already checked out to the post-change code state," then the content read via `read_file` / `grep` is consistent with the DIFF and trustworthy, and may be freely used for cross-file and contextual reasoning.
+- You may use `read` / `grep` to read repository code for additional context, but do not assume the workspace code equals the post-change state of the DIFF — under some invocation modes (e.g. feeding a diff file without switching branches), the on-disk code may not match the DIFF.
+- When the code read via `read` does not match the hunk content in the DIFF, the DIFF takes precedence; for conclusions that rely on workspace context (rather than the DIFF itself), lower `confidence` accordingly.
+- If this task explicitly states that "the workspace is already checked out to the post-change code state," then the content read via `read` / `grep` is consistent with the DIFF and trustworthy, and may be freely used for cross-file and contextual reasoning.
 
 ## I. Review Scope
 
@@ -55,7 +55,7 @@ Review in the following priority order:
 - For very large files such as lockfiles, generated files, snapshot files, or vendored files, prioritize the changed fragments and their related context; investigate deeper only when the change affects dependency resolution, build, security, runtime behavior, or test results.
 - Use the available read-only tools to inspect files, search references, and understand call chains and impact scope.
 - When tools are available, prefer:
-    - `read_file`: read full file context;
+    - `read`: read full file context (also lists directories);
     - `grep` / `ast_grep`: find call sites, similar code, dispatch entry points;
     - code-intelligence tools: find symbols, references, callers, callees, dependencies, and impact radius.
 - For large diffs, still inspect every changed file, but allocate deeper investigation to files affecting runtime behavior, security boundaries, data persistence, concurrency, public APIs, build/deploy configuration, and dependency resolution.
@@ -191,7 +191,7 @@ mod tests {
             );
         }
         // Named read-only tools (code-intelligence tools are described by category).
-        for tool in ["read_file", "grep", "ast_grep", "web_search"] {
+        for tool in ["read", "grep", "ast_grep", "web_search"] {
             assert!(p.contains(tool), "persona must advertise the tool `{tool}`");
         }
         // Core review-discipline anchors.
@@ -212,7 +212,16 @@ mod tests {
     fn persona_does_not_invite_mutation() {
         let p = review_persona("m");
         // The reviewer must not advertise write/edit/bash — it is read-only.
-        for forbidden in ["write_file", "edit_file", "`bash`"] {
+        // The reviewer must not advertise write/edit/shell tools. Match the BACKTICKED
+        // canonical form so prose ("rewrite", "edit the hunk") cannot trip the lock.
+        for forbidden in [
+            "`write`",
+            "`edit`",
+            "`run_command`",
+            "`write_file`",
+            "`edit_file`",
+            "`bash`",
+        ] {
             assert!(
                 !p.contains(forbidden),
                 "reviewer persona must not advertise `{forbidden}`"

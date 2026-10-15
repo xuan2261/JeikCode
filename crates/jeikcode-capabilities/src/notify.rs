@@ -1708,8 +1708,7 @@ mod tests {
         let secret = "0123456789abcdef0123456789abcdef";
         let plain_launch = focus_launch(13457, secret, "550e8400-e29b-41d4-a716-446655440000")
             .expect("uuid session");
-        let plain_xml =
-            windows_toast_xml("JeikCode needs approval", "write_file", Some(&plain_launch));
+        let plain_xml = windows_toast_xml("JeikCode needs approval", "write", Some(&plain_launch));
         assert!(
             !plain_xml.contains("<actions>"),
             "uncorrelated approval notifications must be click-to-focus only"
@@ -1722,7 +1721,7 @@ mod tests {
             "approval_abc123",
         )
         .expect("correlated approval launch");
-        let xml = windows_toast_xml("JeikCode needs approval", "write_file", Some(&launch));
+        let xml = windows_toast_xml("JeikCode needs approval", "write", Some(&launch));
         assert!(xml.contains("<actions>"));
         assert!(xml.contains("content=\"Approve\""));
         assert!(xml.contains("content=\"Deny\""));
@@ -1732,7 +1731,7 @@ mod tests {
         assert!(xml.contains(&format!("arguments=\"{launch}:deny\"")));
         assert!(launch.contains(":approval:approval_abc123"));
 
-        let zh_xml = windows_toast_xml("JeikCode 等待审核", "write_file", Some(&launch));
+        let zh_xml = windows_toast_xml("JeikCode 等待审核", "write", Some(&launch));
         assert!(zh_xml.contains("<actions>"));
         assert!(zh_xml.contains("content=\"同意\""));
         assert!(zh_xml.contains("content=\"拒绝\""));

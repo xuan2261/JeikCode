@@ -28,6 +28,7 @@ mod reasoning;
 mod responses;
 mod retry;
 mod sign;
+mod timeouts;
 
 pub use anthropic::{AnthropicConfig, AnthropicProvider};
 pub fn signer_available() -> bool {
@@ -50,6 +51,7 @@ pub use reasoning::{ReasoningPolicy, REASONING_PLACEHOLDER};
 pub use responses::{ResponsesConfig, ResponsesProvider};
 pub use retry::RetryPolicy;
 pub use sign::{RequestSigner, RequestSigningError, SignedAuth};
+pub use timeouts::ApplyTimeouts;
 
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};

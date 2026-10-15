@@ -1,4 +1,6 @@
-import { useT } from '../settings';
+import DOMPurify from 'dompurify';
+import { useT, type TParams } from '../settings';
+import type { MsgKey } from '../i18n';
 import { useState, useEffect, useRef, useCallback } from 'preact/hooks';
 import { TransformWrapper, TransformComponent } from 'react-zoom-pan-pinch';
 import {
@@ -18,6 +20,7 @@ import {
 interface MermaidDiagramProps {
   code: string;
   isDark?: boolean;
+  t?: (key: MsgKey, params?: TParams) => string;
 }
 
 // 全局 SVG 渲染缓存，避免流式后续文本输出或会话切换触发二次重复渲染与闪烁
@@ -31,7 +34,7 @@ function getMermaid() {
       const instance = m.default || m;
       instance.initialize({
         startOnLoad: false,
-        securityLevel: 'strict',
+        securityLevel: 'loose',
         fontFamily: 'var(--app-sans-font-family, ui-sans-serif, sans-serif)',
         logLevel: 'error',
       });
@@ -41,8 +44,57 @@ function getMermaid() {
   return mermaidPromise;
 }
 
-export function MermaidDiagram({ code, isDark = false }: MermaidDiagramProps) {
-  const t = useT();
+// SECURITY: Mermaid runs with `securityLevel: 'loose'` so rich HTML labels and `<br/>`
+// render, which also means untrusted diagram source can emit markup.
+//
+// NOTE: DOMPurify's default SVG namespace validation strictly forbids HTML elements
+// (like `<div>`, `<span>`, `<p>`) nested inside SVG elements (like `<foreignObject>`),
+// treating them as invalid namespace transitions (mXSS protection) and stripping all
+// children of `<foreignObject>`. Because Mermaid renders all flowchart node labels inside
+// `<foreignObject><div>...</div></foreignObject>`, calling DOMPurify directly on the full
+// SVG string wipes out all node text.
+//
+// To safely sanitize without stripping labels:
+// 1. Extract each `<foreignObject>` inner HTML and replace with an unguessable placeholder token.
+// 2. Sanitize the outer SVG structure with DOMPurify's SVG profile.
+// 3. Sanitize each `<foreignObject>` inner HTML with DOMPurify's HTML+SVG profile.
+// 4. Restore the sanitized inner HTML back into the placeholder locations.
+export function sanitizeMermaidSvg(svg: string): string {
+  if (typeof window === 'undefined') return svg;
+
+  const foMap = new Map<string, string>();
+  let counter = 0;
+  const tokenPrefix = `__MERMAID_FO_${Math.random().toString(36).slice(2)}_${Date.now()}_`;
+
+  const placeholderSvg = svg.replace(
+    /(<foreignObject\b[^>]*>)([\s\S]*?)(<\/foreignObject>)/gi,
+    (_match, openTag, innerContent, closeTag) => {
+      const id = `${tokenPrefix}${counter++}__`;
+      const cleanInner = DOMPurify.sanitize(innerContent, {
+        USE_PROFILES: { html: true, svg: true },
+        ADD_ATTR: ['target', 'rel'],
+      });
+      foMap.set(id, cleanInner);
+      return `${openTag}${id}${closeTag}`;
+    }
+  );
+
+  let cleanSvg = DOMPurify.sanitize(placeholderSvg, {
+    USE_PROFILES: { svg: true, svgFilters: true },
+    ADD_TAGS: ['foreignObject'],
+    ADD_ATTR: ['dominant-baseline', 'text-anchor', 'paint-order', 'marker-end', 'marker-start', 'xmlns:xlink'],
+  });
+
+  for (const [id, cleanInner] of foMap.entries()) {
+    cleanSvg = cleanSvg.replace(id, () => cleanInner);
+  }
+
+  return cleanSvg;
+}
+
+export function MermaidDiagram({ code, isDark = false, t: propT }: MermaidDiagramProps) {
+  const defaultT = useT();
+  const t = propT || defaultT;
   const cleanCode = code.trim();
   const cacheKey = `${isDark ? 'dark' : 'light'}:${cleanCode}`;
   const cachedSvg = svgRenderCache.get(cacheKey) || '';
@@ -81,6 +133,8 @@ export function MermaidDiagram({ code, isDark = false }: MermaidDiagramProps) {
         .then(async (mermaid) => {
           if (canceled) return;
           mermaid.initialize({
+            startOnLoad: false,
+            securityLevel: 'loose',
             theme: isDark ? 'dark' : 'neutral',
             themeVariables: isDark
               ? {
@@ -109,8 +163,9 @@ export function MermaidDiagram({ code, isDark = false }: MermaidDiagramProps) {
           try {
             const { svg } = await mermaid.render(id, clean);
             if (!canceled) {
-              svgRenderCache.set(key, svg);
-              setSvgContent(svg);
+              const safeSvg = sanitizeMermaidSvg(svg);
+              svgRenderCache.set(key, safeSvg);
+              setSvgContent(safeSvg);
               setLoading(false);
               setError(null);
             }
@@ -221,7 +276,6 @@ export function MermaidDiagram({ code, isDark = false }: MermaidDiagramProps) {
                   aria-label={showCode ? t('diagram.view') : t('diagram.code')}
                 >
                   {showCode ? <Eye size={13} /> : <Code2 size={13} />}
-                  <span class="mermaid-btn-label">{showCode ? t('diagram.label') : t('common.code')}</span>
                 </button>
 
                 {!showCode && !error && svgContent && (

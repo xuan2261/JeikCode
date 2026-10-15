@@ -23,7 +23,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 /// Default kernel cap on a single tool result's `content` byte length.
 ///
 /// 256 KiB (~64K tokens). Sized so a 2000-line numbered source file from
-/// `read_file` survives the backstop instead of being chopped into a crawl.
+/// `read` survives the backstop instead of being chopped into a crawl.
 /// Runaway tools (a `grep -r /`, an infinite generator) are still bounded well
 /// below a megabyte. Tools that declare `never_truncate_result()` skip this cap
 /// (and the artifact fold). `0` disables the cap (UNBOUNDED) — see
@@ -131,7 +131,7 @@ const MAX_STREAM_RETRIES: u32 = 5;
 /// re-issues the same round (per-round accumulators reset on `continue`, so
 /// partial output is never double-pushed). After this budget the turn fails with
 /// the explicit "model unresponsive / high latency" terminal error. User-facing
-/// expectation: 60s wait × retry3 → "模型延迟过高,请稍后再试".
+/// expectation: 180s wait × retry3 → "模型延迟过高,请稍后再试".
 const MAX_FIRST_TOKEN_RETRIES: u32 = 3;
 
 /// Safety fuse: maximum consecutive `WaitAndRetry` rate-limit sleeps within a
@@ -312,7 +312,7 @@ const TRUNCATION_RESUME_NUDGE: &str =
     "Output limit hit — your last response was cut off before finishing. If the task is \
      already complete, reply with a short summary and stop (no tool calls). Otherwise resume \
      where you left off, writing the remaining content INCREMENTALLY to a file (append the \
-     next section with edit_file) rather than re-emitting it all in one response.";
+     next section with edit) rather than re-emitting it all in one response.";
 
 // Provider adapters can emit these placeholder strings when no usable reasoning
 // was captured. Keep the neutral kernel cleanup list aligned with adapter output.
@@ -484,6 +484,24 @@ fn is_terminal_rate_limit(e: &crate::stream::ProviderError) -> bool {
     .any(|needle| message.contains(needle))
 }
 
+/// Seconds to wait before resending an empty completion.
+///
+/// Empty and malformed responses use 1,1,2,2,3. A thinking-only completion (reasoning
+/// streamed, no text and no tool call) retries the first time immediately; the same
+/// sequence starts on the following attempt.
+fn empty_retry_wait_secs(thinking_only: bool, empty_retries: u32) -> u64 {
+    let n = if thinking_only {
+        empty_retries.saturating_sub(1)
+    } else {
+        empty_retries
+    };
+    if n == 0 {
+        0
+    } else {
+        (((n + 1) / 2).min(3)) as u64
+    }
+}
+
 /// Build the user-facing message shown when the empty-response retry budget is
 /// exhausted. Honest about cause: a content-free 200 from some OpenAI-compatible
 /// gateways is a LIKELY symptom of an over-/near-window request, so when the
@@ -494,11 +512,17 @@ fn is_terminal_rate_limit(e: &crate::stream::ProviderError) -> bool {
 /// case. `ctx_window == 0` (window unknown) can never claim an over-size cause.
 fn empty_exhaustion_message(
     saw_malformed: bool,
+    thinking_only: bool,
     est_prompt_tokens: u32,
     ctx_window: u32,
     max_retries: u32,
     already_advised: bool,
 ) -> String {
+    if thinking_only {
+        return format!(
+            "模型连续 {max_retries} 次只返回了思考、未给出正文或工具。可直接重试，或稍后再试。"
+        );
+    }
     if saw_malformed {
         return format!(
             "模型连续 {max_retries} 次返回无法解析的响应（上游偶发）。可直接重试，或稍后再试。"
@@ -527,60 +551,81 @@ fn empty_exhaustion_message(
     }
 }
 
-/// The mid-turn input budget: the window minus a reservation for the completion
-/// (`max_tokens`) and a margin covering the byte-based token estimate's undercount.
-/// Used only by the pre-send compaction guard and the over-window advisory — the
-/// DISPLAYED window (`context_window()`) is unchanged, so users still see the model's
-/// full window while the guard keeps the real request (messages + completion) under
-/// the model's usable limit.
-fn effective_input_limit(window: u32, max_tokens: Option<u32>) -> u32 {
-    let output_reserve = max_tokens.unwrap_or(16_384);
-    let margin = (window / 8).clamp(16_000, 128_000);
-    let reserve = output_reserve.saturating_add(margin);
-    // If the reserve can't fit inside the window (unrealistically small windows,
-    // e.g. test fixtures), don't reserve — fall back to the raw window so the guard
-    // keeps its old `est >= window` behavior. Real model windows (>= 128K) always
-    // leave room, so this only affects tiny windows.
-    if reserve >= window {
-        window
+/// Output WATERMARK buffer — the ONLY output-derived term the pressure math reserves.
+///
+/// A small, fixed watermark (mirroring opencode's `COMPACTION_BUFFER`), capped at a quarter
+/// of the window so even tiny windows (test fixtures, misconfigurations) keep a gaugeable
+/// budget. `[models.X] max_tokens` (e.g. 384K) is a CAPABILITY DECLARATION that is passed to
+/// the provider as the protocol max budget — it NEVER enters the context/watermark math.
+/// (Reserving it verbatim once shrank a 1M-window model to a 491K input budget and warned
+/// "near the limit" at 49% — the "max_tokens folded into the context window" defect.)
+const OUTPUT_WATERMARK_BUFFER: u32 = 20_000;
+
+/// Default per-call output budget when `[models.X] max_tokens` is unset — the 64K tier the
+/// model editor offers (32K / 64K / 128K / 256K / 384K / custom).
+pub const DEFAULT_OUTPUT_BUDGET: u32 = 64_000;
+
+/// The output budget handed to the provider this round: the DECLARED value VERBATIM
+/// (`max_tokens` / `max_output_tokens` per protocol), or [`DEFAULT_OUTPUT_BUDGET`] when
+/// unset. The only adjustment is a window sanity clamp — a budget above the window is
+/// protocol-invalid on every gateway. This value never feeds the context/watermark math:
+/// the real output is whatever the model actually generates within it, and real context
+/// pressure comes from the provider's reported usage.
+pub fn wire_output_budget(window: u32, declared: Option<u32>) -> u32 {
+    let budget = declared.unwrap_or(DEFAULT_OUTPUT_BUDGET);
+    let bounded = if window > 0 {
+        budget.min(window)
     } else {
-        window - reserve
-    }
+        budget
+    };
+    bounded.max(1)
 }
 
-/// The pre-send over-window advisory. Fires when the estimate reaches `trigger_limit`
-/// (the effective input budget — window minus output reserve minus margin), so it
-/// warns BEFORE the real request crosses the model's usable limit. The user-facing
-/// text still references the full `ctx_window` — the reserve is internal.
+/// The input WATERMARK budget — the denominator of every pressure decision: the window
+/// minus [`OUTPUT_WATERMARK_BUFFER`] (no output term at all). Auto-compaction, the pre-send
+/// guard and the `CompactionView` handed to the strategy are all sized against THIS, so the
+/// declared output budget cannot influence when context pressure is acted on — real context
+/// is only ever measured by the provider-reported usage (or the byte estimate as fallback).
+fn input_watermark_budget(window: u32) -> u32 {
+    window.saturating_sub(OUTPUT_WATERMARK_BUFFER.min(window / 4))
+}
+
+/// The pre-send over-window advisory. Fires when the estimate reaches the WATERMARK budget
+/// (window − the fixed output watermark) — the same line auto-compaction acts on, so the
+/// advice and the trigger agree. The text names both terms so the arithmetic is auditable.
 fn over_window_advisory(
     est_prompt_tokens: u32,
     ctx_window: u32,
-    trigger_limit: u32,
+    watermark_limit: u32,
 ) -> Option<String> {
-    if ctx_window == 0 || (est_prompt_tokens as u64) < (trigger_limit as u64) {
+    if ctx_window == 0 || (est_prompt_tokens as u64) < (watermark_limit as u64) {
         return None;
     }
     Some(format!(
-        "请求约 {}K tokens 接近当前模型可用上限（窗口约 {}K，需为回复预留空间）：请精简输入或换用更大窗口的模型。",
+        "请求约 {}K tokens 已达上下文水位（窗口约 {}K − 水位缓冲 {}K）：请精简输入或换用更大窗口的模型。",
         est_prompt_tokens / 1000,
         ctx_window / 1000,
+        ctx_window.saturating_sub(watermark_limit) / 1000,
     ))
 }
 
-/// Auto-compaction pressure verdict: `used_tokens / ctx_window >= threshold`.
-/// Recomputed against the LIVE window (not a stored ratio) so a model switch is
+/// Auto-compaction pressure verdict: `used_tokens / input_watermark_budget >= threshold`.
+/// Recomputed against the LIVE model (not a stored ratio) so a model switch is
 /// re-evaluated each turn — switch to a smaller window ⇒ pressure rises ⇒ compact
 /// proactively; switch to a larger window ⇒ pressure drops ⇒ no needless compaction.
-/// `None` when the window is unknown (`ctx_window == 0`) — can't gauge, so don't act.
+/// The denominator is the WATERMARK budget (window − output watermark), NOT the raw window
+/// and NOT the declared output ceiling, so the trigger and the pre-send guard share one
+/// denominator line — no "warns every turn but never compacts" gap.
+/// `None` when the budget is unknown (`watermark_budget == 0`) — can't gauge, so don't act.
 fn auto_compact_trigger(
     used_tokens: u32,
-    ctx_window: u32,
+    watermark_budget: u32,
     threshold: f32,
 ) -> Option<CompactTrigger> {
-    if ctx_window == 0 {
+    if watermark_budget == 0 {
         return None;
     }
-    let utilization = used_tokens as f32 / ctx_window as f32;
+    let utilization = used_tokens as f32 / watermark_budget as f32;
     (utilization >= threshold).then_some(CompactTrigger::Auto { utilization })
 }
 
@@ -1024,14 +1069,9 @@ pub struct Agent {
     /// Optional durable writer for committed manual compactions. `None` is an
     /// explicitly ephemeral agent; session-bound production assembly injects one.
     compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>>,
-    /// LIVENESS: max time to wait for the NEXT stream event (bounds both
-    /// first-token and inter-token latency). `None` (default) = unbounded. See
-    /// `AgentBuilder::stream_timeout`.
-    stream_timeout: Option<std::time::Duration>,
-    /// LIVENESS: max wall-clock wait for the FIRST stream token of a round,
-    /// before any content. `None` (default) = no first-token arm. See
-    /// `AgentBuilder::first_token_timeout`.
-    first_token_timeout: Option<std::time::Duration>,
+    /// LIVENESS: transport + three-phase content clocks. See [`TimeoutPolicy`].
+    /// Content fields default `None` (unbounded) on the neutral kernel.
+    timeouts: crate::timeouts::TimeoutPolicy,
     /// Max re-issues after a first-token timeout (see
     /// `AgentBuilder::first_token_timeout_retries`). Default
     /// [`MAX_FIRST_TOKEN_RETRIES`].
@@ -1139,8 +1179,7 @@ impl Agent {
             compaction: self.compaction,
             compact_threshold: self.compact_threshold,
             compaction_checkpoint: self.compaction_checkpoint,
-            stream_timeout: self.stream_timeout,
-            first_token_timeout: self.first_token_timeout,
+            timeouts: self.timeouts,
             first_token_retries: self.first_token_retries,
             chat_options: self.chat_options,
             // Resolve the effective working dir into a single shared handle: an explicit
@@ -1248,11 +1287,8 @@ struct RunningAgent {
     compaction: Arc<dyn CompactionStrategy>,
     compact_threshold: Option<f32>,
     compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>>,
-    /// LIVENESS: per-stream-event wait bound. `None` = unbounded (no timer arm).
-    stream_timeout: Option<std::time::Duration>,
-    /// LIVENESS: first-token wall-clock wait bound (see `Agent::first_token_timeout`).
-    /// `None` = no first-token arm.
-    first_token_timeout: Option<std::time::Duration>,
+    /// LIVENESS: three-phase content clocks + transport defaults.
+    timeouts: crate::timeouts::TimeoutPolicy,
     /// Max times a round is re-issued after a first-token timeout. Set by the
     /// specialization (config `[coding] first_token_timeout_retries` / env) and
     /// forwarded to the stream loop, replacing the old hard-coded constant.
@@ -1299,8 +1335,13 @@ impl RunningAgent {
     /// Decide whether the AUTO task-boundary trigger should fire for the CURRENT
     /// stored history. Returns `Some(CompactTrigger::Auto{utilization})` iff a
     /// `compact_threshold` is configured AND the last stored assistant turn's raw
-    /// prompt tokens (`meta.used_tokens`) recomputed against the CURRENT model window
-    /// are `>= threshold`. Reads `used_tokens` — NOT the stored `meta.utilization`
+    /// prompt tokens (`meta.used_tokens`) recomputed against the CURRENT model's
+    /// WATERMARK budget (`window − min(20K, output budget)`) are `>= threshold`
+    /// (default 0.9). The denominator is the watermark budget — NOT the raw window and
+    /// NOT the declared output ceiling — so this trigger and the pre-send guard share
+    /// one line: a `max_tokens` capability ceiling (e.g. 384K) can no longer shrink the
+    /// usable context, and there is no "warns every turn but never compacts" gap.
+    /// Reads `used_tokens` — NOT the stored `meta.utilization`
     /// ratio, which baked in whatever window was active when that turn was recorded;
     /// switching to a smaller-window model must re-evaluate (the stored ratio, e.g.
     /// 0.23 against a 1M window, stays below the threshold, so the first send would
@@ -1321,7 +1362,8 @@ impl RunningAgent {
         // stored-ratio behavior for the unknown-window case (no regression there).
         let live = self.provider.context_window();
         let window = if live > 0 { live } else { recorded_window };
-        auto_compact_trigger(used, window, thresh)
+        let budget = input_watermark_budget(window);
+        auto_compact_trigger(used, budget, thresh)
     }
 
     /// Give an in-kernel continuation the same automatic-compaction opportunity as
@@ -1350,11 +1392,15 @@ impl RunningAgent {
             .map(|meta| (meta.ctx_window, meta.used_tokens))
             .unwrap_or((0, 0));
         let live_window = self.provider.context_window();
-        let ctx_window = if live_window > 0 {
+        let window = if live_window > 0 {
             live_window
         } else {
             recorded_window
         };
+        // Pressure math runs against the WATERMARK budget (window − the fixed watermark), NOT
+        // the raw window and NOT the declared output budget — so the strategy's keep-budget /
+        // drain marks / auto escalation use the exact denominator the trigger used.
+        let ctx_window = input_watermark_budget(window);
         let utilization = if ctx_window > 0 {
             used_tokens as f32 / ctx_window as f32
         } else {
@@ -1397,16 +1443,19 @@ impl RunningAgent {
             .and_then(|m| m.meta.as_ref())
             .map(|meta| (meta.ctx_window, meta.used_tokens))
             .unwrap_or((0, 0));
-        // Size this compaction to the CURRENT model window (fall back to the recorded
-        // one only when the live window is unknown), and recompute pressure against it.
-        // A compaction running after a model switch must use the NEW window — otherwise
-        // the keep-budget / drain math would be sized to the previous model's window.
+        // Size this compaction to the CURRENT model's WATERMARK budget (fall back to the
+        // recorded window only when the live window is unknown), and recompute pressure
+        // against it. A compaction running after a model switch must use the NEW window —
+        // otherwise the keep-budget / drain math would be sized to the previous model's
+        // window. The budget — not the raw window, and never the declared output budget —
+        // is what the strategy's pressure math is sized against.
         let live_window = self.provider.context_window();
-        let ctx_window = if live_window > 0 {
+        let window = if live_window > 0 {
             live_window
         } else {
             recorded_window
         };
+        let ctx_window = input_watermark_budget(window);
         let utilization = if ctx_window > 0 {
             used_tokens as f32 / ctx_window as f32
         } else {
@@ -1740,6 +1789,26 @@ impl RunningAgent {
             PromptKind::User => Message::user_with_images(text, images),
             PromptKind::Synthetic => Message::synthetic_user(text),
         });
+        // Identity boundary: announce the STORED user message so a client can bind
+        // its optimistic first-prompt bubble to the same id the transcript carries
+        // (id-based merges across refresh / session switch / replay). Synthetic
+        // continuations are host-driven, not user turns — never announced.
+        if kind == PromptKind::User {
+            if let Some(message_id) = convo.messages.last().and_then(|message| message.id.clone()) {
+                let turn_ordinal = convo.messages[..convo.messages.len().saturating_sub(1)]
+                    .iter()
+                    .filter(|message| {
+                        message.role == crate::message::Role::User
+                            && !message.synthetic
+                            && !message.text.trim().is_empty()
+                    })
+                    .count() as u32;
+                self.rt.emit(AgentEvent::UserMessage {
+                    message_id,
+                    turn_ordinal,
+                });
+            }
+        }
         // Per-turn cancellation token: Cancel fires it; run_turn polls it at the
         // stream, between tools, and inside execute. A CLONE also rides into each
         // ToolContext so cooperative tools can bail. SEAM 2: derived from the
@@ -2000,6 +2069,7 @@ impl RunningAgent {
         reasoning_blocks: &[crate::message::ReasoningBlock],
         pending_calls: &[ToolCall],
         suppress_internal_stream: bool,
+        message_id: Option<&str>,
     ) {
         let partial_reasoning = strip_reasoning_filler(reasoning);
         if assistant_text.is_empty() && partial_reasoning.is_empty() && pending_calls.is_empty() {
@@ -2013,6 +2083,9 @@ impl RunningAgent {
             .cloned()
             .collect();
         let mut partial = Message::assistant(assistant_text.to_string(), safe_calls);
+        // Reuse the round's stable identity so the persisted partial matches the
+        // live `AssistantMessage` id (no duplicate on cancel + refresh).
+        partial.id = message_id.map(str::to_string);
         if suppress_internal_stream {
             partial.internal_origin = Some("verify_cadence".to_string());
             partial.text.clear();
@@ -2055,6 +2128,7 @@ impl RunningAgent {
         reasoning_blocks: &[crate::message::ReasoningBlock],
         pending_calls: &[ToolCall],
         suppress_internal_stream: bool,
+        message_id: Option<&str>,
         diagnostic: Option<&str>,
     ) {
         Self::persist_partial_assistant(
@@ -2064,6 +2138,7 @@ impl RunningAgent {
             reasoning_blocks,
             pending_calls,
             suppress_internal_stream,
+            message_id,
         );
         if let Some(text) = diagnostic {
             Self::persist_turn_diagnostic(convo, text);
@@ -2321,9 +2396,14 @@ impl RunningAgent {
                         input.text.clone(),
                         input.images.clone(),
                     ));
+                    // Same identity the persisted steer message will carry, so the
+                    // client's pending steer card/bubble adopts it (instead of keeping
+                    // its local client id) and id-based merges converge with disk.
+                    let message_id = convo.messages.last().and_then(|message| message.id.clone());
                     inputs.push(crate::event::SteeredInput {
                         text: input.text,
                         images: input.images,
+                        message_id,
                     });
                 }
                 self.rt.emit(AgentEvent::Steered { count: n, inputs });
@@ -2353,7 +2433,7 @@ impl RunningAgent {
             // floor — unrecoverable, so fall through to the advisory).
             {
                 let window = self.provider.context_window();
-                let limit = effective_input_limit(window, self.chat_options.max_tokens);
+                let limit = input_watermark_budget(window);
                 let est = |msgs: &[Message]| -> u64 {
                     msgs.iter().map(|m| m.estimate_tokens() as u64).sum()
                 };
@@ -2394,7 +2474,7 @@ impl RunningAgent {
             if !over_window_warned {
                 let est: u32 = messages.iter().map(|m| m.estimate_tokens()).sum();
                 let window = self.provider.context_window();
-                let limit = effective_input_limit(window, self.chat_options.max_tokens);
+                let limit = input_watermark_budget(window);
                 if let Some(advisory) = over_window_advisory(est, window, limit) {
                     over_window_warned = true;
                     self.rt.emit(AgentEvent::Warning(advisory));
@@ -2423,6 +2503,19 @@ impl RunningAgent {
             // sees the exact bytes about to hit the provider. It gets `&` — it
             // cannot mutate the wire (mutation is pre_request's job above).
             let mut request_options = self.chat_options.clone();
+            // OUTPUT BUDGET (capability declaration → protocol max budget): the configured
+            // `[models.X] max_tokens` rides the wire VERBATIM (32K / 64K / 128K / 256K / 384K /
+            // custom; 64K when unset), so the model may generate up to it. It deliberately
+            // does NOT feed the context/watermark math above — that math uses the window minus
+            // a fixed watermark buffer, and real pressure comes from the provider's report.
+            // `pre_request_options` runs below and may still override (documented hook seam).
+            let wire_window = self.provider.context_window();
+            if wire_window > 0 {
+                request_options.max_tokens = Some(wire_output_budget(
+                    wire_window,
+                    self.chat_options.max_tokens,
+                ));
+            }
             request_options.rate_limit_retry_owner = crate::provider::RateLimitRetryOwner::Kernel;
             self.hooks
                 .pre_request_options(&messages, &mut request_options, &turn_ctx)
@@ -2621,6 +2714,13 @@ impl RunningAgent {
                     return;
                 }
             };
+            // Fresh assistant message boundary for THIS round: allocate its stable
+            // identity and announce it, so live deltas carry the same id the stored
+            // message will have (wire part id = `{message_id}:{part_seq}:{kind}`).
+            let assistant_message_id = crate::message::new_message_id();
+            self.rt.emit(AgentEvent::AssistantMessage {
+                message_id: assistant_message_id.clone(),
+            });
             let mut assistant_text = String::new();
             let suppress_internal_stream = matches!(
                 active_internal_continuation.as_ref(),
@@ -2654,6 +2754,7 @@ impl RunningAgent {
             // empty 200), so it must NOT be retried as empty. Set true on the raw
             // arrival in each content arm below.
             let mut saw_stream_content = false;
+            let mut saw_text_or_tool = false;
             let mut saw_suppressed_reasoning_filler = false;
             // Did the adapter report dropping an UNPARSEABLE chunk this round (a
             // `StreamEvent::Malformed`)? Only used to flavor the empty-response retry
@@ -2662,6 +2763,8 @@ impl RunningAgent {
             // Set to true by the mid-stream 429 WaitAndRetry arm so we can break
             // out of the inner stream loop and retry the round from the outer loop.
             let mut retry_this_round = false;
+            let mut phase = crate::timeouts::StreamPhase::Ttft;
+            let mut last_content = tokio::time::Instant::now();
             loop {
                 // MID-STREAM cancel checkpoint: cancellation stops stream
                 // consumption immediately. Carried from production runner.rs:420.
@@ -2669,16 +2772,13 @@ impl RunningAgent {
                 // nothing dangling to backfill: just emit Cancelled + TurnComplete
                 // and return (no bogus partial-success assistant message).
                 //
-                // LIVENESS stream timeout: when `stream_timeout` is Some(d), a THIRD
-                // arm races EACH `stream.next()` await against `sleep(d)` — bounding
-                // BOTH first-token AND inter-token latency (every await of the next
-                // event is bounded). The arm is GUARDED by `if .. .is_some()`: when
-                // None the arm is disabled and `sleep` is never even constructed, so
-                // the None path polls NO timer (unbounded, exactly as today). On
-                // timeout we take the EXISTING clean-fail path — identical to a
-                // mid-stream StreamEvent::Error: on_error + Error + TurnComplete +
-                // return (no partial assistant pushed, no fake success). `biased`
-                // keeps cancel first; the timer is tried before the (silent) stream.
+                // Three-phase content clock: TTFT / thinking→text transition /
+                // sliding window. Deadline is Instant-based so ResponseId / Usage
+                // / keepalive cannot reset it. `biased` keeps cancel first.
+                let phase_deadline = self
+                    .timeouts
+                    .phase_limit(phase)
+                    .map(|limit| last_content + limit);
                 let ev = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => {
@@ -2690,98 +2790,92 @@ impl RunningAgent {
                                 &reasoning_blocks,
                                 &pending_calls,
                                 suppress_internal_stream,
+                                Some(&assistant_message_id),
                             );
                         }
                         self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
                         return;
                     }
-                    _ = async { tokio::time::sleep(self.first_token_timeout.unwrap()).await }, if !saw_stream_content && self.first_token_timeout.is_some() => {
-                        // FIRST-TOKEN TIMEOUT: the model has emitted NO token within
-                        // `first_token_timeout` this round. Distinct from the stream
-                        // timeout arm below (which bounds EVERY inter-token gap): this
-                        // only fires when SO FAR the provider has produced nothing.
-                        // Re-issue the same round up to MAX_FIRST_TOKEN_RETRIES times
-                        // (fresh connection + reset per-round accumulators via
-                        // `continue`, so no partial output is ever double-pushed).
-                        // Guarded on `!saw_stream_content` so once ANY token arrives
-                        // the first-token arm is inert for the rest of the round.
-                        let first_token_secs = self.first_token_timeout.unwrap().as_secs();
-                        let retry_budget = self.first_token_retries;
-                        if first_token_retries < retry_budget {
-                            first_token_retries += 1;
-                            self.rt.emit(AgentEvent::Warning(format!(
-                                "模型延迟高:{} 秒内无响应,正在重试({}/{})…",
-                                first_token_secs, first_token_retries, retry_budget
-                            )));
-                            // Cancellable wait so Esc during the retry gap aborts.
-                            tokio::select! {
-                                biased;
-                                _ = cancel.cancelled() => {
-                                    self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
-                                    return;
+                    _ = async { tokio::time::sleep_until(phase_deadline.unwrap()).await }, if phase_deadline.is_some() => {
+                        if phase == crate::timeouts::StreamPhase::Thinking && !saw_text_or_tool {
+                            phase = crate::timeouts::StreamPhase::Transition;
+                            last_content = tokio::time::Instant::now();
+                            continue;
+                        }
+                        if !saw_text_or_tool && !saw_stream_content {
+                            if self.timeouts.ttft.is_some() {
+                                let first_token_secs = self
+                                    .timeouts
+                                    .phase_limit(crate::timeouts::StreamPhase::Ttft)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                let retry_budget = self.first_token_retries;
+                                if first_token_retries < retry_budget {
+                                    first_token_retries += 1;
+                                    self.rt.emit(AgentEvent::Warning(format!(
+                                        "模型延迟高:{} 秒内无响应,正在重试({}/{})…",
+                                        first_token_secs, first_token_retries, retry_budget
+                                    )));
+                                    tokio::select! {
+                                        biased;
+                                        _ = cancel.cancelled() => {
+                                            self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                                            return;
+                                        }
+                                        _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+                                    }
+                                    retry_this_round = true;
+                                    break;
                                 }
-                                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+                                let msg = format!(
+                                    "模型延迟过高,请稍后再试(连续 {} 次在 {} 秒内未收到首token)",
+                                    retry_budget, first_token_secs
+                                );
+                                self.hooks.on_error(&msg).await;
+                                self.rt.emit(AgentEvent::Error { message: msg.clone(), http_status: None, code: None });
+                                Self::persist_turn_diagnostic(convo, &msg);
+                                self.finish_turn(convo, StopReason::Timeout, &turn_ctx).await;
+                                return;
                             }
-                            retry_this_round = true;
+                            if stream_retry < MAX_STREAM_RETRIES {
+                                stream_retry += 1;
+                                self.rt.emit(AgentEvent::Warning(format!(
+                                    "stream idle timeout — reconnecting ({stream_retry}/{MAX_STREAM_RETRIES})"
+                                )));
+                                let backoff = std::time::Duration::from_millis(
+                                    (200u64 << (stream_retry - 1).min(31)).min(8_000),
+                                );
+                                tokio::select! {
+                                    biased;
+                                    _ = cancel.cancelled() => {
+                                        self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
+                                        return;
+                                    }
+                                    _ = tokio::time::sleep(backoff) => {}
+                                }
+                                retry_this_round = true;
+                                break;
+                            }
+                            let msg = "stream timeout after automatic reconnects".to_string();
+                            self.hooks.on_error(&msg).await;
+                            self.rt.emit(AgentEvent::Error { message: msg.clone(), http_status: None, code: None });
+                            Self::persist_turn_diagnostic(convo, &msg);
+                            self.finish_turn(convo, StopReason::Timeout, &turn_ctx).await;
+                            return;
+                        }
+                        if !saw_text_or_tool {
                             break;
                         }
-                        // Budget spent: fail with the explicit high-latency terminal
-                        // error (user-facing expectation: "模型延迟过高,请稍后再试").
-                        let msg = format!(
-                            "模型延迟过高,请稍后再试(连续 {} 次在 {} 秒内未收到首token)",
-                            retry_budget, first_token_secs
+                        Self::persist_partial_assistant(
+                            convo,
+                            &assistant_text,
+                            &reasoning,
+                            &reasoning_blocks,
+                            &pending_calls,
+                            suppress_internal_stream,
+                            Some(&assistant_message_id),
                         );
-                        self.hooks.on_error(&msg).await;
-                        self.rt.emit(AgentEvent::Error { message: msg.clone(), http_status: None, code: None });
-                        Self::persist_turn_diagnostic(convo, &msg);
-                        self.finish_turn(convo, StopReason::Timeout, &turn_ctx).await;
-                        return;
-                    }
-                    _ = async { tokio::time::sleep(self.stream_timeout.unwrap()).await }, if self.stream_timeout.is_some() => {
-                        // STREAM IDLE TIMEOUT: no event for `stream_timeout`. Rather than
-                        // fail the turn outright, RECONNECT up to MAX_STREAM_RETRIES times
-                        // (codex parity) — re-issue the SAME round from history (the
-                        // per-round accumulators reset on `continue`, so partial output is
-                        // discarded and never pushed), with exponential backoff. Only after
-                        // the budget is spent do we take the clean-fail path.
-                        if !saw_stream_content && stream_retry < MAX_STREAM_RETRIES {
-                            stream_retry += 1;
-                            self.rt.emit(AgentEvent::Warning(format!(
-                                "stream idle timeout — reconnecting ({stream_retry}/{MAX_STREAM_RETRIES})"
-                            )));
-                            // Exponential backoff: 200ms, 400, 800, 1600, 3200 (cap 8s).
-                            let backoff = std::time::Duration::from_millis(
-                                // `.min(31)` on the shift keeps it well-defined if
-                                // MAX_STREAM_RETRIES is ever raised past 32 (the cap
-                                // clamps the value regardless).
-                                (200u64 << (stream_retry - 1).min(31)).min(8_000),
-                            );
-                            tokio::select! {
-                                biased;
-                                _ = cancel.cancelled() => {
-                                    self.finish_cancelled(convo, rollback_len, &turn_ctx).await;
-                                    return;
-                                }
-                                _ = tokio::time::sleep(backoff) => {}
-                            }
-                            retry_this_round = true;
-                            break;
-                        }
-                        if saw_stream_content {
-                            Self::persist_partial_assistant(
-                                convo,
-                                &assistant_text,
-                                &reasoning,
-                                &reasoning_blocks,
-                                &pending_calls,
-                                suppress_internal_stream,
-                            );
-                        }
-                        let msg = if saw_stream_content {
-                            "stream timeout after partial response; to avoid duplicate output or tool execution, the request was not replayed; partial response preserved"
-                        } else {
-                            "stream timeout after automatic reconnects"
-                        }.to_string();
+                        let msg = "stream timeout after partial response; to avoid duplicate output or tool execution, the request was not replayed; partial response preserved".to_string();
                         self.hooks.on_error(&msg).await;
                         self.rt.emit(AgentEvent::Error { message: msg.clone(), http_status: None, code: None });
                         Self::persist_turn_diagnostic(convo, &msg);
@@ -2793,6 +2887,16 @@ impl RunningAgent {
                         None => break,
                     },
                 };
+                if ev.is_thinking() {
+                    saw_stream_content = true;
+                    phase = crate::timeouts::StreamPhase::Thinking;
+                    last_content = tokio::time::Instant::now();
+                } else if ev.is_visible_output() {
+                    saw_stream_content = true;
+                    saw_text_or_tool = true;
+                    phase = crate::timeouts::StreamPhase::Streaming;
+                    last_content = tokio::time::Instant::now();
+                }
                 match &ev {
                     StreamEvent::Reasoning(_) | StreamEvent::ReasoningSignature { .. } => {
                         if reasoning_started_at.is_none() {
@@ -2946,6 +3050,7 @@ impl RunningAgent {
                                 &reasoning_blocks,
                                 &pending_calls,
                                 suppress_internal_stream,
+                                Some(&assistant_message_id),
                             );
                             let (reset_at_display, reset_label, secs_until_reset) = match decision {
                                 crate::hook::RateLimitDecision::WaitAndRetry { secs } => {
@@ -3050,6 +3155,7 @@ impl RunningAgent {
                             &reasoning_blocks,
                             &pending_calls,
                             suppress_internal_stream,
+                            Some(&assistant_message_id),
                             Some(e.message.as_str()),
                         );
                         self.hooks.on_error(&e.message).await;
@@ -3116,18 +3222,28 @@ impl RunningAgent {
                 && reasoning_blocks.is_empty()
                 && (saw_suppressed_reasoning_filler || !reasoning.trim().is_empty())
                 && cleaned_reasoning.trim().is_empty();
-            let empty_completion = (!saw_stream_content || filler_only_reasoning) && !truncated;
+            let thinking_only = saw_stream_content
+                && !saw_text_or_tool
+                && assistant_text.trim().is_empty()
+                && pending_calls.is_empty()
+                && !filler_only_reasoning
+                && !truncated;
+            let empty_completion =
+                (!saw_stream_content || filler_only_reasoning || thinking_only) && !truncated;
             if empty_completion {
                 if empty_retries < EMPTY_RESPONSE_MAX_RETRIES {
                     empty_retries += 1;
-                    // Front-loaded short backoff: 1,1,2,2,3s (~9s for all 5) — matches
-                    // v1. The empty body returns instantly, so the generic 3/6/9s tier
-                    // would be pure wasted latency. A VISIBLE Warning tells the user a
-                    // retry is underway (a silent re-open reads as "nothing happened").
-                    let wait = (((empty_retries + 1) / 2).min(3)) as u64;
+                    // Front-loaded short backoff (see `empty_retry_wait_secs`). The empty
+                    // body returns instantly, so the generic 3/6/9s tier would be pure
+                    // wasted latency. A VISIBLE Warning tells the user a retry is underway.
+                    let wait = empty_retry_wait_secs(thinking_only, empty_retries);
                     // Distinguish a GARBLED response (adapter dropped unparseable chunks)
                     // from a truly EMPTY one — different upstream faults, different wording.
-                    let notice = if saw_malformed {
+                    let notice = if thinking_only && wait == 0 {
+                        format!("模型只返回了思考，正在重试({empty_retries}/{EMPTY_RESPONSE_MAX_RETRIES})...")
+                    } else if thinking_only {
+                        format!("模型只返回了思考，{wait} 秒后重试({empty_retries}/{EMPTY_RESPONSE_MAX_RETRIES})...")
+                    } else if saw_malformed {
                         format!("响应格式异常，{wait} 秒后重试({empty_retries}/{EMPTY_RESPONSE_MAX_RETRIES})...")
                     } else {
                         format!("模型返回空响应，{wait} 秒后重试({empty_retries}/{EMPTY_RESPONSE_MAX_RETRIES})...")
@@ -3159,6 +3275,7 @@ impl RunningAgent {
                 let est_prompt: u32 = messages.iter().map(|m| m.estimate_tokens()).sum();
                 let msg = empty_exhaustion_message(
                     saw_malformed,
+                    thinking_only,
                     est_prompt,
                     self.provider.context_window(),
                     EMPTY_RESPONSE_MAX_RETRIES,
@@ -3266,6 +3383,7 @@ impl RunningAgent {
                 &assistant_msg.text,
                 &pending_calls,
             );
+            assistant_msg.id = Some(assistant_message_id.clone());
             convo.push(assistant_msg);
             self.hooks.on_turn_progress(convo).await;
             if pending_calls.is_empty() {
@@ -3416,7 +3534,7 @@ impl RunningAgent {
                 std::collections::HashSet::new();
             let mut seen_calls: std::collections::HashSet<(String, String)> =
                 std::collections::HashSet::new();
-            // VISION: images a tool produced this batch (e.g. read_file on a picture),
+            // VISION: images a tool produced this batch (e.g. read on a picture),
             // collected to attach to ONE follow-up user message AFTER every tool_result
             // is in — see the injection at the loop's end for why this is deferred.
             let mut turn_images: Vec<crate::message::ImageContent> = vec![];
@@ -3894,7 +4012,7 @@ impl RunningAgent {
                 } else if batch_start.is_some() {
                     batch_ok += 1;
                 }
-                // VISION: a tool may return inline images (read_file on a picture). The
+                // VISION: a tool may return inline images (read on a picture). The
                 // tool-result message itself stays TEXT — a provider rejects images in a
                 // tool message — so harvest them here and attach to a single follow-up
                 // user message once ALL of this assistant's tool_results are pushed
@@ -4166,22 +4284,7 @@ pub struct AgentBuilder {
     compaction: Arc<dyn CompactionStrategy>,
     compact_threshold: Option<f32>,
     compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>>,
-    stream_timeout: Option<std::time::Duration>,
-    /// LIVENESS: max wall-clock wait for the FIRST stream event (the first
-    /// reasoning/tool-call/text token) of each round, BEFORE any content has
-    /// been produced. Complementary to `stream_timeout` (which bounds the wait
-    /// for EVERY event inter-token gap): a model that silently goes quiet for
-    /// a long stretch during hidden reasoning before emitting its first byte
-    /// is caught here at a finer granularity. `None` (default) = no
-    /// first-token arm — wait for the first event with only `stream_timeout`.
-    ///
-    /// On timeout BEFORE any content this round, the round is RETRIED up to
-    /// `MAX_FIRST_TOKEN_RETRIES` times (a fresh connection + reset
-    /// accumulators, so partial output is never double-pushed); once the
-    /// budget is spent the turn fails with an explicit "model unresponsive /
-    /// high latency" terminal error. Once ANY first token arrives, this timer
-    /// stops mattering — the ordinary `stream_timeout` takes over.
-    first_token_timeout: Option<std::time::Duration>,
+    timeouts: crate::timeouts::TimeoutPolicy,
     /// Max re-issues after a first-token timeout before failing the turn.
     /// Default [`MAX_FIRST_TOKEN_RETRIES`]; config `[coding]
     /// first_token_timeout_retries` / env `JEIKCODE_FIRST_TOKEN_RETRIES`.
@@ -4238,12 +4341,10 @@ impl Default for AgentBuilder {
             compaction: Arc::new(NoCompaction),
             compact_threshold: None,
             compaction_checkpoint: None,
-            // NEUTRAL default: no liveness timeout → the kernel never adds a timer.
-            // Production SHOULD set both (see the builder methods) so a turn can
-            // never park forever on a stalled provider or a silent driver.
-            stream_timeout: None,
+            // NEUTRAL default: content clocks off. Production fills TimeoutPolicy
+            // so a stalled provider cannot park a turn forever.
+            timeouts: crate::timeouts::TimeoutPolicy::unbounded(),
             request_timeout: None,
-            first_token_timeout: None,
             first_token_retries: MAX_FIRST_TOKEN_RETRIES,
             // NEUTRAL default: a no-opinion request (all None + ToolChoice::Auto).
             // The provider receives `ChatOptions::default()` unless a specialization
@@ -4405,35 +4506,25 @@ impl AgentBuilder {
         self.compact_threshold = Some(frac);
         self
     }
-    /// LIVENESS: bound how long the turn waits for the NEXT stream event. When set,
-    /// EACH `stream.next()` is raced against this duration, so it bounds BOTH
-    /// first-token latency (a provider that opens the stream then goes silent) AND
-    /// inter-token latency (a model that stalls mid-response / a TCP half-open). On
-    /// a timeout the turn CLEANLY FAILS — exactly like a mid-stream provider error
-    /// (`on_error` hook + `AgentEvent::Error{"stream timeout"}` + `TurnComplete`),
-    /// with NO partial assistant message and NO fake success. Without this call the
-    /// default is `None` → UNBOUNDED (no timer is added). This is a neutral kernel,
-    /// so the value is policy; PRODUCTION SHOULD set this so a stalled provider can
-    /// never park a turn forever.
-    pub fn stream_timeout(mut self, d: std::time::Duration) -> Self {
-        self.stream_timeout = Some(d);
+    /// Install the full transport + three-phase content policy. Production
+    /// assembly uses [`crate::timeouts::TimeoutPolicy::production`] (or the
+    /// config-resolved equivalent). Tests that only need a single idle bound
+    /// can keep calling [`Self::stream_timeout`].
+    pub fn timeouts(mut self, policy: crate::timeouts::TimeoutPolicy) -> Self {
+        self.timeouts = policy;
         self
     }
-    /// LIVENESS: bound the wall-clock wait for the FIRST stream event of each
-    /// round (first reasoning / tool-call / text token), before any content has
-    /// been produced. Complementary to [`Self::stream_timeout`]: a model that
-    /// goes quiet during hidden reasoning before emitting its first byte is
-    /// caught here at fine granularity; once the first token arrives this arm
-    /// stops and `stream_timeout` governs the inter-token gap.
-    ///
-    /// On timeout BEFORE any content, the round is retried up to
-    /// [`MAX_FIRST_TOKEN_RETRIES`] times (fresh connection, reset accumulators
-    /// — partial output is never double-pushed); after the budget, the turn
-    /// FAILS with the explicit "model unresponsive / high latency" terminal
-    /// error ([`STOP_REASON_FIRST_TOKEN`]). Without this call the default is
-    /// `None` → no first-token arm (only `stream_timeout` bounds the wait).
+    /// LIVENESS: sliding window between business tokens. When TTFT is unset,
+    /// this value also bounds the first-token wait (existing test contract).
+    /// `Duration::ZERO` leaves content clocks unbounded.
+    pub fn stream_timeout(mut self, d: std::time::Duration) -> Self {
+        self.timeouts.streaming = if d.is_zero() { None } else { Some(d) };
+        self
+    }
+    /// LIVENESS: first business token (thinking / text / tool). `Duration::ZERO`
+    /// disables the TTFT arm; the sliding window still applies if set.
     pub fn first_token_timeout(mut self, d: std::time::Duration) -> Self {
-        self.first_token_timeout = if d.is_zero() { None } else { Some(d) };
+        self.timeouts.ttft = if d.is_zero() { None } else { Some(d) };
         self
     }
     /// Set how many times a round is re-issued after a first-token timeout
@@ -4561,8 +4652,7 @@ impl AgentBuilder {
             compaction: self.compaction,
             compact_threshold: self.compact_threshold,
             compaction_checkpoint: self.compaction_checkpoint,
-            stream_timeout: self.stream_timeout,
-            first_token_timeout: self.first_token_timeout,
+            timeouts: self.timeouts,
             first_token_retries: self.first_token_retries,
             request_timeout: self.request_timeout,
             chat_options: self.chat_options,
@@ -4645,6 +4735,31 @@ mod effective_retry_after_tests {
 }
 
 #[cfg(test)]
+mod empty_retry_wait_tests {
+    use super::empty_retry_wait_secs;
+
+    #[test]
+    fn thinking_only_retries_immediately_then_backs_off() {
+        assert_eq!(
+            (1..=5)
+                .map(|n| empty_retry_wait_secs(true, n))
+                .collect::<Vec<_>>(),
+            vec![0, 1, 1, 2, 2]
+        );
+    }
+
+    #[test]
+    fn empty_and_malformed_keep_the_short_backoff() {
+        assert_eq!(
+            (1..=5)
+                .map(|n| empty_retry_wait_secs(false, n))
+                .collect::<Vec<_>>(),
+            vec![1, 1, 2, 2, 3]
+        );
+    }
+}
+
+#[cfg(test)]
 mod empty_exhaustion_message_tests {
     use super::empty_exhaustion_message;
 
@@ -4652,7 +4767,7 @@ mod empty_exhaustion_message_tests {
     fn size_aware_when_near_or_over_window() {
         // 339k prompt into a 200k window (170%) must blame request size, NOT
         // assert it's context-independent.
-        let m = empty_exhaustion_message(false, 339_000, 200_000, 5, false);
+        let m = empty_exhaustion_message(false, false, 339_000, 200_000, 5, false);
         assert!(m.contains("请求过大"), "over-window must blame size: {m}");
         assert!(
             !m.contains("与上下文长度无关"),
@@ -4662,7 +4777,7 @@ mod empty_exhaustion_message_tests {
 
     #[test]
     fn upstream_framing_when_comfortably_within_window() {
-        let m = empty_exhaustion_message(false, 5_000, 200_000, 5, false);
+        let m = empty_exhaustion_message(false, false, 5_000, 200_000, 5, false);
         assert!(
             m.contains("与上下文长度无关"),
             "small request keeps upstream framing: {m}"
@@ -4673,7 +4788,7 @@ mod empty_exhaustion_message_tests {
     #[test]
     fn unknown_window_cannot_claim_over_size() {
         // window unknown (0) — never attribute to size even with a huge estimate.
-        let m = empty_exhaustion_message(false, 999_999, 0, 5, false);
+        let m = empty_exhaustion_message(false, false, 999_999, 0, 5, false);
         assert!(
             !m.contains("请求过大"),
             "unknown window cannot claim over-size: {m}"
@@ -4682,7 +4797,7 @@ mod empty_exhaustion_message_tests {
 
     #[test]
     fn malformed_keeps_distinct_wording_and_no_size_blame() {
-        let m = empty_exhaustion_message(true, 339_000, 200_000, 5, false);
+        let m = empty_exhaustion_message(true, false, 339_000, 200_000, 5, false);
         assert!(m.contains("无法解析"), "malformed keeps its wording: {m}");
         assert!(
             !m.contains("请求过大"),
@@ -4695,7 +4810,7 @@ mod empty_exhaustion_message_tests {
         // When the pre-send over-window advisory already fired this turn, the
         // exhaustion terminal must be SHORT and reference it — not repeat the
         // full "约 NNN K tokens … 接近或超过窗口" blurb (the double-show fix).
-        let m = empty_exhaustion_message(false, 339_000, 200_000, 5, true);
+        let m = empty_exhaustion_message(false, false, 339_000, 200_000, 5, true);
         assert!(
             m.contains("如开头"),
             "should point back to the earlier advisory: {m}"
@@ -4713,20 +4828,22 @@ mod over_window_advisory_tests {
     use super::over_window_advisory;
 
     #[test]
-    fn fires_at_or_over_window() {
+    fn fires_at_or_over_the_watermark() {
+        // 200K window ⇒ watermark budget = 200_000 − min(20_000, 50_000) = 180_000.
+        assert_eq!(super::input_watermark_budget(200_000), 180_000);
         assert!(
-            over_window_advisory(200_000, 200_000, 200_000).is_some(),
-            "exactly at window must warn"
+            over_window_advisory(180_000, 200_000, 180_000).is_some(),
+            "exactly at the watermark budget must warn"
         );
         assert!(
-            over_window_advisory(339_000, 200_000, 200_000).is_some(),
-            "over window must warn"
+            over_window_advisory(339_000, 200_000, 180_000).is_some(),
+            "over the watermark budget must warn"
         );
     }
 
     #[test]
-    fn silent_within_window() {
-        assert!(over_window_advisory(150_000, 200_000, 200_000).is_none());
+    fn silent_below_the_watermark() {
+        assert!(over_window_advisory(179_999, 200_000, 180_000).is_none());
     }
 
     #[test]
@@ -4736,9 +4853,13 @@ mod over_window_advisory_tests {
 
     #[test]
     fn advisory_is_actionable_and_one_line() {
-        let m = over_window_advisory(339_000, 200_000, 200_000).expect("over-window must warn");
+        let m = over_window_advisory(339_000, 200_000, 180_000).expect("over-watermark must warn");
         assert!(!m.contains('\n'), "must be a single line: {m}");
         assert!(m.contains("窗口"), "must name the window: {m}");
+        assert!(
+            m.contains("水位缓冲"),
+            "must name the watermark buffer so the math is auditable: {m}"
+        );
         assert!(
             m.contains("精简") || m.contains("更大窗口"),
             "must give actionable advice (trim / larger window): {m}"
@@ -4750,13 +4871,24 @@ mod over_window_advisory_tests {
     }
 
     #[test]
-    fn fires_at_effective_limit_below_window() {
-        // window 1_000_000, effective limit 858_616 (16_384 output + 125_000 margin).
-        // An estimate of 900_000 is UNDER the window but OVER the effective limit —
-        // the old `est >= window` gate would stay silent; the reserve makes it warn.
-        assert!(super::over_window_advisory(900_000, 1_000_000, 858_616).is_some());
-        // Just under the effective limit → still silent.
-        assert!(super::over_window_advisory(800_000, 1_000_000, 858_616).is_none());
+    fn declared_output_budget_never_shrinks_the_trigger() {
+        // The reported defect: a declared 384K output budget on a 1M window used to reserve
+        // 384K + 125K ⇒ warning from 491K (49% utilization!). It is now a pure protocol
+        // budget; the trigger sits at the watermark budget 980K — and the very request that
+        // produced the bogus advisory (582K real / ~491K estimated) is comfortably silent.
+        let window = 1_000_000;
+        let limit = super::input_watermark_budget(window);
+        assert_eq!(limit, 980_000);
+        assert_eq!(
+            super::wire_output_budget(window, Some(384_000)),
+            384_000,
+            "the declaration rides the wire verbatim"
+        );
+        assert!(
+            over_window_advisory(582_000, window, limit).is_none(),
+            "a 582K request into a 1M window must NOT warn"
+        );
+        assert!(over_window_advisory(980_000, window, limit).is_some());
     }
 }
 
@@ -4807,25 +4939,31 @@ mod cap_tool_result_tests {
 
 #[cfg(test)]
 mod auto_compact_trigger_tests {
-    use super::{auto_compact_trigger, CompactTrigger};
+    use super::{auto_compact_trigger, input_watermark_budget, CompactTrigger};
 
-    fn fires(used: u32, window: u32, thresh: f32) -> bool {
+    /// Watermark budget for a model window — the exact denominator `should_compact` feeds
+    /// the trigger. No output term: a declared output budget never influences pressure.
+    fn budget(window: u32) -> u32 {
+        input_watermark_budget(window)
+    }
+
+    fn fires(used: u32, watermark_budget: u32, thresh: f32) -> bool {
         matches!(
-            auto_compact_trigger(used, window, thresh),
+            auto_compact_trigger(used, watermark_budget, thresh),
             Some(CompactTrigger::Auto { .. })
         )
     }
 
     #[test]
     fn switch_to_smaller_window_recomputes_and_fires() {
-        // 229K tokens sat at 23% of a 1M window (no compaction there)…
+        // 229K tokens sat at 23% of a 1M-window budget (no compaction there)…
         assert!(
-            !fires(229_000, 1_000_000, 0.7),
+            !fires(229_000, budget(1_000_000), 0.9),
             "under a 1M window: no compaction"
         );
-        // …but switching to a 64K window recomputes to 3.6× over → must compact.
+        // …but switching to a 64K window recomputes well over the threshold → must compact.
         assert!(
-            fires(229_000, 64_000, 0.7),
+            fires(229_000, budget(64_000), 0.9),
             "switch to 64K window: must compact"
         );
     }
@@ -4834,29 +4972,47 @@ mod auto_compact_trigger_tests {
     fn switch_to_larger_window_does_not_fire() {
         // Pressure drops when the window grows — no needless compaction.
         assert!(
-            !fires(60_000, 1_000_000, 0.7),
+            !fires(60_000, budget(1_000_000), 0.9),
             "60K in a 1M window: no compaction"
         );
     }
 
     #[test]
     fn threshold_boundary_and_unknown_window() {
-        assert!(fires(7_000, 10_000, 0.7), "exactly at threshold fires");
-        assert!(!fires(6_999, 10_000, 0.7), "just below threshold does not");
-        assert!(!fires(999_999, 0, 0.7), "unknown window (0) never fires");
+        assert!(fires(9_000, 10_000, 0.9), "exactly at threshold fires");
+        assert!(!fires(8_999, 10_000, 0.9), "just below threshold does not");
+        assert!(!fires(999_999, 0, 0.9), "unknown budget (0) never fires");
     }
 
     #[test]
     fn carries_the_recomputed_utilization() {
-        match auto_compact_trigger(229_000, 64_000, 0.7) {
+        match auto_compact_trigger(229_000, 64_000, 0.9) {
             Some(CompactTrigger::Auto { utilization }) => {
                 assert!(
                     (utilization - 229_000.0 / 64_000.0).abs() < 1e-4,
-                    "utilization vs CURRENT window"
+                    "utilization vs the CURRENT watermark budget"
                 );
             }
             other => panic!("expected Auto, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn declared_384k_ceiling_no_longer_compacts_a_comfortable_session() {
+        // The reported session: 1M window, `[models.X] max_tokens = 384000`, 582K real
+        // prompt tokens. OLD: the declaration was reserved (491K guard) while the
+        // window-based threshold sat at 700K ⇒ a turn that warns every round but never
+        // compacts. NEW: the declaration is a pure protocol budget, so the watermark
+        // budget is 1M − 20K = 980K and the trigger sits at 0.9 × 980K = 882K ⇒ the 582K
+        // session is comfortably below; only a genuinely full window compacts.
+        let b = budget(1_000_000);
+        assert_eq!(b, 980_000);
+        assert!(!fires(582_000, b, 0.9), "582K must not compact a 1M window");
+        assert!(!fires(881_999, b, 0.9), "just below 90%: no compaction");
+        assert!(
+            fires(882_000, b, 0.9),
+            "90% of the watermark budget: compact"
+        );
     }
 }
 
@@ -4957,7 +5113,9 @@ mod internal_continuation_compaction_tests {
 
     #[tokio::test]
     async fn hook_continuation_compacts_at_threshold_before_next_round() {
-        let (events, calls) = run_hook_continuation(700).await;
+        // The threshold is a fraction of the WATERMARK budget (window 1_000 − the fixed
+        // 250-token watermark = 750) ⇒ "at threshold" = 0.7 × 750 = 525 prompt tokens.
+        let (events, calls) = run_hook_continuation(525).await;
         assert!(
             events.iter().any(|event| matches!(
                 event,
@@ -4983,7 +5141,8 @@ mod internal_continuation_compaction_tests {
 
     #[tokio::test]
     async fn hook_continuation_below_threshold_does_not_compact() {
-        let (events, calls) = run_hook_continuation(699).await;
+        // One token below the watermark-budget threshold (0.7 × 750 = 525).
+        let (events, calls) = run_hook_continuation(524).await;
         assert!(
             !events
                 .iter()
@@ -4995,12 +5154,15 @@ mod internal_continuation_compaction_tests {
 
     #[tokio::test]
     async fn later_summary_stage_is_not_blocked_by_an_earlier_noop_stage() {
+        // Usages are chosen against the WATERMARK budget (window 1_000 − 250 = 750) so they
+        // straddle the policy's 0.78 summary gate: 540/750 = 0.72 (rewrite stage) then
+        // 600/750 = 0.80 (summary stage). Both are ≥ the 0.7 trigger.
         let provider = Arc::new(
             MockProvider::new(vec![
                 vec![
                     StreamEvent::TextDelta("moderate pressure".into()),
                     StreamEvent::Usage(TokenUsage {
-                        prompt: 700,
+                        prompt: 540,
                         completion: 1,
                         cached: 0,
                     }),
@@ -5009,7 +5171,7 @@ mod internal_continuation_compaction_tests {
                 vec![
                     StreamEvent::TextDelta("high pressure".into()),
                     StreamEvent::Usage(TokenUsage {
-                        prompt: 780,
+                        prompt: 600,
                         completion: 1,
                         cached: 0,
                     }),
@@ -5363,7 +5525,7 @@ mod partial_stream_persistence_tests {
         convo.push(Message::user("work"));
         let call = ToolCall {
             id: "call-1".into(),
-            name: "write_file".into(),
+            name: "write".into(),
             arguments: r#"{"path":"x"}"#.into(),
         };
 
@@ -5374,6 +5536,7 @@ mod partial_stream_persistence_tests {
             &[],
             &[call.clone(), call],
             false,
+            None,
         );
 
         let assistant = &convo.messages[1];
@@ -5396,7 +5559,7 @@ mod partial_stream_persistence_tests {
     #[test]
     fn display_only_incomplete_tool_delta_cannot_create_persisted_tool_call() {
         let mut convo = Conversation::new();
-        RunningAgent::persist_partial_assistant(&mut convo, "", "", &[], &[], false);
+        RunningAgent::persist_partial_assistant(&mut convo, "", "", &[], &[], false, None);
         assert!(convo.messages.is_empty());
     }
 
@@ -5425,6 +5588,7 @@ mod partial_stream_persistence_tests {
             &[],
             &[],
             false,
+            None,
             Some("upstream 503"),
         );
         assert_eq!(convo.messages[1].role, Role::Assistant);
@@ -5630,6 +5794,92 @@ mod steer_buffer_tests {
         );
     }
 
+    /// 身份回传：落盘的用户消息身份在两个 seam 上都会被宣布——回合起始提问
+    /// （`UserMessage`）与每个被 fold 的 steer（`Steered.inputs[..].message_id`），
+    /// 让客户端把乐观气泡绑定到转录里真正存储的 id（不再依赖文本启发对齐）。
+    #[tokio::test]
+    async fn user_identity_is_announced_for_prompt_and_steer() {
+        let deferred_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<AgentCommand>>>> =
+            Arc::new(Mutex::new(None));
+        let deferred_tx_clone = deferred_tx.clone();
+        let provider = Arc::new(crate::testkit::DeferredSteerProvider::new(
+            vec![
+                vec![
+                    StreamEvent::ToolCall(ToolCall {
+                        id: "c1".into(),
+                        name: "noop".into(),
+                        arguments: "{}".into(),
+                    }),
+                    StreamEvent::Done { truncated: false },
+                ],
+                vec![
+                    StreamEvent::TextDelta("done".into()),
+                    StreamEvent::Done { truncated: false },
+                ],
+            ],
+            1,
+            "STEER-ID",
+            deferred_tx_clone,
+        ));
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(NoopTool));
+        let mut handle = Agent::builder()
+            .provider(provider)
+            .tools(reg.mount(&["noop"]))
+            .build()
+            .spawn();
+        *deferred_tx.lock().unwrap() = Some(handle.commands.clone());
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "start".into(),
+                images: vec![],
+            })
+            .unwrap();
+        let mut prompts: Vec<(String, u32)> = Vec::new();
+        let mut steered_ids: Vec<Option<String>> = Vec::new();
+        while let Some(ev) = handle.events.recv().await {
+            match ev {
+                AgentEvent::UserMessage {
+                    message_id,
+                    turn_ordinal,
+                } => prompts.push((message_id, turn_ordinal)),
+                AgentEvent::Steered { inputs, .. } => {
+                    steered_ids.extend(inputs.into_iter().map(|input| input.message_id));
+                }
+                AgentEvent::TurnComplete { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            prompts.len(),
+            1,
+            "exactly one turn-start prompt is announced (synthetic/folded inputs must not re-announce)"
+        );
+        assert_eq!(prompts[0].1, 0, "the first real prompt is ordinal 0");
+        assert!(
+            prompts[0].0.starts_with("m-"),
+            "the announced identity is the stored kernel message id; got {:?}",
+            prompts[0].0
+        );
+        assert_eq!(
+            steered_ids.len(),
+            1,
+            "the folded steer announces its stored identity"
+        );
+        assert!(
+            steered_ids[0]
+                .as_deref()
+                .is_some_and(|id| id.starts_with("m-")),
+            "the steer carries the stored message id; got {steered_ids:?}"
+        );
+        assert_ne!(
+            Some(prompts[0].0.clone()),
+            steered_ids[0],
+            "prompt and steer identities must be distinct rows"
+        );
+    }
+
     /// A pure-text turn (no tool calls) where the user steers mid-stream must
     /// CONTINUE in the same turn rather than ending.
     ///
@@ -5745,13 +5995,22 @@ mod steer_buffer_tests {
                 _ => {}
             }
         }
+        // The folded input now also carries the STORED identity of the message it
+        // became (回传 id)；断言文本/图片不变，且身份确实是内核消息 id。
         assert_eq!(
-            steered_inputs,
-            vec![crate::event::SteeredInput {
-                text: "STEER-COUNT".into(),
-                images: Vec::new(),
-            }],
+            steered_inputs.len(),
+            1,
             "one folded prompt → Steered {{ count: 1 }}"
+        );
+        assert_eq!(steered_inputs[0].text, "STEER-COUNT");
+        assert!(steered_inputs[0].images.is_empty());
+        assert!(
+            steered_inputs[0]
+                .message_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("m-")),
+            "a folded steer announces the stored message identity; got {:?}",
+            steered_inputs[0].message_id
         );
     }
 
@@ -5965,40 +6224,36 @@ mod provider_message_pairing_tests {
 }
 
 #[cfg(test)]
-mod effective_input_limit_tests {
-    use super::effective_input_limit;
+mod output_budget_tests {
+    use super::{input_watermark_budget, wire_output_budget, DEFAULT_OUTPUT_BUDGET};
 
     #[test]
-    fn reserves_output_plus_margin() {
-        // deepseek-v4-flash: 1M window, 16,384 max_tokens.
-        // margin = 1_000_000/8 = 125_000; reserve = 16_384 + 125_000 = 141_384.
-        assert_eq!(effective_input_limit(1_000_000, Some(16_384)), 858_616);
-        // GLM: 200K window, 16,384 max_tokens.
-        // margin = 200_000/8 = 25_000; reserve = 16_384 + 25_000 = 41_384.
-        assert_eq!(effective_input_limit(200_000, Some(16_384)), 158_616);
+    fn declared_budget_rides_the_wire_verbatim() {
+        // The model editor's tiers: 32K / 64K / 128K / 256K / 384K / custom.
+        for tier in [32_000, 64_000, 128_000, 256_000, 384_000] {
+            assert_eq!(wire_output_budget(1_000_000, Some(tier)), tier);
+        }
+        // Unset ⇒ the 64K default tier.
+        assert_eq!(DEFAULT_OUTPUT_BUDGET, 64_000);
+        assert_eq!(wire_output_budget(1_000_000, None), 64_000);
+        // The ONLY adjustment is the window sanity clamp (a budget above the window is
+        // protocol-invalid on every gateway) — never a capability downsizing.
+        assert_eq!(wire_output_budget(16_000, Some(384_000)), 16_000);
+        // Unknown window ⇒ the declaration passes through untouched.
+        assert_eq!(wire_output_budget(0, Some(384_000)), 384_000);
     }
 
     #[test]
-    fn none_max_tokens_uses_default_16384() {
-        assert_eq!(effective_input_limit(1_000_000, None), 858_616);
-    }
-
-    #[test]
-    fn margin_clamps_floor_and_ceiling() {
-        // Small window: 64_000/8 = 8_000 → clamped UP to 16_000.
-        // reserve = 16_384 + 16_000 = 32_384; effective = 31_616.
-        assert_eq!(effective_input_limit(64_000, Some(16_384)), 31_616);
-        // Large window: 2_000_000/8 = 250_000 → clamped DOWN to 128_000.
-        // reserve = 16_384 + 128_000 = 144_384; effective = 1_855_616.
-        assert_eq!(effective_input_limit(2_000_000, Some(16_384)), 1_855_616);
-    }
-
-    #[test]
-    fn tiny_window_falls_back_to_raw_window() {
-        // reserve (~32_384) exceeds a tiny window → no reservation possible, so it
-        // falls back to the raw window (old `est >= window` behavior). Never panics.
-        assert_eq!(effective_input_limit(1_000, Some(16_384)), 1_000);
-        assert_eq!(effective_input_limit(100, Some(16_384)), 100);
+    fn watermark_budget_has_no_output_term() {
+        // 1M window ⇒ window − min(20K, window/4) = 980K, whatever the declared output is.
+        assert_eq!(input_watermark_budget(1_000_000), 980_000);
+        assert_eq!(input_watermark_budget(200_000), 180_000);
+        // Tiny windows (test fixtures / misconfigurations): the buffer is capped at a
+        // quarter of the window so a gaugeable budget always remains.
+        assert_eq!(input_watermark_budget(1_000), 750);
+        assert_eq!(input_watermark_budget(100), 75);
+        // Unknown window ⇒ 0 (callers treat 0 as "can't gauge").
+        assert_eq!(input_watermark_budget(0), 0);
     }
 }
 

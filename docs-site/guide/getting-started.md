@@ -135,6 +135,7 @@ Upon entering the terminal environment, you will see JeikCode's rich text termin
 
 ## 5. Next Steps
 
+- Update, roll back, or uninstall: [Updates & Uninstall](/guide/updates)
 - Explore CodeGraph and semantic retrieval: [CodeExplore](/usage/codegraph)
 - Learn core configuration and auto-setup: [AI Quick Configuration](/guide/configuration)
 - Learn how to configure models and provider accounts: [Model Configuration](/guide/login)

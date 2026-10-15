@@ -15,7 +15,7 @@ fn malformed_write_provider(file_path: &Path) -> Arc<MockProvider> {
         vec![
             StreamEvent::ToolCall(ToolCall {
                 id: "write-1".into(),
-                name: "write_file".into(),
+                name: "write".into(),
                 arguments: format!(
                     r#"{{"file_path":"{}","content":"repaired",}}"#,
                     file_path.display()

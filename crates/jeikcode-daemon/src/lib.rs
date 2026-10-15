@@ -123,6 +123,8 @@ pub(crate) struct ConfigResponse {
     pub accounts: Vec<AccountInfo>,
     /// Global UI language. `"en"` when the user has not chosen one.
     pub language: String,
+    /// Whether to display the GitHub repository logo in the UI.
+    pub github_logo: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -394,6 +396,7 @@ mod session_window_tests {
                 images: None,
                 created_at: None,
                 elapsed_ms: None,
+                id: None,
             },
             MessageInfo {
                 role: "assistant".into(),
@@ -407,6 +410,7 @@ mod session_window_tests {
                 images: None,
                 created_at: None,
                 elapsed_ms: None,
+                id: None,
             },
             MessageInfo {
                 role: "user".into(),
@@ -420,6 +424,7 @@ mod session_window_tests {
                 images: None,
                 created_at: None,
                 elapsed_ms: None,
+                id: None,
             },
             MessageInfo {
                 role: "assistant".into(),
@@ -433,6 +438,7 @@ mod session_window_tests {
                 images: None,
                 created_at: None,
                 elapsed_ms: None,
+                id: None,
             },
             MessageInfo {
                 role: "user".into(),
@@ -446,6 +452,7 @@ mod session_window_tests {
                 images: None,
                 created_at: None,
                 elapsed_ms: None,
+                id: None,
             },
         ];
         let turns = session_user_outline(&msgs);
@@ -459,6 +466,316 @@ mod session_window_tests {
         assert_eq!(turns[2].ordinal, 2);
         assert_eq!(turns[2].index, 4);
         assert_eq!(turns[2].text, "服务恢复后继续");
+    }
+}
+
+#[cfg(test)]
+mod chat_replay_tests {
+    use super::*;
+
+    #[test]
+    fn chat_replay_coalesces_only_within_the_same_identity() {
+        let delta = |content: &str, message_id: &str, part_id: &str| ChatEvent::TextDelta {
+            content: content.into(),
+            message_id: Some(message_id.into()),
+            part_id: Some(part_id.into()),
+            part_seq: Some(1),
+        };
+        let mut buf = Vec::new();
+        push_chat_replay(&mut buf, delta("a", "m-1", "m-1:1:text"));
+        push_chat_replay(&mut buf, delta("b", "m-1", "m-1:1:text"));
+        assert_eq!(buf.len(), 1, "same identity coalesces");
+        // 身份不同绝不合并：合并后回放会把后一回合的正文画到前一回合名下。
+        push_chat_replay(&mut buf, delta("c", "m-2", "m-2:1:text"));
+        assert_eq!(buf.len(), 2, "a different round keeps its own replay entry");
+        match (&buf[0], &buf[1]) {
+            (
+                ChatEvent::TextDelta {
+                    content: first,
+                    message_id: Some(first_id),
+                    ..
+                },
+                ChatEvent::TextDelta {
+                    content: second,
+                    message_id: Some(second_id),
+                    ..
+                },
+            ) => {
+                assert_eq!(first, "ab");
+                assert_eq!(first_id, "m-1");
+                assert_eq!(second, "c");
+                assert_eq!(second_id, "m-2");
+            }
+            other => panic!("unexpected replay buffer: {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod env_write_guard_tests {
+    /// 运行期禁止改写“会影响路径解析”的进程级环境变量。
+    ///
+    /// 契约：`Config::config_dir()` 在进程内只解析一次（`OnceLock`），因此任何
+    /// 运行期 `set_var` 这 4 个键的代码都会让“写”与“读”落到不同根目录 —— 这正是
+    /// 并行测试偶发的根因（scoped-home 测试改 env，另一个测试正好横跨读写窗口）。
+    ///
+    /// 正确做法：测试用 `jeikcode_config::test_util::isolated_home()`（线程级注入，
+    /// 不碰 env）；bins 的 `main` 用 `special_dirs::sanitize_process_temp_env()`
+    /// （仅启动期一次）。
+    ///
+    /// 白名单**只减不增**，且只允许“每测试进程/每进程恰好一次”的启动期写入。
+    const GUARDED_KEYS: [&str; 4] = ["JEIKCODE_HOME", "TMPDIR", "TMP", "TEMP"];
+
+    const ALLOWED: [(&str, &str); 3] = [
+        (
+            "crates/jeikcode-kernel/src/test_support.rs",
+            "每测试进程一次的 isolate_home()（在任何测试解析路径之前）",
+        ),
+        (
+            "crates/jeikcode-capabilities/src/special_dirs.rs",
+            "bins main 启动期归一化 TMP/TMPDIR/TEMP",
+        ),
+        (
+            "crates/jeikcode-capabilities/tests/temp_env_sanitize.rs",
+            "该用例的测试对象就是 TMPDIR/TMP/TEMP 的归一化本身（集成测试独立进程）",
+        ),
+    ];
+
+    /// 已登记的历史站点（**只减不增**）。迁移完成后本表应为空。
+    const PENDING_MIGRATION: [&str; 0] = [];
+
+    #[test]
+    fn runtime_code_must_not_write_path_env_vars() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|crates| crates.parent())
+            .expect("repo root")
+            .to_path_buf();
+        let mut files = Vec::new();
+        collect_rs_files(&repo_root.join("crates"), &mut files);
+        assert!(!files.is_empty(), "源码扫描必须能枚举到 crates/**/*.rs");
+
+        let mut hits: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for file in files {
+            let relative = file
+                .strip_prefix(&repo_root)
+                .unwrap_or(&file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if ALLOWED.iter().any(|(path, _)| *path == relative) {
+                continue;
+            }
+            let Ok(source) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            for (index, line) in source.lines().enumerate() {
+                let trimmed = line.trim_start();
+                // 注释里的示例不算违规。
+                if trimmed.starts_with("//")
+                    || !(line.contains("set_var") || line.contains("remove_var"))
+                {
+                    continue;
+                }
+                if GUARDED_KEYS
+                    .iter()
+                    .any(|key| line.contains(&format!("\"{key}\"")))
+                {
+                    hits.entry(relative.clone())
+                        .or_default()
+                        .push(format!("{}: {trimmed}", index + 1));
+                }
+            }
+        }
+
+        // ① 表外新违规 → 失败（阻止债务增长）。
+        let unexpected: Vec<String> = hits
+            .iter()
+            .filter(|(file, _)| !PENDING_MIGRATION.contains(&file.as_str()))
+            .map(|(file, lines)| format!("{file}\n  {}", lines.join("\n  ")))
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "新增的运行期路径 env 写入（应改用线程级注入或启动期一次）；\n{}…",
+            unexpected.join("\n")
+        );
+
+        // ② 已登记但不再违规 → 失败（提醒收缩清单）。
+        let stale: Vec<&str> = PENDING_MIGRATION
+            .iter()
+            .copied()
+            .filter(|file| !hits.contains_key(*file))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "这些文件已不再违规，请从 PENDING_MIGRATION 里删除：{stale:?}"
+        );
+    }
+
+    fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path
+                    .file_name()
+                    .is_some_and(|name| name == "target" || name == ".git")
+                {
+                    continue;
+                }
+                collect_rs_files(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod global_events_tests {
+    use super::*;
+
+    #[test]
+    fn global_bus_fans_out_to_every_subscriber() {
+        // 跨实例语义：每个实例一条订阅，投递必须广播到所有订阅者（而不是竞争消费）。
+        let mut first = global_events().subscribe();
+        let mut second = global_events().subscribe();
+        publish_global(GlobalWireEvent::Activity {
+            session_id: "s-1".into(),
+            running: true,
+            terminal: None,
+            status: None,
+        });
+        publish_global(GlobalWireEvent::ReviewAsked {
+            session_id: "s-1".into(),
+        });
+        for rx in [&mut first, &mut second] {
+            let a = rx.try_recv().expect("first event reaches every subscriber");
+            let b = rx
+                .try_recv()
+                .expect("second event reaches every subscriber");
+            assert!(matches!(a, GlobalWireEvent::Activity { .. }));
+            assert!(matches!(b, GlobalWireEvent::ReviewAsked { .. }));
+        }
+    }
+
+    /// 路由级 smoke：`/events` 必须先发 `sync` 对齐帧，随后把总线上的增量事件
+    /// 真正推到 SSE 客户端（走 axum 路由 + ServiceExt::oneshot，与生产挂载同一 helper）。
+    #[tokio::test]
+    async fn global_events_route_streams_sync_then_incremental_events() {
+        use axum::body::Body;
+        use axum::http::{header, Request, StatusCode};
+        use futures::StreamExt as _;
+        use tower::ServiceExt as _;
+
+        let app = with_global_events_route(Router::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("/events must be mounted on the router");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let mut body = response.into_body().into_data_stream();
+
+        // 首帧：sync。累积读取，不依赖分片边界。
+        let mut seen = String::new();
+        while !seen.contains("\"type\":\"sync\"") {
+            let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), body.next())
+                .await
+                .expect("sync frame must arrive")
+                .expect("stream stays open")
+                .expect("frame is valid");
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+        }
+
+        // 真推送：订阅建立后发布增量事件，SSE 必须送达。
+        publish_global(GlobalWireEvent::ReviewAsked {
+            session_id: "s-route".into(),
+        });
+        while !seen.contains("review_asked") {
+            let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), body.next())
+                .await
+                .expect("incremental event must arrive")
+                .expect("stream stays open")
+                .expect("frame is valid");
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        assert!(seen.contains("\"session_id\":\"s-route\""), "{seen}");
+    }
+
+    #[test]
+    fn global_wire_events_carry_incremental_payloads() {
+        let upsert = serde_json::to_value(GlobalWireEvent::SessionUpsert {
+            session: SessionRowWire {
+                id: "s1".into(),
+                name: "n".into(),
+                working_dir: "E:/p".into(),
+                project_hash: "0123456789abcdef".into(),
+                created_at: 1,
+                updated_at: 2,
+                message_count: 3,
+                origin: "manual".into(),
+            },
+        })
+        .unwrap();
+        assert_eq!(upsert["type"], "session_upsert");
+        assert_eq!(upsert["session"]["id"], "s1");
+        assert_eq!(upsert["session"]["project_hash"], "0123456789abcdef");
+
+        let deleted = serde_json::to_value(GlobalWireEvent::SessionDeleted {
+            session_id: "s1".into(),
+            project_hash: "0123456789abcdef".into(),
+        })
+        .unwrap();
+        assert_eq!(deleted["type"], "session_deleted");
+        assert_eq!(deleted["session_id"], "s1");
+
+        // 终态带 kind（客户端据此出右下角通知）；运行中事件不带 terminal。
+        let terminal = serde_json::to_value(GlobalWireEvent::Activity {
+            session_id: "s1".into(),
+            running: false,
+            terminal: Some("completed"),
+            status: None,
+        })
+        .unwrap();
+        assert_eq!(terminal["type"], "activity");
+        assert_eq!(terminal["terminal"], "completed");
+        let running = serde_json::to_value(GlobalWireEvent::Activity {
+            session_id: "s1".into(),
+            running: true,
+            terminal: None,
+            status: None,
+        })
+        .unwrap();
+        assert!(running.get("terminal").is_none());
+
+        let asked = serde_json::to_value(GlobalWireEvent::ReviewAsked {
+            session_id: "s1".into(),
+        })
+        .unwrap();
+        assert_eq!(asked["type"], "review_asked");
+        let resolved = serde_json::to_value(GlobalWireEvent::ReviewResolved {
+            session_id: "s1".into(),
+            approval_id: Some("a1".into()),
+            request_id: None,
+        })
+        .unwrap();
+        assert_eq!(resolved["type"], "review_resolved");
+        assert_eq!(resolved["approval_id"], "a1");
+        assert!(resolved.get("request_id").is_none());
     }
 }
 
@@ -836,10 +1153,17 @@ struct ActiveChatOperation {
     /// *after* subscribe and loses thinking/text/tools already streamed.
     /// Consecutive text/reasoning deltas are coalesced to bound memory.
     replay: Arc<std::sync::Mutex<Vec<ChatEvent>>>,
+    /// 本回合帧的起始游标：第 i 条缓冲帧的 seq = `seq_base + i + 1`。
+    /// 回合结束时把 `seq_base + 缓冲长度` 回写到会话计数器，下一回合接着往上走。
+    seq_base: u64,
     /// Mid-turn steer inbox. Present only while `run_chat_turn_v2` is reading it.
     /// A submit on this channel is folded at the next round boundary; it does not
     /// cancel the in-flight model call or tool batch.
     steer_tx: Option<mpsc::UnboundedSender<live_api::ChatSteerSignal>>,
+    /// FIFO of client correlation ids for `/chat/steer` submits awaiting fold.
+    /// Drained by the projection when a `Steered` event lands, so the wire can
+    /// echo the id and let the WebUI reconcile an in-flight steer after refresh.
+    steer_client_ids: std::collections::VecDeque<Option<String>>,
 }
 
 #[derive(Default)]
@@ -852,6 +1176,11 @@ struct ActiveChatIndex {
     /// WebUI gets a push the moment an API turn starts instead of having to
     /// poll. Keyed by session id (the `session_id` alias the watcher used).
     standby_watchers: HashMap<String, Vec<mpsc::UnboundedSender<ChatEvent>>>,
+    /// 会话级断点续传游标（严格单调递增）。
+    ///
+    /// 它是我们自己定义的序号，与模型上下文无关 —— 回合结束清空回合缓冲、
+    /// 上下文压缩、历史改写都不会重置它，所以跨回合重连可以带着旧游标精准续传。
+    session_seq: HashMap<String, u64>,
 }
 
 /// Atomic admission and identity-aware cleanup for background `/chat` turns.
@@ -925,6 +1254,11 @@ impl ActiveChatRegistry {
         let operation_id = uuid::Uuid::new_v4().to_string();
         let cancellation = CancellationToken::new();
         let stop_gate = Arc::new(Mutex::new(false));
+        // 会话级游标起点：接着上一回合的序号继续走（严格单调递增）。
+        let seq_base = session_id
+            .as_deref()
+            .and_then(|sid| index.session_seq.get(sid).copied())
+            .unwrap_or(0);
         // Capacity: lagging watchers drop oldest; primary SSE is separate.
         let (event_bus, _) = tokio::sync::broadcast::channel(512);
         // Clone for waking standby watchers (the original moves into the operation).
@@ -963,7 +1297,9 @@ impl ActiveChatRegistry {
                 event_bus,
                 admitted_user: None,
                 replay: Arc::new(std::sync::Mutex::new(Vec::new())),
+                seq_base,
                 steer_tx: None,
+                steer_client_ids: std::collections::VecDeque::new(),
             },
         );
 
@@ -978,6 +1314,16 @@ impl ActiveChatRegistry {
                     "chat: drained standby watchers to live fan-out"
                 );
             }
+        }
+
+        // 跨实例增量：新轮次开始 → 所有实例即时点亮该会话的活动状态。
+        if let Some(sid) = session_id.clone() {
+            publish_global(GlobalWireEvent::Activity {
+                session_id: sid,
+                running: true,
+                terminal: None,
+                status: None,
+            });
         }
 
         Ok(ActiveChatAdmission {
@@ -1022,6 +1368,15 @@ impl ActiveChatRegistry {
         let index = self.inner.read().await;
         if let Some(operation_id) = index.aliases.get(session_id) {
             if let Some(operation) = index.operations.get(operation_id) {
+                // 会话变更（删/改/截断）改写了权威转录：本回合的旧帧立即作废，
+                // 否则带旧游标或全量重连会把变更前发出的帧补回来（已删内容复活）。
+                if matches!(event, ChatEvent::SessionMutation { .. }) {
+                    operation
+                        .replay
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clear();
+                }
                 let _ = operation.event_bus.send(event.clone());
             }
         }
@@ -1038,31 +1393,50 @@ impl ActiveChatRegistry {
     async fn subscribe_live_with_replay(
         &self,
         session_id: &str,
-    ) -> Option<(Vec<ChatEvent>, tokio::sync::broadcast::Receiver<ChatEvent>)> {
+    ) -> Option<(
+        Vec<(u64, ChatEvent)>,
+        tokio::sync::broadcast::Receiver<ChatEvent>,
+    )> {
         let index = self.inner.read().await;
         let operation_id = index.aliases.get(session_id)?.clone();
         let operation = index.operations.get(&operation_id)?;
+        if operation.terminal_reached || operation.stopped {
+            return None;
+        }
         let guard = operation
             .replay
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut snapshot = guard.clone();
+        // 游标就是缓冲序号（从 1 开始）：缓冲是追加式的（连续同身份合并只改最后一条的内容，
+        // 不改它的位置），所以同一个事件的 seq 永远稳定 —— 断点续传靠的就是这一点。
+        let mut snapshot: Vec<(u64, ChatEvent)> = guard
+            .iter()
+            .enumerate()
+            .map(|(index, event)| (operation.seq_base + index as u64 + 1, event.clone()))
+            .collect();
         let rx = operation.event_bus.subscribe();
         drop(guard);
         if let Some(ref admitted) = operation.admitted_user {
-            if !snapshot.iter().any(|e| matches!(e, ChatEvent::User { .. })) {
+            if !snapshot
+                .iter()
+                .any(|(_, e)| matches!(e, ChatEvent::User { .. }))
+            {
+                // 本轮提问的回声：不占游标（seq 0），因为它是幂等的用户气泡。
                 snapshot.insert(
                     0,
-                    ChatEvent::User {
-                        content: admitted.content.clone(),
-                        session_id: Some(session_id.to_string()),
-                        created_at: admitted
-                            .created_at
-                            .or((operation.started_at > 0).then_some(operation.started_at)),
-                        message_id: None,
-                        order: None,
-                        turn_ordinal: None,
-                    },
+                    (
+                        operation.seq_base,
+                        ChatEvent::User {
+                            content: admitted.content.clone(),
+                            session_id: Some(session_id.to_string()),
+                            created_at: admitted
+                                .created_at
+                                .or((operation.started_at > 0).then_some(operation.started_at)),
+                            message_id: None,
+                            order: None,
+                            turn_ordinal: None,
+                        },
+                    ),
                 );
             }
         }
@@ -1083,6 +1457,9 @@ impl ActiveChatRegistry {
         let Some(operation) = index.operations.get(operation_id) else {
             return (None, None);
         };
+        if operation.terminal_reached || operation.stopped {
+            return (None, None);
+        }
         let guard = operation
             .replay
             .lock()
@@ -1121,7 +1498,13 @@ impl ActiveChatRegistry {
         let mut index = self.inner.write().await;
         if let Some(operation_id) = index.aliases.get(session_id).cloned() {
             if let Some(operation) = index.operations.get(&operation_id) {
-                return WatchOutcome::Live(operation.event_bus.subscribe());
+                if !operation.terminal_reached && !operation.stopped {
+                    return WatchOutcome::Live(operation.event_bus.subscribe());
+                } else {
+                    index.aliases.remove(session_id);
+                }
+            } else {
+                index.aliases.remove(session_id);
             }
         }
         // One standby slot per session: WebUI reconnect/refresh used to pile up
@@ -1279,7 +1662,13 @@ impl ActiveChatRegistry {
     /// until it leaves the registry. `true` means the alias is idle (already
     /// gone, or the cancelled turn finished). `false` means the timeout fired
     /// while the previous turn was still persisting.
-    async fn stop_and_wait(&self, alias: String, timeout: Duration) -> bool {
+    ///
+    /// `timeout = None` waits for the release to be real instead of timing out.
+    /// Send-now callers need that verdict: a hard cap there misreported
+    /// "still busy" for turns that were already releasing, which pushed the
+    /// user's message back into the queue. `Some(limit)` keeps the bounded
+    /// behaviour of the session-deletion paths.
+    async fn stop_and_wait(&self, alias: String, timeout: Option<Duration>) -> bool {
         let operation_id = {
             let index = self.inner.read().await;
             let Some(operation_id) = index.aliases.get(&alias).cloned() else {
@@ -1291,7 +1680,7 @@ impl ActiveChatRegistry {
             operation_id
         };
         self.stop_alias_owned(alias).await;
-        tokio::time::timeout(timeout, async {
+        let await_release = async {
             loop {
                 let finished = {
                     let index = self.inner.read().await;
@@ -1309,9 +1698,16 @@ impl ActiveChatRegistry {
                 }
                 notified.await;
             }
-        })
-        .await
-        .is_ok()
+        };
+        match timeout {
+            Some(limit) => tokio::time::timeout(limit, await_release).await.is_ok(),
+            // Unterminated wait: the operation always leaves the registry (the
+            // chat task completes even on panic), so this resolves, not hangs.
+            None => {
+                await_release.await;
+                true
+            }
+        }
     }
 
     async fn stop_alias_owned(&self, alias: String) -> bool {
@@ -1349,7 +1745,7 @@ impl ActiveChatRegistry {
             }
         }
         cancellation.cancel();
-        jeikcode_capabilities::tools::legacy_bash_runtime_state().cancel_all_live_bash();
+        jeikcode_capabilities::tools::legacy_bash_runtime_state().cancel_foreground_live_bash();
         true
     }
 
@@ -1416,7 +1812,7 @@ impl ActiveChatRegistry {
             if remaining.is_zero() {
                 return false;
             }
-            if !self.stop_and_wait(alias, remaining).await {
+            if !self.stop_and_wait(alias, Some(remaining)).await {
                 return false;
             }
         }
@@ -1462,6 +1858,30 @@ impl ActiveChatRegistry {
         index.operations.get(operation_id)?.steer_tx.clone()
     }
 
+    /// Record a `/chat/steer` submit's client correlation id (FIFO; `None` when
+    /// the client sent none) so the turn projection can echo it on `steered`.
+    async fn record_steer_client_id(&self, alias: &str, client_input_id: Option<String>) {
+        let mut index = self.inner.write().await;
+        if let Some(operation_id) = index.aliases.get(alias).cloned() {
+            if let Some(operation) = index.operations.get_mut(&operation_id) {
+                operation.steer_client_ids.push_back(client_input_id);
+            }
+        }
+    }
+
+    /// Drain up to `count` recorded steer client ids for the operation (FIFO),
+    /// padding with `None` so the returned list always aligns 1:1 with the folded
+    /// inputs reported by the kernel.
+    async fn take_steer_client_ids(&self, operation_id: &str, count: usize) -> Vec<Option<String>> {
+        let mut index = self.inner.write().await;
+        let Some(operation) = index.operations.get_mut(operation_id) else {
+            return Vec::new();
+        };
+        (0..count)
+            .map(|_| operation.steer_client_ids.pop_front().unwrap_or(None))
+            .collect()
+    }
+
     /// Remove only the exact operation that finished. A late cleanup from an
     /// older generation can never erase a replacement operation's aliases.
     async fn complete(&self, operation_id: &str) -> bool {
@@ -1469,6 +1889,17 @@ impl ActiveChatRegistry {
         let Some(operation) = index.operations.remove(operation_id) else {
             return false;
         };
+        // 会话级游标推进：把本回合已发出的帧数累加进去，下一回合从更高的序号开始。
+        // 严格单调递增，且与上下文/压缩无关。
+        let turn_frames = operation
+            .replay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len() as u64;
+        let next_base = operation.seq_base + turn_frames;
+        for alias in &operation.aliases {
+            index.session_seq.insert(alias.clone(), next_base);
+        }
         for alias in operation.aliases {
             if index
                 .aliases
@@ -1479,6 +1910,15 @@ impl ActiveChatRegistry {
             }
         }
         operation.finished.notify_waiters();
+        // 跨实例增量：操作结束 → 活动状态回落（不触发任何整表重拉）。
+        if let Some(sid) = operation.session_id.clone() {
+            publish_global(GlobalWireEvent::Activity {
+                session_id: sid,
+                running: false,
+                terminal: None,
+                status: None,
+            });
+        }
         true
     }
 
@@ -1557,31 +1997,39 @@ fn log_truncate(value: &str, max: usize) -> String {
 /// a later `request_user_input` tool result or the turn ends — TUI/live can
 /// answer or decline without a dedicated chat-bus resolve event.
 fn pending_interactive_from_replay(events: &[ChatEvent]) -> (Option<ChatEvent>, Option<ChatEvent>) {
-    let mut last_permission: Option<ChatEvent> = None;
+    // A PermissionRequest is only "answered" by a resolution event that occurs
+    // AFTER it (by index). A tool that started / produced output / returned a
+    // result BEFORE the request cannot be what answered it, so a genuinely
+    // unanswered card (the request being the newest event) is still restored.
+    // This preserves the in-flight-tool-switch guard (a resolved tool is never
+    // re-toasted) while no longer dropping an unanswered request that happens to
+    // share a call id with an earlier ToolCallStarted.
+    let mut last_permission: Option<(usize, ChatEvent)> = None;
     let mut last_user_input: Option<ChatEvent> = None;
-    let mut resolved_call_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut last_resolution: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     let mut turn_terminal = false;
-    for event in events {
+    for (index, event) in events.iter().enumerate() {
         match event {
             ChatEvent::ToolCallStarted { id, .. } => {
                 // Tool already started running — approval was granted / not needed.
-                resolved_call_ids.insert(id.clone());
+                last_resolution.insert(id.clone(), index);
             }
             ChatEvent::ToolCallResult { id, name, .. } => {
-                resolved_call_ids.insert(id.clone());
+                last_resolution.insert(id.clone(), index);
                 if name == "request_user_input" {
                     last_user_input = None;
                 }
             }
             ChatEvent::ToolOutputChunk { id, .. } => {
                 // Output means the tool already started — approval was granted.
-                resolved_call_ids.insert(id.clone());
+                last_resolution.insert(id.clone(), index);
             }
             ChatEvent::Done { .. } | ChatEvent::Stopped | ChatEvent::Error { .. } => {
                 turn_terminal = true;
             }
             ChatEvent::PermissionRequest { .. } => {
-                last_permission = Some(event.clone());
+                last_permission = Some((index, event.clone()));
             }
             ChatEvent::UserInputRequest { .. } => {
                 last_user_input = Some(event.clone());
@@ -1592,9 +2040,12 @@ fn pending_interactive_from_replay(events: &[ChatEvent]) -> (Option<ChatEvent>, 
     if turn_terminal {
         return (None, None);
     }
-    let permission = last_permission.and_then(|ev| match &ev {
-        ChatEvent::PermissionRequest { call_id, .. } if !resolved_call_ids.contains(call_id) => {
-            Some(ev)
+    let permission = last_permission.and_then(|(req_index, ev)| match &ev {
+        ChatEvent::PermissionRequest { call_id, .. } => {
+            let answered = last_resolution
+                .get(call_id)
+                .is_some_and(|&res_index| res_index > req_index);
+            (!answered).then_some(ev)
         }
         _ => None,
     });
@@ -1612,17 +2063,236 @@ fn replay_resolves_call(events: &[ChatEvent], call_id: &str) -> bool {
     })
 }
 
+/// 全局失效总线（跨实例推送）。
+///
+/// 现有推送通道都是「按会话」的：`SessionRuntimeRegistry` 每个会话一条
+/// broadcast（订阅必须带 session_id），`LiveViewHub` 只绑定一个执行会话，
+/// `/chat/watch` 同样需要指定会话。于是「实例 B」无从得知「实例 A 新建/删除了
+/// 会话、某会话弹出了审批/提问卡」——只能靠窗口聚焦重拉（历史上的 15s 轮询
+/// 兜底已被拔除）。这里补上唯一缺失的一环：一条进程级全局广播 + `/events`。
+///
+/// 只发「失效信号」（不发 payload 副本）：客户端收到后单次重拉既有接口，
+/// 保证实时性的同时让数据形状与一致性仍由单一数据源决定。
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(tag = "type")]
+pub(crate) enum GlobalWireEvent {
+    /// 会话行新增/更新（新建、改名、回合完成后的 updated_at/message_count）。
+    /// 客户端按 id 就地 upsert，不重拉列表。
+    #[serde(rename = "session_upsert")]
+    SessionUpsert { session: SessionRowWire },
+    /// 会话删除（含批量）：客户端就地删行并丢弃该 id 的本地缓存。
+    #[serde(rename = "session_deleted")]
+    SessionDeleted {
+        session_id: String,
+        project_hash: String,
+    },
+    /// 活动/转圈变化；`terminal` 非空时同时携带终态供右下角通知去重；`status` 可携带 "compacting" 等阶段状态。
+    #[serde(rename = "activity")]
+    Activity {
+        session_id: String,
+        running: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        terminal: Option<&'static str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+    },
+    /// 某会话弹出待交互卡片（审批/提问）。只带会话 id，客户端对该会话做一次
+    /// 定向 pending 拉取（单会话、小请求），避免重拉整表。
+    #[serde(rename = "review_asked")]
+    ReviewAsked { session_id: String },
+    /// 待交互卡片已解决：客户端直接就地移除卡片。
+    #[serde(rename = "review_resolved")]
+    ReviewResolved {
+        session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        approval_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_id: Option<u64>,
+    },
+    /// 全局配置热重载（如 CLI 执行 jeikcode ghimg 或后台变更）。
+    #[serde(rename = "config_reloaded")]
+    ConfigReloaded,
+}
+
+/// 增量会话行（与 `/sessions` 返回的 `SessionMetaWithProject` 同形），
+/// 客户端按 `id` 就地 upsert。
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct SessionRowWire {
+    pub id: String,
+    pub name: String,
+    pub working_dir: String,
+    pub project_hash: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub message_count: u32,
+    pub origin: String,
+}
+
+/// Build the incremental session row for one stored session. `None` when the
+/// aggregate is not (yet) durable.
+pub(crate) fn session_row_wire(
+    working_dir: &std::path::Path,
+    session_id: &str,
+) -> Option<SessionRowWire> {
+    let manager = NativeSessionManager::for_project(working_dir);
+    let meta = manager.read_meta(session_id).ok()?;
+    let origin = match meta.origin {
+        jeikcode_capabilities::session::SessionOrigin::Manual => "manual",
+        jeikcode_capabilities::session::SessionOrigin::Scheduled => "scheduled",
+        jeikcode_capabilities::session::SessionOrigin::Protocol => "protocol",
+    };
+    Some(SessionRowWire {
+        id: session_id.to_string(),
+        name: meta.name.clone(),
+        working_dir: meta.working_dir.clone(),
+        project_hash: response_project_hash(std::path::Path::new(&meta.working_dir)),
+        created_at: u64::try_from(meta.created_at.max(0)).unwrap_or(0),
+        updated_at: u64::try_from(meta.updated_at.max(0)).unwrap_or(0),
+        message_count: meta.message_count,
+        origin: origin.to_string(),
+    })
+}
+
+/// Same row, addressed by project bucket instead of a working dir (catalog
+/// mutation helpers already hold the bucket).
+pub(crate) fn session_row_wire_in_bucket(
+    project_bucket: &str,
+    session_id: &str,
+) -> Option<SessionRowWire> {
+    let manager =
+        NativeSessionManager::with_root(NativeSessionManager::sessions_root().join(project_bucket));
+    let meta = manager.read_meta(session_id).ok()?;
+    let origin = match meta.origin {
+        jeikcode_capabilities::session::SessionOrigin::Manual => "manual",
+        jeikcode_capabilities::session::SessionOrigin::Scheduled => "scheduled",
+        jeikcode_capabilities::session::SessionOrigin::Protocol => "protocol",
+    };
+    Some(SessionRowWire {
+        id: session_id.to_string(),
+        name: meta.name.clone(),
+        working_dir: meta.working_dir.clone(),
+        project_hash: project_bucket.to_string(),
+        created_at: u64::try_from(meta.created_at.max(0)).unwrap_or(0),
+        updated_at: u64::try_from(meta.updated_at.max(0)).unwrap_or(0),
+        message_count: meta.message_count,
+        origin: origin.to_string(),
+    })
+}
+
+/// 推送一条会话行的增量快照（读 meta 失败即静默跳过：下次事件/冷启动收敛）。
+pub(crate) fn publish_session_upsert(working_dir: &std::path::Path, session_id: &str) {
+    if let Some(session) = session_row_wire(working_dir, session_id) {
+        publish_global(GlobalWireEvent::SessionUpsert { session });
+    }
+}
+
+const GLOBAL_EVENTS_CAP: usize = 256;
+
+/// Process-wide invalidation bus shared by every connected client instance.
+pub(crate) fn global_events() -> &'static tokio::sync::broadcast::Sender<GlobalWireEvent> {
+    static BUS: std::sync::OnceLock<tokio::sync::broadcast::Sender<GlobalWireEvent>> =
+        std::sync::OnceLock::new();
+    BUS.get_or_init(|| {
+        let (tx, _) = tokio::sync::broadcast::channel(GLOBAL_EVENTS_CAP);
+        tx
+    })
+}
+
+/// Broadcast an invalidation signal. No subscribers / lagged receivers are fine:
+/// the next invalidation (or a client's cold start) reconciles the state.
+pub(crate) fn publish_global(event: GlobalWireEvent) {
+    let _ = global_events().send(event);
+}
+
+/// `/events` 的挂载点。单独抽成 helper，生产路由与测试共用同一份定义：
+/// 路由一旦被从生产路由上拿掉，`global_events_route_tests` 会立即失败。
+pub(crate) fn with_global_events_route<S>(router: Router<S>) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    router.route("/events", get(global_events_stream))
+}
+
+/// GET /events — cross-instance invalidation stream (SSE).
+///
+/// The first frame is `{"type":"sync"}` so a connecting client performs one
+/// cold-start alignment; afterwards only real changes are pushed.
+async fn global_events_stream() -> axum::response::Response {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use futures::StreamExt as _;
+    use std::convert::Infallible;
+
+    let mut rx = global_events().subscribe();
+    let (tx, out_rx) = mpsc::unbounded_channel::<String>();
+    let _ = tx.send(serde_json::json!({ "type": "sync" }).to_string());
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(event) => match serde_json::to_string(&event) {
+                    Ok(json) => {
+                        if tx.send(json).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => continue,
+                },
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(out_rx)
+        .map(|json| Ok::<Event, Infallible>(Event::default().data(json)));
+    let mut resp = Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
+        .into_response();
+    resp.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-cache, no-transform"),
+    );
+    resp
+}
+
 /// Append `event` to the turn replay log, coalescing consecutive text/reasoning
 /// deltas so a long stream does not allocate one Vec entry per token.
+///
+/// Coalescing is IDENTITY-SCOPED: two deltas may merge only when they carry the
+/// same `message_id`/`part_id`. Merging across identities used to fuse a later
+/// round's tail into an earlier round's entry, so a watch/live replay repainted
+/// that text under the WRONG stored message (ghost rounds + misplaced text).
 fn push_chat_replay(buf: &mut Vec<ChatEvent>, event: ChatEvent) {
     match (&event, buf.last_mut()) {
-        (ChatEvent::TextDelta { content }, Some(ChatEvent::TextDelta { content: prev })) => {
+        (
+            ChatEvent::TextDelta {
+                content,
+                message_id,
+                part_id,
+                ..
+            },
+            Some(ChatEvent::TextDelta {
+                content: prev,
+                message_id: prev_message_id,
+                part_id: prev_part_id,
+                ..
+            }),
+        ) if message_id == prev_message_id && part_id == prev_part_id => {
             prev.push_str(content);
         }
         (
-            ChatEvent::ReasoningDelta { content },
-            Some(ChatEvent::ReasoningDelta { content: prev }),
-        ) => {
+            ChatEvent::ReasoningDelta {
+                content,
+                message_id,
+                part_id,
+                ..
+            },
+            Some(ChatEvent::ReasoningDelta {
+                content: prev,
+                message_id: prev_message_id,
+                part_id: prev_part_id,
+                ..
+            }),
+        ) if message_id == prev_message_id && part_id == prev_part_id => {
             prev.push_str(content);
         }
         (
@@ -1648,7 +2318,7 @@ pub(crate) fn fanout_chat_events(
     bus: tokio::sync::broadcast::Sender<ChatEvent>,
     replay: Option<Arc<std::sync::Mutex<Vec<ChatEvent>>>>,
 ) -> mpsc::UnboundedSender<ChatEvent> {
-    fanout_chat_events_for_session(primary, bus, replay, None)
+    fanout_chat_events_for_session(primary, bus, replay, None, None)
 }
 
 /// Like [`fanout_chat_events`], but also mirrors stream events into the L2
@@ -1659,10 +2329,12 @@ pub(crate) fn fanout_chat_events_for_session(
     bus: tokio::sync::broadcast::Sender<ChatEvent>,
     replay: Option<Arc<std::sync::Mutex<Vec<ChatEvent>>>>,
     session_id: Option<String>,
+    working_dir: Option<std::path::PathBuf>,
 ) -> mpsc::UnboundedSender<ChatEvent> {
     let (tx, mut rx) = mpsc::unbounded_channel::<ChatEvent>();
     tokio::spawn(async move {
         let mut current_sid = session_id;
+        let mut current_wd = working_dir;
         while let Some(event) = rx.recv().await {
             match &event {
                 ChatEvent::ToolCallStarted {
@@ -1675,18 +2347,63 @@ pub(crate) fn fanout_chat_events_for_session(
                     );
                 }
                 ChatEvent::PermissionRequest {
-                    tool_name, call_id, ..
+                    session_id,
+                    tool_name,
+                    call_id,
+                    ..
                 } => {
                     tracing::warn!(
                         tool = %tool_name,
                         call_id = %call_id,
                         "chat: PERMISSION REQUEST emitted (approval round-trip)"
                     );
+                    publish_global(GlobalWireEvent::ReviewAsked {
+                        session_id: session_id.clone(),
+                    });
                 }
-                ChatEvent::UserInputRequest { .. } => {
+                ChatEvent::UserInputRequest { session_id, .. } => {
                     tracing::warn!(
                         "chat: user_input_request emitted (model asked a structured question)"
                     );
+                    publish_global(GlobalWireEvent::ReviewAsked {
+                        session_id: session_id.clone(),
+                    });
+                }
+                ChatEvent::User { session_id, .. } => {
+                    let sid = session_id.clone().or_else(|| current_sid.clone());
+                    if let Some(sid) = sid {
+                        publish_global(GlobalWireEvent::Activity {
+                            session_id: sid,
+                            running: true,
+                            terminal: None,
+                            status: None,
+                        });
+                    }
+                }
+                ChatEvent::Done {
+                    session_id,
+                    stop_reason,
+                    ..
+                } => {
+                    publish_global(GlobalWireEvent::Activity {
+                        session_id: session_id.clone(),
+                        running: false,
+                        terminal: Some(chat_done_terminal_label(stop_reason.as_deref())),
+                        status: None,
+                    });
+                    if let Some(wd) = current_wd.clone() {
+                        publish_session_upsert(&wd, session_id);
+                    }
+                }
+                ChatEvent::Stopped | ChatEvent::Error { .. } => {
+                    if let Some(sid) = current_sid.clone() {
+                        publish_global(GlobalWireEvent::Activity {
+                            session_id: sid,
+                            running: false,
+                            terminal: Some("stopped"),
+                            status: None,
+                        });
+                    }
                 }
                 ChatEvent::ToolCallResult { name, success, .. } => {
                     tracing::info!(tool = %name, success, "chat: tool result");
@@ -1748,14 +2465,14 @@ fn mirror_chat_event_to_registry(session_id: &str, event: &ChatEvent) {
         .unwrap_or_else(|| PathBuf::from("."));
     let _ = reg.open_or_attach(session_id.to_string(), working_dir);
     match event {
-        ChatEvent::TextDelta { content } => {
+        ChatEvent::TextDelta { content, .. } => {
             let _ = reg.push_runtime_event(
                 &session_id.to_string(),
                 0,
                 CodingRuntimeEvent::Agent(AgentEvent::TextDelta(content.clone())),
             );
         }
-        ChatEvent::ReasoningDelta { content } => {
+        ChatEvent::ReasoningDelta { content, .. } => {
             let _ = reg.push_runtime_event(
                 &session_id.to_string(),
                 0,
@@ -1848,6 +2565,12 @@ pub struct AppState {
     /// server 绑定的地址 / 端口（供 /tunnel/status 报告远程可达性）。
     pub bind_host: String,
     pub bind_port: u16,
+    /// Workspace the OpenAI / Responses / Anthropic protocol surface is pinned
+    /// to: the directory this process was started in (`jeikcode serve --host
+    /// --port` cwd, or `working_dir_override`). WebUI multi-project switches
+    /// update `project` for the session panel; they must not move protocol
+    /// conversations into the first sidebar project.
+    pub bind_working_dir: PathBuf,
     /// This instance's port-scoped webui cookie name (`jeikcode_webui_<port>`),
     /// resolved ONCE at construction from the actual bound port. Read it directly
     /// — never re-derive the name from the bare `WEBUI_COOKIE` const at a call
@@ -2017,6 +2740,11 @@ pub struct ToolResultInfo {
 #[derive(Debug, Serialize)]
 pub struct MessageInfo {
     pub role: String,
+    /// Stable per-message identity from the kernel `Message.id` (SIDECAR). Lets
+    /// WebUI cache/disk/wire agree on the same handle. Absent for messages
+    /// persisted before the field existed. ADDITIVE: `#[serde(default)]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub content: String,
     /// The model's reasoning/thinking for an ASSISTANT message — persisted
     /// losslessly in the kernel `Message.reasoning` but until now dropped at
@@ -2201,6 +2929,7 @@ impl MessageInfo {
         }
         Self {
             role: role.into(),
+            id: msg.id.clone(),
             content,
             reasoning: msg.reasoning.clone().map(cap_display_field),
             synthetic: msg.synthetic,
@@ -2221,14 +2950,21 @@ fn extract_artifacts_from_call_fields<'a>(
     let mut artifacts = Vec::new();
 
     for (name, arguments) in tool_calls {
-        if name == "create_file" || name == "edit_file" {
+        if matches!(
+            name,
+            "write" | "write_file" | "create_file" | "edit" | "edit_file"
+        ) {
             // Parse arguments
             let args: serde_json::Value = match serde_json::from_str(arguments) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
 
-            let path = match args.get("file_path").and_then(|v| v.as_str()) {
+            let path = match args
+                .get("path")
+                .or_else(|| args.get("file_path"))
+                .and_then(|v| v.as_str())
+            {
                 Some(p) => p,
                 None => continue,
             };
@@ -2277,7 +3013,11 @@ fn extract_artifacts_from_call_fields<'a>(
                 Err(_) => continue,
             };
 
-            let command = match args.get("command").and_then(|v| v.as_str()) {
+            let command = match args
+                .get("command")
+                .or_else(|| args.get("cmd"))
+                .and_then(|v| v.as_str())
+            {
                 Some(c) => c,
                 None => continue,
             };
@@ -2424,8 +3164,12 @@ fn format_tool_args(tool_name: &str, args_json: &str) -> String {
     };
 
     match tool_name {
-        "read_file" => {
-            let path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+        "read" | "read_file" => {
+            let path = args
+                .get("path")
+                .or_else(|| args.get("file_path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let short = short_path(path);
             let mut s = short;
             if let Some(offset) = args.get("offset").and_then(|v| v.as_u64()) {
@@ -2435,8 +3179,12 @@ fn format_tool_args(tool_name: &str, args_json: &str) -> String {
             }
             s
         }
-        "create_file" => {
-            let path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+        "write" | "write_file" | "create_file" => {
+            let path = args
+                .get("path")
+                .or_else(|| args.get("file_path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let size = args
                 .get("content")
                 .and_then(|v| v.as_str())
@@ -2444,12 +3192,20 @@ fn format_tool_args(tool_name: &str, args_json: &str) -> String {
                 .unwrap_or(0);
             format!("{} ({} bytes)", short_path(path), size)
         }
-        "edit_file" => {
-            let path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+        "edit" | "edit_file" => {
+            let path = args
+                .get("path")
+                .or_else(|| args.get("file_path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             short_path(path)
         }
         "bash" | "run_command" => {
-            let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            let cmd = args
+                .get("command")
+                .or_else(|| args.get("cmd"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let shown = if cmd.chars().count() > 80 {
                 format!("{}...", cmd.chars().take(77).collect::<String>())
             } else {
@@ -2464,6 +3220,18 @@ fn format_tool_args(tool_name: &str, args_json: &str) -> String {
                 format!("`{shown}`")
             } else {
                 format!("{summary} — `{shown}`")
+            }
+        }
+        "code_explore" => {
+            let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            format!("\"{}\" in {}", query, short_path(path))
+        }
+        "task" => {
+            if let Some(tasks) = args.get("tasks").and_then(|t| t.as_array()) {
+                format!("{} subtask(s)", tasks.len())
+            } else {
+                "subtask".to_string()
             }
         }
         "list_directory" => {
@@ -2779,7 +3547,14 @@ impl ChatTurnPolicy {
 fn effective_chat_approval_mode(
     request_mode: Option<crate::approval_mode::ApprovalMode>,
 ) -> crate::approval_mode::ApprovalMode {
-    request_mode.unwrap_or_else(live_api::live_current_approval_mode)
+    effective_chat_approval_mode_scoped(request_mode, None)
+}
+
+fn effective_chat_approval_mode_scoped(
+    request_mode: Option<crate::approval_mode::ApprovalMode>,
+    session_id: Option<&str>,
+) -> crate::approval_mode::ApprovalMode {
+    request_mode.unwrap_or_else(|| live_api::live_session_approval_mode(session_id))
 }
 
 /// Modes that park the turn until the WebUI/TUI answers `/chat/permission`.
@@ -3608,6 +4383,43 @@ async fn get_session_detail(
     }
 }
 
+/// GET /projects/:hash/sessions/:id/lineage - Get conversation fork lineage and child branches
+async fn get_session_lineage(
+    Path((hash, id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    if !valid_project_bucket(&hash) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "INVALID_PROJECT",
+                "message": format!("Invalid project identifier: {hash}")
+            })),
+        )
+            .into_response();
+    }
+    let sessions_root = NativeSessionManager::sessions_root();
+    let manager = NativeSessionManager::with_root(sessions_root.join(&hash));
+    match manager.session_lineage(&id) {
+        Ok(Some(lineage)) => (StatusCode::OK, Json(lineage)).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "SESSION_NOT_FOUND",
+                "message": format!("Session '{id}' was not found in project '{hash}'")
+            })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "STORAGE_ERROR",
+                "message": format!("{error}")
+            })),
+        )
+            .into_response(),
+    }
+}
+
 /// Display-only image sidecar: the ORIGINAL images of VL-preprocessed user messages.
 ///
 /// When the active model lacks vision, the runtime's VL seam strips the image from the
@@ -3796,6 +4608,7 @@ fn merge_catalog_session_messages_for_display(
                     PresentationRole::Assistant => "assistant",
                 }
                 .into(),
+                id: None,
                 content: unwrap_presentation_text(entry.role, &entry.text),
                 reasoning: None,
                 synthetic: false,
@@ -3829,6 +4642,7 @@ fn merge_catalog_session_messages_for_display(
                     PresentationRole::Assistant => "assistant",
                 }
                 .into(),
+                id: None,
                 content: unwrap_presentation_text(entry.role, &entry.text),
                 reasoning: None,
                 synthetic: false,
@@ -4030,7 +4844,13 @@ async fn search_sessions(Query(query): Query<SearchQuery>) -> impl IntoResponse 
 /// unexpected storage failure (`500`). Flattening everything into
 /// `io::Error::other` made that distinction impossible.
 fn delete_session_file(project_hash: &str, session_id: &str) -> anyhow::Result<()> {
-    crate::legacy_convert::delete_catalog_session_in_project(project_hash, session_id)
+    crate::legacy_convert::delete_catalog_session_in_project(project_hash, session_id)?;
+    // 跨实例增量：删行 + 让客户端丢弃该 id 的本地缓存。
+    publish_global(GlobalWireEvent::SessionDeleted {
+        session_id: session_id.to_string(),
+        project_hash: project_hash.to_string(),
+    });
+    Ok(())
 }
 
 fn valid_project_bucket(project_bucket: &str) -> bool {
@@ -4371,13 +5191,19 @@ async fn delete_session(
         match deleted {
             Ok(Ok(())) => {
                 let working_dir = state_clone.project.read().await.working_dir.clone();
-                let id_for_mcp = id.clone();
-                // Session files are already gone. Reap MCP in the background so a
-                // bulk WebUI delete is not blocked on process teardown.
+                let id_for_cleanup = id.clone();
+                // Session files are already gone. Reap MCP, kill session background tasks,
+                // and clean up session background log files asynchronously.
                 tokio::spawn(async move {
                     let pool = jeikcode_capabilities::mcp::SessionMcpPool::global();
-                    pool.retire_session(&working_dir, &id_for_mcp).await;
-                    pool.retire_session_id(&id_for_mcp).await;
+                    pool.retire_session(&working_dir, &id_for_cleanup).await;
+                    pool.retire_session_id(&id_for_cleanup).await;
+
+                    // Cascade terminate all background services owned by this session
+                    jeikcode_capabilities::tools::bash_runtime::kill_by_session_id(&id_for_cleanup);
+
+                    // Delete all ephemeral log files matching jeikcode-back-{session_id}-*.log
+                    jeikcode_capabilities::tools::cleanup_session_logs(&id_for_cleanup).await;
                 });
                 state_clone.telemetry.track(Event::UseCommand {
                     type_: "delete_session".into(),
@@ -4433,7 +5259,12 @@ fn rename_session_file(
 ) -> std::io::Result<()> {
     crate::legacy_convert::rename_catalog_session_in_project(project_hash, session_id, new_name)
         .map(|_| ())
-        .map_err(std::io::Error::other)
+        .map_err(std::io::Error::other)?;
+    // 跨实例增量：就地 upsert 该行（改名 + updated_at），不重拉列表。
+    if let Some(session) = session_row_wire_in_bucket(project_hash, session_id) {
+        publish_global(GlobalWireEvent::SessionUpsert { session });
+    }
+    Ok(())
 }
 
 /// PATCH /projects/:hash/sessions/:id/rename - Rename a session
@@ -4476,6 +5307,8 @@ pub struct PatchMessageRequest {
     pub expected_text: Option<String>,
     #[serde(default)]
     pub expected_message_id: Option<String>,
+    #[serde(default)]
+    pub expected_role: Option<String>,
 }
 
 /// Query parameters for deleting a session message
@@ -4487,6 +5320,8 @@ pub struct DeleteMessageQuery {
     pub expected_text: Option<String>,
     #[serde(default)]
     pub expected_message_id: Option<String>,
+    #[serde(default)]
+    pub expected_role: Option<String>,
 }
 
 /// Request to truncate session history to a target point
@@ -4498,7 +5333,41 @@ pub struct TruncateSessionRequest {
     #[serde(default)]
     pub expected_text: Option<String>,
     #[serde(default)]
+    pub expected_role: Option<String>,
+    #[serde(default)]
     pub inclusive: Option<bool>,
+}
+
+/// Request to fork (branch) a session, optionally at a target message index
+#[derive(Debug, Deserialize, Default)]
+pub struct ForkSessionRequest {
+    #[serde(default)]
+    pub target_index: Option<usize>,
+    #[serde(default)]
+    pub target_message_id: Option<String>,
+    #[serde(default)]
+    pub expected_text: Option<String>,
+    #[serde(default)]
+    pub expected_role: Option<String>,
+    #[serde(default)]
+    pub inclusive: Option<bool>,
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+/// Response for a forked session
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ForkSessionResponse {
+    pub success: bool,
+    pub id: String,
+    pub name: String,
+    pub parent_id: String,
+    pub root_id: String,
+    pub working_dir: PathBuf,
+    pub project_hash: String,
+    pub message_count: u32,
+    pub turn_count: u32,
+    pub created_at: u64,
 }
 
 fn resolve_target_message_index(
@@ -4507,43 +5376,139 @@ fn resolve_target_message_index(
     expected_text: Option<&str>,
     expected_role: Option<&str>,
 ) -> Option<usize> {
-    if let Some(text) = expected_text {
-        let t_trimmed = text.trim();
-        if !t_trimmed.is_empty() {
-            // 文本内容精准定位优先：倒序匹配目标消息真实的物理下标，彻底解决前端折叠索引与底层存储索引错位
-            for (i, msg) in messages.iter().enumerate().rev() {
-                let role_matches = expected_role.map_or(true, |r| match msg.role {
-                    jeikcode_kernel::message::Role::System => r.eq_ignore_ascii_case("system"),
-                    jeikcode_kernel::message::Role::User => r.eq_ignore_ascii_case("user"),
-                    jeikcode_kernel::message::Role::Assistant => {
-                        r.eq_ignore_ascii_case("assistant")
-                    }
-                    jeikcode_kernel::message::Role::Tool => r.eq_ignore_ascii_case("tool"),
-                });
-                let msg_trimmed = msg.text.trim();
-                if role_matches
-                    && (msg_trimmed == t_trimmed
-                        || msg_trimmed.contains(t_trimmed)
-                        || t_trimmed.contains(msg_trimmed))
-                {
-                    return Some(i);
-                }
-            }
-        }
-    }
-
-    if let Some(msg) = messages.get(target_index) {
-        let role_matches = expected_role.map_or(true, |r| match msg.role {
+    let role_matches = |role: &jeikcode_kernel::message::Role| -> bool {
+        expected_role.map_or(true, |r| match role {
             jeikcode_kernel::message::Role::System => r.eq_ignore_ascii_case("system"),
             jeikcode_kernel::message::Role::User => r.eq_ignore_ascii_case("user"),
             jeikcode_kernel::message::Role::Assistant => r.eq_ignore_ascii_case("assistant"),
             jeikcode_kernel::message::Role::Tool => r.eq_ignore_ascii_case("tool"),
-        });
-        if role_matches {
+        })
+    };
+
+    let text_trimmed = expected_text.map(|t| t.trim()).filter(|t| !t.is_empty());
+
+    let msg_text_matches = |msg: &jeikcode_kernel::message::Message, t: &str| -> bool {
+        let m_trimmed = msg.text.trim();
+        if m_trimmed == t {
+            return true;
+        }
+        if let Some(reasoning) = &msg.reasoning {
+            let r_trimmed = reasoning.trim();
+            if r_trimmed == t {
+                return true;
+            }
+            let combined = format!("{}\n{}", r_trimmed, m_trimmed);
+            if combined.trim() == t {
+                return true;
+            }
+        }
+        false
+    };
+
+    let msg_text_contains = |msg: &jeikcode_kernel::message::Message, t: &str| -> bool {
+        let m_trimmed = msg.text.trim();
+        if !m_trimmed.is_empty()
+            && (m_trimmed.starts_with(t) || m_trimmed.contains(t) || t.contains(m_trimmed))
+        {
+            return true;
+        }
+        if let Some(reasoning) = &msg.reasoning {
+            let r_trimmed = reasoning.trim();
+            if !r_trimmed.is_empty()
+                && (r_trimmed.starts_with(t) || r_trimmed.contains(t) || t.contains(r_trimmed))
+            {
+                return true;
+            }
+            let combined = format!("{}\n{}", r_trimmed, m_trimmed);
+            let c_trimmed = combined.trim();
+            if !c_trimmed.is_empty()
+                && (c_trimmed.starts_with(t) || c_trimmed.contains(t) || t.contains(c_trimmed))
+            {
+                return true;
+            }
+        }
+        false
+    };
+
+    // 1. 优先命中：物理索引处直接匹配（角色匹配 + 文本一致/无指定文本）
+    if let Some(msg) = messages.get(target_index) {
+        if role_matches(&msg.role) {
+            if let Some(t) = text_trimmed {
+                if msg_text_matches(msg, t) {
+                    return Some(target_index);
+                }
+            } else {
+                return Some(target_index);
+            }
+        }
+    }
+
+    // 2. 文本精准匹配：在所有角色匹配的消息中，寻找完全相等且距离 target_index 最近的项
+    if let Some(t) = text_trimmed {
+        let mut best_exact: Option<(usize, usize)> = None;
+        for (i, msg) in messages.iter().enumerate() {
+            if role_matches(&msg.role) && msg_text_matches(msg, t) {
+                let dist = if i >= target_index {
+                    i - target_index
+                } else {
+                    target_index - i
+                };
+                if best_exact.map_or(true, |(_, d)| dist < d) {
+                    best_exact = Some((i, dist));
+                }
+            }
+        }
+        if let Some((idx, _)) = best_exact {
+            return Some(idx);
+        }
+
+        // 3. 前缀/包含模糊匹配（仅当严格符合目标角色时才允许，杜绝反向包含误伤）
+        let mut best_fuzzy: Option<(usize, usize)> = None;
+        for (i, msg) in messages.iter().enumerate() {
+            if role_matches(&msg.role) && msg_text_contains(msg, t) {
+                let dist = if i >= target_index {
+                    i - target_index
+                } else {
+                    target_index - i
+                };
+                if best_fuzzy.map_or(true, |(_, d)| dist < d) {
+                    best_fuzzy = Some((i, dist));
+                }
+            }
+        }
+        if let Some((idx, _)) = best_fuzzy {
+            return Some(idx);
+        }
+    }
+
+    // 4. 次选降级：若 target_index 处角色匹配则使用
+    if let Some(msg) = messages.get(target_index) {
+        if role_matches(&msg.role) {
             return Some(target_index);
         }
     }
 
+    // 5. 寻找距离 target_index 最近且符合目标角色的任意消息
+    if expected_role.is_some() {
+        let mut best_role: Option<(usize, usize)> = None;
+        for (i, msg) in messages.iter().enumerate() {
+            if role_matches(&msg.role) {
+                let dist = if i >= target_index {
+                    i - target_index
+                } else {
+                    target_index - i
+                };
+                if best_role.map_or(true, |(_, d)| dist < d) {
+                    best_role = Some((i, dist));
+                }
+            }
+        }
+        if let Some((idx, _)) = best_role {
+            return Some(idx);
+        }
+    }
+
+    // 6. 最终兜底
     if target_index < messages.len() {
         Some(target_index)
     } else {
@@ -4563,7 +5528,7 @@ async fn patch_session_message(
     daemon_scope(&state, session_uuid, client_mode, || async move {
         let _ = state_clone
             .active_chats
-            .stop_and_wait(id.clone(), std::time::Duration::from_millis(1500))
+            .stop_and_wait(id.clone(), Some(std::time::Duration::from_millis(1500)))
             .await;
         let _ = crate::native_live::cancel_via_registry(&id);
 
@@ -4604,7 +5569,7 @@ async fn patch_session_message(
             &snapshot.messages,
             index,
             req.expected_text.as_deref(),
-            None,
+            req.expected_role.as_deref(),
         );
         let Some(real_index) = target_idx else {
             return (
@@ -4625,10 +5590,7 @@ async fn patch_session_message(
                 .collect();
         }
         snapshot.cache_epoch = snapshot.cache_epoch.saturating_add(1);
-        meta.updated_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        meta.updated_at = jeikcode_capabilities::session::now_ms();
         if let Err(e) = manager.save_snapshot(&id, &snapshot) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -4680,7 +5642,7 @@ async fn delete_session_message(
     daemon_scope(&state, session_uuid, client_mode, || async move {
         let _ = state_clone
             .active_chats
-            .stop_and_wait(id.clone(), std::time::Duration::from_millis(1500))
+            .stop_and_wait(id.clone(), Some(std::time::Duration::from_millis(1500)))
             .await;
         let _ = crate::native_live::cancel_via_registry(&id);
 
@@ -4721,7 +5683,7 @@ async fn delete_session_message(
             &snapshot.messages,
             index,
             query.expected_text.as_deref(),
-            None,
+            query.expected_role.as_deref(),
         );
         let Some(real_index) = target_idx else {
             return (
@@ -4732,7 +5694,10 @@ async fn delete_session_message(
         };
 
         let delete_turn = query.delete_turn.unwrap_or(false);
+        let mutation_start_idx;
         if delete_turn {
+            // 用户消息删除（整回合删除：删除该用户消息以及随后的整轮 Agent 中间输出和回答）
+            mutation_start_idx = real_index;
             let mut end = real_index + 1;
             while end < snapshot.messages.len()
                 && snapshot.messages[end].role != jeikcode_kernel::message::Role::User
@@ -4741,7 +5706,28 @@ async fn delete_session_message(
             }
             snapshot.messages.drain(real_index..end);
         } else {
-            snapshot.messages.remove(real_index);
+            // Agent 消息删除（删除当轮 Agent 的所有中间输出、工具调用和最终回答，保留前置 User 消息）
+            if snapshot.messages[real_index].role == jeikcode_kernel::message::Role::Assistant
+                || snapshot.messages[real_index].role == jeikcode_kernel::message::Role::Tool
+            {
+                let mut start = real_index;
+                while start > 0
+                    && snapshot.messages[start - 1].role != jeikcode_kernel::message::Role::User
+                {
+                    start -= 1;
+                }
+                let mut end = real_index + 1;
+                while end < snapshot.messages.len()
+                    && snapshot.messages[end].role != jeikcode_kernel::message::Role::User
+                {
+                    end += 1;
+                }
+                mutation_start_idx = start;
+                snapshot.messages.drain(start..end);
+            } else {
+                mutation_start_idx = real_index;
+                snapshot.messages.remove(real_index);
+            }
         }
 
         let (turn_c, req_c) =
@@ -4749,10 +5735,9 @@ async fn delete_session_message(
         snapshot.turn_counter = turn_c;
         snapshot.request_counter = req_c;
         snapshot.cache_epoch = snapshot.cache_epoch.saturating_add(1);
-        meta.updated_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        meta.updated_at = jeikcode_capabilities::session::now_ms();
+        meta.message_count = u32::try_from(snapshot.messages.len()).unwrap_or(0);
+        meta.turn_count = u32::try_from(turn_c).unwrap_or(0);
         if let Err(e) = manager.save_snapshot(&id, &snapshot) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -4773,7 +5758,7 @@ async fn delete_session_message(
             revision: snapshot.cache_epoch,
             action: "delete".into(),
             message_id: query.expected_message_id,
-            source_index: Some(real_index),
+            source_index: Some(mutation_start_idx),
             text: None,
             images: None,
             delete_turn: Some(delete_turn),
@@ -4785,7 +5770,7 @@ async fn delete_session_message(
 
         (
             StatusCode::OK,
-            Json(serde_json::json!({ "success": true, "revision": snapshot.cache_epoch, "source_index": real_index })),
+            Json(serde_json::json!({ "success": true, "revision": snapshot.cache_epoch, "source_index": mutation_start_idx })),
         )
             .into_response()
     })
@@ -4804,7 +5789,7 @@ async fn truncate_session(
     daemon_scope(&state, session_uuid, client_mode, || async move {
         let _ = state_clone
             .active_chats
-            .stop_and_wait(id.clone(), std::time::Duration::from_millis(1500))
+            .stop_and_wait(id.clone(), Some(std::time::Duration::from_millis(1500)))
             .await;
         let _ = crate::native_live::cancel_via_registry(&id);
 
@@ -4845,7 +5830,7 @@ async fn truncate_session(
             &snapshot.messages,
             req.target_index,
             req.expected_text.as_deref(),
-            None,
+            req.expected_role.as_deref(),
         );
         let Some(real_index) = target_idx else {
             return (
@@ -4867,10 +5852,9 @@ async fn truncate_session(
         snapshot.turn_counter = turn_c;
         snapshot.request_counter = req_c;
         snapshot.cache_epoch = snapshot.cache_epoch.saturating_add(1);
-        meta.updated_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        meta.updated_at = jeikcode_capabilities::session::now_ms();
+        meta.message_count = u32::try_from(snapshot.messages.len()).unwrap_or(0);
+        meta.turn_count = u32::try_from(turn_c).unwrap_or(0);
         if let Err(e) = manager.save_snapshot(&id, &snapshot) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -4907,6 +5891,154 @@ async fn truncate_session(
         )
             .into_response()
     })
+    .await
+}
+
+/// POST /projects/:hash/sessions/:id/fork - Fork (branch) a session
+async fn fork_session(
+    State(state): State<AppState>,
+    axum::Extension(client_mode): axum::Extension<SessionMode>,
+    Path((hash, id)): Path<(String, String)>,
+    body: Option<Json<ForkSessionRequest>>,
+) -> impl IntoResponse {
+    let req = body.map(|Json(r)| r).unwrap_or_default();
+    let session_uuid = uuid::Uuid::parse_str(&id).ok();
+    let state_clone = state.clone();
+    daemon_scope(&state, session_uuid, client_mode, || async move {
+        let sessions_root = NativeSessionManager::sessions_root();
+        let (project_hash, manager, source_id, source) = if valid_project_bucket(&hash) {
+            let mgr = NativeSessionManager::with_root(sessions_root.join(&hash));
+            if let Ok(loaded) = mgr.load_native_session(&id) {
+                (hash.clone(), mgr, id.clone(), loaded)
+            } else if let Ok(Some(resolved)) = resolve_session_by_id(&id) {
+                let mgr =
+                    NativeSessionManager::with_root(sessions_root.join(&resolved.project_hash));
+                if let Ok(loaded) = mgr.load_native_session(&resolved.meta.id) {
+                    (resolved.project_hash, mgr, resolved.meta.id, loaded)
+                } else {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({ "success": false, "error": "session not found" })),
+                    )
+                        .into_response();
+                }
+            } else {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "success": false, "error": "session not found" })),
+                )
+                    .into_response();
+            }
+        } else if let Ok(Some(resolved)) = resolve_session_by_id(&id) {
+            let mgr = NativeSessionManager::with_root(sessions_root.join(&resolved.project_hash));
+            if let Ok(loaded) = mgr.load_native_session(&resolved.meta.id) {
+                (resolved.project_hash, mgr, resolved.meta.id, loaded)
+            } else {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "success": false, "error": "session not found" })),
+                )
+                    .into_response();
+            }
+        } else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "success": false, "error": "session not found" })),
+            )
+                .into_response();
+        };
+
+        let target_message_count = req.target_index.map(|target_index| {
+            if let Some(real_index) = resolve_target_message_index(
+                &source.snapshot.messages,
+                target_index,
+                req.expected_text.as_deref(),
+                req.expected_role.as_deref(),
+            ) {
+                if req.inclusive.unwrap_or(true) {
+                    (real_index + 1).min(source.snapshot.messages.len())
+                } else {
+                    real_index.min(source.snapshot.messages.len())
+                }
+            } else {
+                target_index.min(source.snapshot.messages.len())
+            }
+        });
+
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let now = jeikcode_capabilities::session::now_ms();
+        let (mut forked, _lease) = match manager.fork_native_session_at(
+            &source_id,
+            &new_id,
+            target_message_count,
+            now,
+        ) {
+            Ok(res) => res,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "success": false, "error": e.to_string() })),
+                )
+                    .into_response();
+            }
+        };
+
+        forked.meta.updated_at = now.saturating_add(1);
+        if let Some(title) = req.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+            forked.meta.name = title.to_string();
+            forked.meta.user_renamed = true;
+        }
+        let _ = manager.write_meta(&forked.meta);
+
+        if let Some(session) = session_row_wire_in_bucket(&project_hash, &new_id) {
+            publish_global(GlobalWireEvent::SessionUpsert { session });
+        }
+
+        state_clone.telemetry.track(Event::UseCommand {
+            type_: "fork_session".into(),
+            success: Some(true),
+            error_kind: None,
+            error_data: None,
+        });
+
+        let root_id = forked
+            .meta
+            .fork_info
+            .as_ref()
+            .map(|f| f.root_id.clone())
+            .unwrap_or_else(|| source_id.clone());
+
+        let response = ForkSessionResponse {
+            success: true,
+            id: new_id,
+            name: forked.meta.name,
+            parent_id: source_id,
+            root_id,
+            working_dir: PathBuf::from(&forked.meta.working_dir),
+            project_hash,
+            message_count: forked.meta.message_count,
+            turn_count: forked.meta.turn_count,
+            created_at: u64::try_from(forked.meta.created_at.max(0)).unwrap_or(0) / 1_000,
+        };
+
+        (StatusCode::OK, Json(response)).into_response()
+    })
+    .await
+}
+
+/// POST /sessions/:id/fork - Fork (branch) a session by id across projects
+async fn fork_session_by_id(
+    State(state): State<AppState>,
+    axum::Extension(client_mode): axum::Extension<SessionMode>,
+    Path(id): Path<String>,
+    body: Option<Json<ForkSessionRequest>>,
+) -> impl IntoResponse {
+    fork_session(
+        State(state),
+        axum::Extension(client_mode),
+        Path((String::new(), id)),
+        body,
+    )
     .await
 }
 
@@ -5124,6 +6256,14 @@ pub struct ImageInput {
     pub data: String,
 }
 
+fn default_fence_len() -> usize {
+    3
+}
+
+fn is_default_fence_len(len: &usize) -> bool {
+    *len == 3
+}
+
 /// SSE event types for streaming chat
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
@@ -5156,6 +6296,15 @@ pub enum ChatEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_ordinal: Option<u32>,
     },
+    /// The STORED identity of the real user prompt this turn runs on (from the
+    /// kernel `UserMessage` boundary). Identity-only — the visible bubble is
+    /// already painted by the `user` echo; this lets a client bind that
+    /// optimistic bubble to the id the disk transcript carries.
+    #[serde(rename = "user_identified")]
+    UserIdentified {
+        message_id: String,
+        turn_ordinal: u32,
+    },
     /// Tool batch started (all tools in this assistant turn)
     #[serde(rename = "tool_batch")]
     ToolBatchStarted {
@@ -5163,16 +6312,41 @@ pub enum ChatEvent {
     },
     /// LLM text delta
     #[serde(rename = "text")]
-    TextDelta { content: String },
+    TextDelta {
+        content: String,
+        /// Streaming assistant-message identity (from `AssistantMessage`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+        /// Unique part id for this streamed text run: `{message_id}:{part_seq}:text`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        part_id: Option<String>,
+        /// Monotonic part counter within the message (bumped on kind change).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        part_seq: Option<u32>,
+    },
     /// LLM reasoning/thinking content
     #[serde(rename = "reasoning")]
-    ReasoningDelta { content: String },
+    ReasoningDelta {
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        part_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        part_seq: Option<u32>,
+    },
     /// Tool call started
     #[serde(rename = "tool_start")]
     ToolCallStarted {
         id: String,
         name: String,
         arguments: String,
+        /// Assistant message (round) that issued this call. Lets the WebUI
+        /// attach the row to the OWNING round instead of "whatever assistant
+        /// is last" — a mid-turn steer bubble can sit after that round while
+        /// its remaining tool calls still stream in.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
     },
     /// Real-time tool output chunk (stdout). `id` is the tool call id so parallel
     /// tools can be attributed correctly on the OpenAI/Anthropic compat surface.
@@ -5187,6 +6361,11 @@ pub enum ChatEvent {
     Steered {
         count: usize,
         inputs: Vec<jeikcode_kernel::event::SteeredInput>,
+        /// Client-correlation ids for the folded inputs, in FIFO order (`None`
+        /// when a submit carried none). Lets the WebUI promote its optimistic
+        /// steer card/bubble to the persisted message by id across a refresh.
+        #[serde(default)]
+        client_input_ids: Vec<Option<String>>,
     },
     /// Tool call completed
     #[serde(rename = "tool_result")]
@@ -5215,6 +6394,11 @@ pub enum ChatEvent {
         artifact_type: String,    // "code", "html", "markdown"
         language: Option<String>, // for code blocks
         title: Option<String>,
+        #[serde(
+            default = "default_fence_len",
+            skip_serializing_if = "is_default_fence_len"
+        )]
+        fence_len: usize,
     },
     /// Artifact content chunk
     #[serde(rename = "artifact_content")]
@@ -5703,7 +6887,7 @@ mod chat_event_type_tests {
         let calls: Vec<jeikcode_kernel::event::ToolBatchCall> =
             vec![jeikcode_kernel::event::ToolBatchCall {
                 id: "call-1".into(),
-                name: "read_file".into(),
+                name: "read".into(),
                 arguments: "{}".into(),
                 parallel_safe: true,
             }];
@@ -5716,32 +6900,38 @@ mod chat_event_type_tests {
     #[test]
     fn native_steered_event_reaches_chat_projection() {
         let mut projector = ChatRuntimeProjector::default();
-        let events = projector.project_agent(jeikcode_kernel::event::AgentEvent::Steered {
-            count: 1,
-            inputs: vec![jeikcode_kernel::event::SteeredInput {
-                text: "next instruction".into(),
-                images: Vec::new(),
-            }],
-        });
+        let events = projector.project_agent(
+            jeikcode_kernel::event::AgentEvent::Steered {
+                count: 1,
+                inputs: vec![jeikcode_kernel::event::SteeredInput {
+                    text: "next instruction".into(),
+                    images: Vec::new(),
+                    message_id: Some("m-steer-1".into()),
+                }],
+            },
+            "test-session",
+        );
         assert!(matches!(
             events.as_slice(),
-            [ChatEvent::Steered { count: 1, inputs }] if inputs[0].text == "next instruction"
+            [ChatEvent::Steered { count: 1, inputs, .. }] if inputs[0].text == "next instruction"
         ));
     }
 
     #[test]
     fn native_tool_batch_reaches_chat_without_core_projection() {
         let mut projector = ChatRuntimeProjector::default();
-        let events =
-            projector.project_agent(jeikcode_kernel::event::AgentEvent::ToolBatchStarted {
+        let events = projector.project_agent(
+            jeikcode_kernel::event::AgentEvent::ToolBatchStarted {
                 batch_id: "batch-1".into(),
                 calls: vec![jeikcode_kernel::event::ToolBatchCall {
                     id: "call-1".into(),
-                    name: "read_file".into(),
+                    name: "read".into(),
                     arguments: "{}".into(),
                     parallel_safe: true,
                 }],
-            });
+            },
+            "test-session",
+        );
 
         assert!(matches!(
             events.as_slice(),
@@ -5760,7 +6950,10 @@ mod chat_event_type_tests {
             },
             ..Default::default()
         };
-        let events = projector.project_agent(jeikcode_kernel::event::AgentEvent::Usage(meta));
+        let events = projector.project_agent(
+            jeikcode_kernel::event::AgentEvent::Usage(meta),
+            "test-session",
+        );
 
         assert!(matches!(
             events.as_slice(),
@@ -5957,11 +7150,29 @@ enum ArtifactDetectorState {
     /// Normal text output
     Normal,
     /// Inside a code block
-    InCodeBlock { id: String },
+    InCodeBlock {
+        id: String,
+        artifact_type: String,
+        fence_len: usize,
+        depth: usize,
+    },
     /// Inside HTML block (detected by <html>, <!DOCTYPE, or substantial HTML tags)
     InHtml { id: String, content: String },
     /// Inside SVG block (detected by <svg> tag)
     InSvg { id: String, content: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FenceInsideBlock {
+    /// True close of the outermost code block (depth == 1 and pure close with cur_len >= fence_len)
+    OuterClose {
+        line_start: usize,
+        after_fence_line: usize,
+    },
+    /// An inner code block opening (has info tag, cur_len >= fence_len)
+    InnerOpen { after_fence_line: usize },
+    /// An inner code block closing (depth > 1, pure close with cur_len >= fence_len)
+    InnerClose { after_fence_line: usize },
 }
 
 impl ArtifactDetector {
@@ -6009,12 +7220,15 @@ impl ArtifactDetector {
             match self.state.clone() {
                 ArtifactDetectorState::Normal => {
                     // Check for code block start
-                    if let Some((fence_start, content_start, language)) =
+                    if let Some((fence_start, content_start, fence_len, language)) =
                         Self::find_code_fence_start(remaining)
                     {
                         if fence_start > 0 {
                             events.push(ChatEvent::TextDelta {
                                 content: remaining[..fence_start].to_string(),
+                                message_id: None,
+                                part_id: None,
+                                part_seq: None,
                             });
                         }
 
@@ -6022,12 +7236,22 @@ impl ArtifactDetector {
                         let id = self.next_id();
                         events.push(ChatEvent::ArtifactStart {
                             id: id.clone(),
-                            artifact_type,
-                            language: Some(language),
+                            artifact_type: artifact_type.clone(),
+                            language: if language.is_empty() {
+                                None
+                            } else {
+                                Some(language)
+                            },
                             title,
+                            fence_len,
                         });
 
-                        self.state = ArtifactDetectorState::InCodeBlock { id };
+                        self.state = ArtifactDetectorState::InCodeBlock {
+                            id,
+                            artifact_type,
+                            fence_len,
+                            depth: 1,
+                        };
                         remaining = &remaining[content_start..];
                     }
                     // Check for SVG block start (standalone <svg> tag)
@@ -6038,6 +7262,7 @@ impl ArtifactDetector {
                             artifact_type: "svg".to_string(),
                             language: None,
                             title: None,
+                            fence_len: 3,
                         });
                         events.push(ChatEvent::ArtifactContent {
                             id: id.clone(),
@@ -6058,6 +7283,7 @@ impl ArtifactDetector {
                             artifact_type: "html".to_string(),
                             language: None,
                             title: None,
+                            fence_len: 3,
                         });
                         events.push(ChatEvent::ArtifactContent {
                             id: id.clone(),
@@ -6073,32 +7299,91 @@ impl ArtifactDetector {
                         // Normal text
                         events.push(ChatEvent::TextDelta {
                             content: remaining.to_string(),
+                            message_id: None,
+                            part_id: None,
+                            part_seq: None,
                         });
                         remaining = "";
                     }
                 }
-                ArtifactDetectorState::InCodeBlock { id } => {
-                    // Check for code block end
-                    if let Some((fence_start, after_fence_line)) =
-                        Self::find_code_fence_end(remaining)
-                    {
-                        if fence_start > 0 {
+                ArtifactDetectorState::InCodeBlock {
+                    id,
+                    artifact_type,
+                    fence_len,
+                    mut depth,
+                } => match Self::find_next_fence_in_block(remaining, fence_len, depth) {
+                    Some(FenceInsideBlock::OuterClose {
+                        line_start,
+                        after_fence_line,
+                    }) => {
+                        if line_start > 0 {
                             events.push(ChatEvent::ArtifactContent {
                                 id: id.clone(),
-                                content: remaining[..fence_start].to_string(),
+                                content: remaining[..line_start].to_string(),
                             });
                         }
                         events.push(ChatEvent::ArtifactEnd { id });
                         self.state = ArtifactDetectorState::Normal;
                         remaining = &remaining[after_fence_line..];
-                    } else {
+                    }
+                    Some(FenceInsideBlock::InnerOpen { after_fence_line }) => {
+                        events.push(ChatEvent::ArtifactContent {
+                            id: id.clone(),
+                            content: remaining[..after_fence_line].to_string(),
+                        });
+                        depth += 1;
+                        self.state = ArtifactDetectorState::InCodeBlock {
+                            id,
+                            artifact_type,
+                            fence_len,
+                            depth,
+                        };
+                        remaining = &remaining[after_fence_line..];
+                    }
+                    Some(FenceInsideBlock::InnerClose { after_fence_line }) => {
+                        events.push(ChatEvent::ArtifactContent {
+                            id: id.clone(),
+                            content: remaining[..after_fence_line].to_string(),
+                        });
+                        depth = depth.saturating_sub(1);
+                        self.state = ArtifactDetectorState::InCodeBlock {
+                            id,
+                            artifact_type,
+                            fence_len,
+                            depth,
+                        };
+                        remaining = &remaining[after_fence_line..];
+                    }
+                    None => {
+                        // 结构性终结自愈：如果当前非 markdown 代码块内部遇到了明确的顶层大纲结构（如 `\n### 第二步`）
+                        if artifact_type != "markdown" {
+                            if let Some(term_pos) = Self::find_structural_terminator(remaining) {
+                                if term_pos > 0 {
+                                    events.push(ChatEvent::ArtifactContent {
+                                        id: id.clone(),
+                                        content: remaining[..term_pos].to_string(),
+                                    });
+                                }
+                                events.push(ChatEvent::ArtifactEnd { id });
+                                self.state = ArtifactDetectorState::Normal;
+                                remaining = &remaining[term_pos..];
+                                continue;
+                            }
+                        }
+
                         events.push(ChatEvent::ArtifactContent {
                             id: id.clone(),
                             content: remaining.to_string(),
                         });
+                        self.state = ArtifactDetectorState::InCodeBlock {
+                            id,
+                            artifact_type,
+                            fence_len,
+                            depth,
+                        };
                         remaining = "";
                     }
-                }
+                },
                 ArtifactDetectorState::InHtml { id, mut content } => {
                     // Check for HTML end (simple heuristic: </html> or </body>)
                     let trimmed = remaining.trim();
@@ -6151,7 +7436,17 @@ impl ArtifactDetector {
         events
     }
 
-    fn find_code_fence_start(text: &str) -> Option<(usize, usize, String)> {
+    fn is_valid_fence_indentation(indentation: &str) -> bool {
+        let trimmed = indentation.trim();
+        if trimmed.is_empty() {
+            indentation.len() <= 8
+        } else {
+            // 允许前导可选的 blockquote 引用标记（例如 ">", "> ", ">> ", "> > "）
+            trimmed.chars().all(|ch| ch == '>' || ch.is_whitespace())
+        }
+    }
+
+    fn find_code_fence_start(text: &str) -> Option<(usize, usize, usize, String)> {
         let mut search_start = 0;
         while let Some(relative_marker_start) = text[search_start..].find("```") {
             let marker_start = search_start + relative_marker_start;
@@ -6160,17 +7455,24 @@ impl ArtifactDetector {
                 .map_or(0, |index| index + 1);
             let indentation = &text[line_start..marker_start];
 
-            if indentation.len() <= 3 && indentation.chars().all(|ch| ch == ' ') {
-                let language_start = marker_start + 3;
-                let line_end = text[language_start..]
+            if Self::is_valid_fence_indentation(indentation) {
+                let fence_len = text[marker_start..]
+                    .chars()
+                    .take_while(|&ch| ch == '`')
+                    .count();
+                let after_marker = marker_start + fence_len;
+                let line_end = text[after_marker..]
                     .find('\n')
-                    .map(|index| language_start + index);
-                let language = match line_end {
-                    Some(end) => text[language_start..end].trim().to_string(),
-                    None => text[language_start..].trim().to_string(),
+                    .map(|index| after_marker + index);
+                let raw_lang = match line_end {
+                    Some(end) => text[after_marker..end].trim(),
+                    None => text[after_marker..].trim(),
                 };
-                let content_start = line_end.map_or(text.len(), |index| index + 1);
-                return Some((line_start, content_start, language));
+                if !raw_lang.contains('`') {
+                    let language = raw_lang.split_whitespace().next().unwrap_or("").to_string();
+                    let content_start = line_end.map_or(text.len(), |index| index + 1);
+                    return Some((line_start, content_start, fence_len, language));
+                }
             }
 
             search_start = marker_start + 3;
@@ -6179,7 +7481,11 @@ impl ArtifactDetector {
         None
     }
 
-    fn find_code_fence_end(text: &str) -> Option<(usize, usize)> {
+    fn find_next_fence_in_block(
+        text: &str,
+        outer_fence_len: usize,
+        current_depth: usize,
+    ) -> Option<FenceInsideBlock> {
         let mut search_start = 0;
         while let Some(relative_marker_start) = text[search_start..].find("```") {
             let marker_start = search_start + relative_marker_start;
@@ -6188,19 +7494,36 @@ impl ArtifactDetector {
                 .map_or(0, |index| index + 1);
             let indentation = &text[line_start..marker_start];
 
-            if indentation.len() <= 3 && indentation.chars().all(|ch| ch == ' ') {
-                let after_marker = marker_start + 3;
+            if Self::is_valid_fence_indentation(indentation) {
+                let cur_fence_len = text[marker_start..]
+                    .chars()
+                    .take_while(|&ch| ch == '`')
+                    .count();
+                let after_marker = marker_start + cur_fence_len;
                 let line_end = text[after_marker..]
                     .find('\n')
                     .map(|index| after_marker + index);
                 let trailing = match line_end {
-                    Some(end) => &text[after_marker..end],
-                    None => &text[after_marker..],
+                    Some(end) => text[after_marker..end].trim(),
+                    None => text[after_marker..].trim(),
                 };
 
-                if trailing.trim().is_empty() {
-                    let after_fence_line = line_end.map_or(text.len(), |index| index + 1);
-                    return Some((line_start, after_fence_line));
+                let after_fence_line = line_end.map_or(text.len(), |index| index + 1);
+
+                // CommonMark: Only fences with cur_fence_len >= outer_fence_len can close or nest
+                if cur_fence_len >= outer_fence_len {
+                    if trailing.is_empty() {
+                        if current_depth > 1 {
+                            return Some(FenceInsideBlock::InnerClose { after_fence_line });
+                        } else {
+                            return Some(FenceInsideBlock::OuterClose {
+                                line_start,
+                                after_fence_line,
+                            });
+                        }
+                    } else if !trailing.contains('`') {
+                        return Some(FenceInsideBlock::InnerOpen { after_fence_line });
+                    }
                 }
             }
 
@@ -6208,6 +7531,73 @@ impl ArtifactDetector {
         }
 
         None
+    }
+
+    fn find_structural_terminator(text: &str) -> Option<usize> {
+        let mut search_start = 0;
+        while let Some(rel_newline) = text[search_start..].find('\n') {
+            let line_start = search_start + rel_newline + 1;
+            let line_end = text[line_start..]
+                .find('\n')
+                .map_or(text.len(), |idx| line_start + idx);
+            let line = text[line_start..line_end].trim();
+            if Self::is_structural_heading(line) {
+                return Some(line_start);
+            }
+            search_start = line_start;
+        }
+        None
+    }
+
+    fn is_structural_heading(line: &str) -> bool {
+        let trimmed = line.trim();
+        let heading = trimmed.trim_start_matches(|c: char| c == '>' || c.is_whitespace());
+        if !heading.starts_with('#') {
+            return false;
+        }
+        let hashes = heading.chars().take_while(|&c| c == '#').count();
+        if hashes < 1 || hashes > 6 {
+            return false;
+        }
+        let after_hashes = &heading[hashes..];
+        if !after_hashes.starts_with(' ') && !after_hashes.starts_with('\t') {
+            return false;
+        }
+        let title = after_hashes.trim();
+        if title.is_empty() {
+            return false;
+        }
+
+        let is_doc_keyword = title.starts_with("第一")
+            || title.starts_with("第二")
+            || title.starts_with("第三")
+            || title.starts_with("第四")
+            || title.starts_with("第五")
+            || title.starts_with("第六")
+            || title.starts_with("第七")
+            || title.starts_with("第八")
+            || title.starts_with("第九")
+            || title.starts_with("第十")
+            || title.starts_with("步骤")
+            || title.starts_with("总结")
+            || title.starts_with("结论")
+            || title.starts_with("注意事项")
+            || title.starts_with("核心结论")
+            || title.starts_with("为什么")
+            || title.starts_with("如何");
+
+        let has_cjk = title
+            .chars()
+            .any(|c| ('\u{4e00}'..='\u{9fa5}').contains(&c));
+        let has_cjk_punct = title.contains('？')
+            || title.contains('！')
+            || title.contains('：')
+            || title.contains('（')
+            || title.contains('）')
+            || title.contains('?')
+            || title.contains('!');
+
+        is_doc_keyword || (has_cjk && has_cjk_punct)
     }
 
     fn is_html_start(&self, text: &str) -> bool {
@@ -6226,7 +7616,7 @@ impl ArtifactDetector {
     /// Finalize any pending artifact
     fn finish(&mut self) -> Option<ChatEvent> {
         match &self.state {
-            ArtifactDetectorState::InCodeBlock { id } => {
+            ArtifactDetectorState::InCodeBlock { id, .. } => {
                 let id = id.clone();
                 self.state = ArtifactDetectorState::Normal;
                 Some(ChatEvent::ArtifactEnd { id })
@@ -6258,6 +7648,14 @@ struct ChatRuntimeProjector {
     /// nested ```` fences) as `content`. ArtifactDetector is a WebUI widget
     /// split and must not run on that path or mixed last-turn text is lost.
     keep_raw_markdown: bool,
+    /// Stable id of the assistant message currently streaming (from
+    /// `AgentEvent::AssistantMessage`). Tags text/reasoning deltas with the same
+    /// identity the persisted `Message` carries.
+    current_message_id: Option<String>,
+    /// Monotonic per-message part counter; bumped when the streaming part KIND
+    /// changes (reasoning → text → …) so each part gets a unique `part_id`.
+    part_seq: u32,
+    last_part_kind: Option<String>,
 }
 
 impl Default for ChatRuntimeProjector {
@@ -6271,6 +7669,9 @@ impl Default for ChatRuntimeProjector {
             terminal_seen: false,
             last_error: None,
             keep_raw_markdown: false,
+            current_message_id: None,
+            part_seq: 0,
+            last_part_kind: None,
         }
     }
 }
@@ -6285,7 +7686,7 @@ impl ChatRuntimeProjector {
         use jeikcode_coding::TurnCompletion;
 
         match event {
-            CodingRuntimeEvent::Agent(event) => self.project_agent(event),
+            CodingRuntimeEvent::Agent(event) => self.project_agent(event, permission_session_id),
             CodingRuntimeEvent::Request(request) => {
                 use jeikcode_capabilities::tools::{
                     request_user_input::REQUEST_USER_INPUT_KIND, ApprovalRequest, APPROVAL_KIND,
@@ -6341,7 +7742,12 @@ impl ChatRuntimeProjector {
                     outcome.summary_would_grow(),
                 );
                 if self.keep_raw_markdown {
-                    vec![ChatEvent::TextDelta { content: text }]
+                    vec![ChatEvent::TextDelta {
+                        content: text,
+                        message_id: None,
+                        part_id: None,
+                        part_seq: None,
+                    }]
                 } else {
                     self.artifacts.process(&text)
                 }
@@ -6449,22 +7855,111 @@ impl ChatRuntimeProjector {
         }
     }
 
-    fn project_agent(&mut self, event: jeikcode_kernel::event::AgentEvent) -> Vec<ChatEvent> {
+    /// Allocate the id set for the current streaming part `kind` (bumping
+    /// `part_seq` when the kind changes). `None` ids when no assistant-message
+    /// boundary has been seen (older driver / non-boundary text such as a
+    /// compaction advisory).
+    fn next_part_stamp(&mut self, kind: &str) -> (Option<String>, Option<String>, Option<u32>) {
+        let message_id = self.current_message_id.clone();
+        if self.last_part_kind.as_deref() != Some(kind) {
+            self.part_seq += 1;
+            self.last_part_kind = Some(kind.to_string());
+        }
+        let has_id = message_id.is_some();
+        let part_id = message_id
+            .as_ref()
+            .map(|m| format!("{m}:{}:{kind}", self.part_seq));
+        (message_id, part_id, has_id.then_some(self.part_seq))
+    }
+
+    /// Close the current streaming part so the next delta opens a fresh one.
+    /// Called on tool boundaries: a tool ends the prose run, and the run after it
+    /// must carry its own `part_id` or a replay cannot converge them separately.
+    fn end_streaming_part(&mut self) {
+        self.last_part_kind = None;
+    }
+
+    fn project_agent(
+        &mut self,
+        event: jeikcode_kernel::event::AgentEvent,
+        session_id: &str,
+    ) -> Vec<ChatEvent> {
         use jeikcode_kernel::event::AgentEvent as Agent;
 
         match event {
+            Agent::AssistantMessage { message_id } => {
+                // Boundary marker: tag subsequent deltas with this identity.
+                self.current_message_id = Some(message_id);
+                self.part_seq = 0;
+                self.last_part_kind = None;
+                Vec::new()
+            }
+            Agent::UserMessage {
+                message_id,
+                turn_ordinal,
+            } => {
+                // Identity-only boundary: the `user` echo already painted the
+                // bubble; this binds it to the stored message id.
+                vec![ChatEvent::UserIdentified {
+                    message_id,
+                    turn_ordinal,
+                }]
+            }
             Agent::TextDelta(text) => {
-                if self.keep_raw_markdown {
-                    vec![ChatEvent::TextDelta { content: text }]
+                let (message_id, part_id, part_seq) = self.next_part_stamp("text");
+                let mut events = if self.keep_raw_markdown {
+                    vec![ChatEvent::TextDelta {
+                        content: text,
+                        message_id: message_id.clone(),
+                        part_id: part_id.clone(),
+                        part_seq,
+                    }]
                 } else {
                     self.artifacts.process(&text)
+                };
+                // ArtifactDetector emits TextDelta without ids — stamp them here.
+                for ev in events.iter_mut() {
+                    if let ChatEvent::TextDelta {
+                        message_id: m,
+                        part_id: p,
+                        part_seq: s,
+                        ..
+                    } = ev
+                    {
+                        if m.is_none() {
+                            *m = message_id.clone();
+                        }
+                        if p.is_none() {
+                            *p = part_id.clone();
+                        }
+                        if s.is_none() {
+                            *s = part_seq;
+                        }
+                    }
                 }
+                events
             }
-            Agent::Reasoning(content) => vec![ChatEvent::ReasoningDelta { content }],
+            Agent::Reasoning(content) => {
+                let (message_id, part_id, part_seq) = self.next_part_stamp("reasoning");
+                vec![ChatEvent::ReasoningDelta {
+                    content,
+                    message_id,
+                    part_id,
+                    part_seq,
+                }]
+            }
             Agent::ToolBatchStarted { calls, .. } => {
+                // A tool batch closes the current prose run: the next delta must open a
+                // NEW part id. Sharing one part id across a tool boundary makes pre- and
+                // post-tool prose indistinguishable on replay, so the browser cannot
+                // converge the part in place and re-appends it instead.
+                self.end_streaming_part();
                 vec![ChatEvent::ToolBatchStarted { calls }]
             }
-            Agent::ToolStarted { call } => self.project_tool_started(call),
+            Agent::ToolStarted { call } => {
+                self.end_streaming_part();
+                self.project_tool_started(call)
+            }
             Agent::ToolProgress { call_id, message } => {
                 if let Some(progress) = message.strip_prefix('\u{1e}') {
                     vec![ChatEvent::ToolProgress {
@@ -6529,8 +8024,68 @@ impl ChatRuntimeProjector {
                 if let Some(event) = self.finish() {
                     events.push(event);
                 }
-                events.push(ChatEvent::Steered { count, inputs });
+                events.push(ChatEvent::Steered {
+                    count,
+                    inputs,
+                    client_input_ids: Vec::new(),
+                });
                 events
+            }
+            Agent::CompactionStarted { .. } => {
+                crate::publish_global(crate::GlobalWireEvent::Activity {
+                    session_id: session_id.to_string(),
+                    running: true,
+                    terminal: None,
+                    status: Some("compacting".to_string()),
+                });
+                vec![ChatEvent::SessionStatus {
+                    session_id: session_id.to_string(),
+                    status: "compacting".to_string(),
+                }]
+            }
+            Agent::Compacted {
+                removed,
+                bytes_before,
+                bytes_after,
+                committed: true,
+                ..
+            } => {
+                crate::publish_global(crate::GlobalWireEvent::Activity {
+                    session_id: session_id.to_string(),
+                    running: true,
+                    terminal: None,
+                    status: None,
+                });
+                let est_before = (bytes_before as f32 / 3.5).ceil() as usize;
+                let est_after = (bytes_after as f32 / 3.5).ceil() as usize;
+                vec![
+                    ChatEvent::SessionStatus {
+                        session_id: session_id.to_string(),
+                        status: "running".to_string(),
+                    },
+                    ChatEvent::Warning {
+                        message: jeikcode_config::i18n::format_compaction_mark(
+                            removed, est_before, est_after,
+                        ),
+                    },
+                ]
+            }
+            Agent::CompactionFailed { error, .. } => {
+                crate::publish_global(crate::GlobalWireEvent::Activity {
+                    session_id: session_id.to_string(),
+                    running: true,
+                    terminal: None,
+                    status: None,
+                });
+                vec![
+                    ChatEvent::SessionStatus {
+                        session_id: session_id.to_string(),
+                        status: "running".to_string(),
+                    },
+                    ChatEvent::Warning {
+                        message: format!("Compaction failed: {error}"),
+                    },
+                ]
             }
             Agent::TurnStarted
             | Agent::ToolCallStreaming { .. }
@@ -6539,9 +8094,7 @@ impl ChatRuntimeProjector {
             | Agent::Snapshot { .. }
             | Agent::TurnComplete { .. }
             | Agent::Cancelled
-            | Agent::CompactionStarted { .. }
-            | Agent::Compacted { .. }
-            | Agent::CompactionFailed { .. } => Vec::new(),
+            | Agent::Compacted { .. } => Vec::new(),
             _ => Vec::new(),
         }
     }
@@ -6556,11 +8109,21 @@ impl ChatRuntimeProjector {
             id: call.id,
             name: call.name.clone(),
             arguments: call.arguments.clone(),
+            message_id: self.current_message_id.clone(),
         }];
 
-        if !self.keep_raw_markdown && (call.name == "create_file" || call.name == "edit_file") {
+        if !self.keep_raw_markdown
+            && matches!(
+                call.name.as_str(),
+                "write" | "write_file" | "create_file" | "edit" | "edit_file"
+            )
+        {
             if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
-                if let Some(path) = args.get("file_path").and_then(|value| value.as_str()) {
+                if let Some(path) = args
+                    .get("path")
+                    .or_else(|| args.get("file_path"))
+                    .and_then(|value| value.as_str())
+                {
                     let artifact_type = if path.ends_with(".html") || path.ends_with(".htm") {
                         "html"
                     } else if path.ends_with(".svg") {
@@ -6580,6 +8143,7 @@ impl ChatRuntimeProjector {
                                 artifact_type: artifact_type.to_string(),
                                 language: Some("html".to_string()),
                                 title,
+                                fence_len: 3,
                             });
                             events.push(ChatEvent::ArtifactContent {
                                 id: id.clone(),
@@ -6678,6 +8242,7 @@ async fn chat_stream(
         event_bus,
         replay,
         req.session_id.clone(),
+        req.working_dir.clone(),
     );
 
     // Clone state for the spawned task
@@ -6901,7 +8466,8 @@ async fn process_chat_request(
     terminal_sent: Arc<std::sync::atomic::AtomicBool>,
     keep_raw_markdown: bool,
 ) -> anyhow::Result<()> {
-    let approval_mode = effective_chat_approval_mode(req.approval_mode);
+    let approval_mode =
+        effective_chat_approval_mode_scoped(req.approval_mode, req.session_id.as_deref());
     // Load config
     let config = jeikcode_config::ConfigStore::default_store().read()?.config;
     jeikcode_config::proxy::apply_process_proxy_config(&config.network.proxy);
@@ -7172,7 +8738,21 @@ async fn process_chat_request(
         ..ChatRuntimeProjector::default()
     };
     while let Some(event) = runtime_event_rx.recv().await {
-        for chat_event in projector.project_runtime(event, &perm_session_key) {
+        for mut chat_event in projector.project_runtime(event, &perm_session_key) {
+            // Echo the recorded client correlation ids on a steer fold, so the
+            // WebUI can reconcile an in-flight steer (id → persisted message).
+            if let ChatEvent::Steered {
+                count,
+                client_input_ids,
+                ..
+            } = &mut chat_event
+            {
+                if client_input_ids.is_empty() {
+                    *client_input_ids = active_chats
+                        .take_steer_client_ids(&operation_id, *count)
+                        .await;
+                }
+            }
             if matches!(
                 chat_event,
                 ChatEvent::Done { .. } | ChatEvent::Error { .. } | ChatEvent::Stopped
@@ -7297,7 +8877,121 @@ struct StopChatRequest {
 #[derive(Debug, Serialize)]
 struct StopChatResponse {
     success: bool,
+    /// Authoritative release verdict for callers that aim to start a new turn
+    /// right after stopping (WebUI send-now): the compat registry slot is free
+    /// **and** no native-runtime turn still occupies the session.
+    released: bool,
     message: String,
+}
+
+/// One `/chat/watch` replay frame.
+///
+/// `seq` is the frame's position in the turn replay buffer (the resume cursor).
+/// Only REPLAYED frames carry it: a frame without `seq` is a live delta and is
+/// always new to the client. The browser stores the highest `seq` it applied and
+/// sends it back as `after_seq` on reconnect, so a reconnect never re-paints what
+/// is already on screen (and never has to guess by content).
+fn chat_watch_frame_json(event: &ChatEvent, session_id: &str, seq: Option<u64>) -> String {
+    let mut val = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);
+    if let serde_json::Value::Object(ref mut map) = val {
+        if !map.contains_key("session_id") {
+            map.insert(
+                "session_id".to_string(),
+                serde_json::Value::String(session_id.to_string()),
+            );
+        }
+        if let Some(seq) = seq {
+            map.insert("seq".to_string(), serde_json::Value::Number(seq.into()));
+        }
+    }
+    serde_json::to_string(&val).unwrap_or_default()
+}
+
+/// Handshake for `after_seq = -1` (a brand-new session / empty canvas).
+///
+/// There is nothing to catch up on, so the server skips the replay entirely and
+/// only tells the client where the cursor starts; every later frame is live.
+fn chat_watch_session_start_json(session_id: &str, cursor: u64) -> String {
+    serde_json::json!({
+        "type": "session_start",
+        "session_id": session_id,
+        "cursor": cursor,
+    })
+    .to_string()
+}
+
+#[cfg(test)]
+mod chat_watch_frame_tests {
+    use super::*;
+
+    fn text_delta() -> ChatEvent {
+        ChatEvent::TextDelta {
+            content: "正文 2".into(),
+            message_id: Some("m-round-2".into()),
+            part_id: Some("m-round-2:2:text".into()),
+            part_seq: Some(2),
+        }
+    }
+
+    #[test]
+    fn replayed_frames_carry_the_cursor_and_live_frames_do_not() {
+        let replayed: serde_json::Value =
+            serde_json::from_str(&chat_watch_frame_json(&text_delta(), "s-1", Some(7))).unwrap();
+        assert_eq!(replayed["seq"], serde_json::Value::Number(7.into()));
+        assert_eq!(replayed["type"], "text");
+        assert_eq!(replayed["session_id"], "s-1");
+        assert_eq!(replayed["part_id"], "m-round-2:2:text");
+
+        // A live delta carries no cursor: it is always new, never re-painted.
+        let live: serde_json::Value =
+            serde_json::from_str(&chat_watch_frame_json(&text_delta(), "s-1", None)).unwrap();
+        assert!(live.get("seq").is_none());
+        assert_eq!(live["content"], "正文 2");
+    }
+
+    #[test]
+    fn session_start_handshake_carries_the_starting_cursor() {
+        let handshake: serde_json::Value =
+            serde_json::from_str(&chat_watch_session_start_json("s-1", 42)).unwrap();
+        assert_eq!(handshake["type"], "session_start");
+        assert_eq!(handshake["session_id"], "s-1");
+        assert_eq!(handshake["cursor"], serde_json::Value::Number(42.into()));
+    }
+}
+
+#[cfg(test)]
+mod chat_part_identity_tests {
+    use super::*;
+
+    #[test]
+    fn tool_boundary_opens_a_new_text_part() {
+        use jeikcode_kernel::event::AgentEvent as Agent;
+        let mut projector = ChatRuntimeProjector::default();
+        projector.project_agent(
+            Agent::AssistantMessage {
+                message_id: "m-1".into(),
+            },
+            "sess-1",
+        );
+        let part_of = |events: Vec<ChatEvent>| match events.into_iter().next() {
+            Some(ChatEvent::TextDelta { part_id, .. }) => part_id.unwrap_or_default(),
+            other => panic!("expected a text delta, got {other:?}"),
+        };
+        let before = part_of(projector.project_agent(Agent::TextDelta("正文 1".into()), "sess-1"));
+        projector.project_agent(
+            Agent::ToolBatchStarted {
+                batch_id: "b1".into(),
+                calls: Vec::new(),
+            },
+            "sess-1",
+        );
+        let after = part_of(projector.project_agent(Agent::TextDelta("正文 2".into()), "sess-1"));
+        assert_eq!(before, "m-1:1:text");
+        // Sharing one part id across a tool boundary makes the two prose runs
+        // indistinguishable on replay: the browser then re-appends instead of
+        // converging the part in place.
+        assert_eq!(after, "m-1:2:text");
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -7308,6 +9002,12 @@ struct ChatWatchQuery {
     /// armed the stop button and blinking cursor on completed sessions.
     #[serde(default)]
     standby: bool,
+    /// 断点续传游标：
+    /// - `-1`：我没有缓存（新会话/空画布）→ 不补发，只回一条 `session_start`；
+    /// - `N`：只补 `seq >= N` 的回放帧，然后转实时；
+    /// - 缺省：全量补发（无游标兜底，前端按身份幂等收敛）。
+    #[serde(default)]
+    after_seq: Option<i64>,
 }
 
 /// GET /chat/watch?session_id=… — reattach to a turn owned by another client.
@@ -7333,6 +9033,14 @@ async fn chat_watch(
     }
 
     let (tx, rx) = mpsc::unbounded_channel::<ChatEvent>();
+    // 断点续传：回放帧带 seq（回合缓冲序号 = 游标），实时帧不带。
+    // 帧语义由「这次连接请求了什么」决定 —— 前端自己就知道，不需要逐帧猜：
+    //   after_seq = -1 → 新会话/空画布：不补发，只回 session_start 后转实时
+    //   after_seq = N  → 只补 seq >= N 的回放帧，然后转实时
+    //   缺省           → 全量补发（无游标兜底，前端按身份幂等收敛）
+    let mut replay_head: Vec<(u64, ChatEvent)> = Vec::new();
+    let mut handshake: Option<String> = None;
+    let mut buffer_len = 0u64;
     // Prefer atomic snapshot+subscribe when a turn is live so a mid-stream
     // browser refresh gets the full thinking/text/tool history, not only
     // deltas after reconnect. Idle standby watchers skip this so a leftover
@@ -7343,45 +9051,83 @@ async fn chat_watch(
             .subscribe_live_with_replay(&session_id)
             .await
         {
+            buffer_len = snapshot.iter().map(|(seq, _)| *seq).max().unwrap_or(0);
             tracing::debug!(
                 session_id = %session_id,
                 replay_events = snapshot.len(),
+                after_seq = ?q.after_seq,
                 "chat_watch: LIVE with replay"
             );
-            tokio::spawn(async move {
-                for event in snapshot {
-                    let terminal = matches!(
-                        event,
-                        ChatEvent::Done { .. } | ChatEvent::Error { .. } | ChatEvent::Stopped
-                    );
-                    if tx.send(event).is_err() {
-                        return;
-                    }
-                    if terminal {
-                        return;
-                    }
-                }
-                loop {
-                    match bus_rx.recv().await {
-                        Ok(event) => {
-                            let terminal = matches!(
-                                event,
-                                ChatEvent::Done { .. }
-                                    | ChatEvent::Error { .. }
-                                    | ChatEvent::Stopped
-                            );
-                            if tx.send(event).is_err() {
-                                break;
-                            }
-                            if terminal {
-                                break;
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            let maybe_user = snapshot
+                .iter()
+                .find(|(_, e)| matches!(e, ChatEvent::User { .. }))
+                .cloned();
+
+            match q.after_seq {
+                Some(-1) => {
+                    // 新会话：画布本来就是空的，补发毫无意义；只给一个起始游标。
+                    // 但是如果本轮存在活跃用户提问，必须在头部送达，防止刷新后用户提问丢失！
+                    handshake = Some(chat_watch_session_start_json(&session_id, buffer_len));
+                    if let Some(user) = maybe_user {
+                        replay_head = vec![user];
                     }
                 }
+                // 游标有效（没越过缓冲末尾）：只补它之后的帧。
+                // 核心防线：当前回合的活跃用户提问（ChatEvent::User）必须始终放在头部，
+                // 绝不受 after_seq 过滤丢弃，确保断线重连或 F5 刷新后用户消息绝不丢失！
+                Some(after) if after >= 0 && (after as u64) <= buffer_len => {
+                    let mut filtered: Vec<(u64, ChatEvent)> = snapshot
+                        .into_iter()
+                        .filter(|(seq, e)| {
+                            !matches!(e, ChatEvent::User { .. }) && *seq >= after as u64
+                        })
+                        .collect();
+                    if let Some(user) = maybe_user {
+                        filtered.insert(0, user);
+                    }
+                    replay_head = filtered;
+                }
+                // 无游标，或游标已失效（换设备 / 清缓存 / 新回合）：全量补发。
+                _ => replay_head = snapshot,
+            }
+            // 终态已在补发里：截到终态为止，且绝不再挂实时总线。
+            let terminal_at = replay_head.iter().position(|(_, event)| {
+                matches!(
+                    event,
+                    ChatEvent::Done { .. } | ChatEvent::Error { .. } | ChatEvent::Stopped
+                )
             });
+            if let Some(cut) = terminal_at {
+                replay_head.truncate(cut + 1);
+            }
+            if terminal_at.is_none() {
+                tokio::spawn(async move {
+                    loop {
+                        match bus_rx.recv().await {
+                            Ok(event) => {
+                                let terminal = matches!(
+                                    event,
+                                    ChatEvent::Done { .. }
+                                        | ChatEvent::Error { .. }
+                                        | ChatEvent::Stopped
+                                );
+                                if tx.send(event).is_err() {
+                                    break;
+                                }
+                                if terminal {
+                                    break;
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                });
+            } else {
+                // No live pump: drop the sender so the SSE stream ends cleanly
+                // after the replayed terminal instead of hanging on keepalive.
+                drop(tx);
+            }
         } else {
             match state
                 .active_chats
@@ -7485,20 +9231,41 @@ async fn chat_watch(
 
     let active_conns = state.active_connections.clone();
     active_conns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let stream_session_id = session_id.clone();
-    let stream = UnboundedReceiverStream::new(rx).map(move |event| {
-        let mut val = serde_json::to_value(&event).unwrap_or(serde_json::Value::Null);
-        if let serde_json::Value::Object(ref mut map) = val {
-            if !map.contains_key("session_id") {
-                map.insert(
-                    "session_id".to_string(),
-                    serde_json::Value::String(stream_session_id.clone()),
-                );
-            }
-        }
-        let json = serde_json::to_string(&val).unwrap_or_default();
+    let head_session_id = session_id.clone();
+    let live_session_id = session_id.clone();
+    // 补发/握手帧在前（带 seq），实时帧在后（同样携带单调递增 seq）。
+    // 前端每收到一帧就实时推进本地游标，断线/刷新重连带回来续传 —— 精准无缝续接，不重复、不重播！
+    let last_head_seq = replay_head
+        .iter()
+        .map(|(seq, _)| *seq)
+        .max()
+        .unwrap_or(buffer_len);
+
+    let head_json: Vec<String> = handshake
+        .into_iter()
+        .chain(
+            replay_head
+                .iter()
+                .map(|(seq, event)| chat_watch_frame_json(event, &head_session_id, Some(*seq))),
+        )
+        .collect();
+    let head_stream = futures::stream::iter(head_json).map(|json| {
         Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(json))
     });
+
+    let live_seq_counter =
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(last_head_seq + 1));
+    let live_stream = UnboundedReceiverStream::new(rx).map(move |event| {
+        let seq = live_seq_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok::<_, std::convert::Infallible>(
+            axum::response::sse::Event::default().data(chat_watch_frame_json(
+                &event,
+                &live_session_id,
+                Some(seq),
+            )),
+        )
+    });
+    let stream = head_stream.chain(live_stream);
     let conn_guard = SseConnectionGuard(active_conns);
     let guarded = stream.chain(futures::stream::once(async move {
         drop(conn_guard);
@@ -7533,14 +9300,27 @@ async fn stop_chat(
     let state_clone = state.clone();
     daemon_scope(&state, session_uuid, client_mode, || async move {
         let resolved_session_id = state_clone.active_chats.session_id(&req.session_id).await;
-        let stopped_alias = state_clone.active_chats.stop_alias(&req.session_id).await;
+        // 与「停止按钮同源」的停止：无上限等待该会话的 compat 运行中操作真正离场。
+        // 正常路径下与“秒停”同步完成，固定上限反而会把正在收尾的回合误报成占用。
+        let stopped_alias = state_clone
+            .active_chats
+            .stop_and_wait(req.session_id.clone(), None)
+            .await;
         let mut stopped_reg = crate::native_live::cancel_via_registry(&req.session_id).is_ok();
         if let Some(ref sid) = resolved_session_id {
             if sid != &req.session_id {
                 stopped_reg = crate::native_live::cancel_via_registry(sid).is_ok() || stopped_reg;
             }
         }
-        jeikcode_capabilities::tools::legacy_bash_runtime_state().cancel_all_live_bash();
+        jeikcode_capabilities::tools::legacy_bash_runtime_state().cancel_foreground_live_bash();
+        // 调用方（WebUI「立即发送」）能否安全紧接一个新回合的权威结论：
+        // compat 槽位已确认释放，且该会话（或它绑定的 canonical id）没有任何
+        // native runtime 回合仍在占用——后者只能异步取消，不能在此处宣称已释放。
+        let released = stopped_alias
+            && !crate::native_live::live_turn_running(&req.session_id)
+            && resolved_session_id.as_deref().map_or(true, |sid| {
+                sid == req.session_id || !crate::native_live::live_turn_running(sid)
+            });
         if stopped_alias || stopped_reg {
             state_clone.telemetry.track(Event::UseCommand {
                 type_: "stop".into(),
@@ -7552,6 +9332,7 @@ async fn stop_chat(
                 axum::http::StatusCode::OK,
                 Json(StopChatResponse {
                     success: true,
+                    released,
                     message: format!("Chat session {} stopped", req.session_id),
                 }),
             )
@@ -7566,6 +9347,7 @@ async fn stop_chat(
                 axum::http::StatusCode::OK,
                 Json(StopChatResponse {
                     success: true,
+                    released,
                     message: format!("Chat session {} was not running", req.session_id),
                 }),
             )
@@ -7582,6 +9364,10 @@ struct ChatSteerRequest {
     message: String,
     #[serde(default)]
     images: Vec<ImageInput>,
+    /// Client correlation id (opaque). Echoed on the `steered` wire event so the
+    /// WebUI can promote an optimistic steer to the persisted message by id.
+    #[serde(default)]
+    client_input_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -7739,6 +9525,12 @@ async fn chat_steer(
             }),
         );
     };
+    // Record the client correlation id BEFORE submitting, so a fast round-boundary
+    // fold cannot emit `steered` before the id is available to echo.
+    state
+        .active_chats
+        .record_steer_client_id(&req.session_id, req.client_input_id.clone())
+        .await;
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     let pending = live_api::PendingChatSteer {
         text: steer_prompt::compose_steer_text(&req.message),
@@ -8323,6 +10115,12 @@ fn merge_configured_mcp_statuses(
 }
 
 async fn mcp_status(State(state): State<AppState>) -> Json<McpStatusResponse> {
+    Json(build_mcp_status(&state).await)
+}
+
+/// Build the full MCP status response. Shared by `GET /mcp/status` and the MCP half
+/// of `GET /capabilities`.
+async fn build_mcp_status(state: &AppState) -> McpStatusResponse {
     // Agent `jeikcode_config_reload` dirties the daemon MCP cache; rebuild it
     // here so the WebUI sidebar reflects newly written mcp.json. Live-runtime
     // remount happens at TurnFinished (reload_capabilities is Busy mid-turn).
@@ -8416,11 +10214,11 @@ async fn mcp_status(State(state): State<AppState>) -> Json<McpStatusResponse> {
         tools.extend(session_schema.tools);
     }
     let servers = build_mcp_server_rows(statuses, &tools);
-    Json(McpStatusResponse {
+    McpStatusResponse {
         servers,
         trusted,
         blocked,
-    })
+    }
 }
 
 /// Build the `/mcp` status server rows from raw registry statuses.
@@ -8518,6 +10316,128 @@ async fn mcp_reload(State(state): State<AppState>) -> Json<serde_json::Value> {
         "status": "reloading",
         "runtime_reloaded": runtime_reloaded,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Unified capability surface (MCP + skills, GLOBAL + PROJECT scopes)
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize)]
+struct CapItemResponse {
+    kind: &'static str,
+    id: String,
+    name: String,
+    description: String,
+    global_disabled: bool,
+    project_disabled: bool,
+    effective_disabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dir: Option<String>,
+}
+
+/// Bare skill name without its namespace prefix (`skills:foo` → `foo`).
+fn bare_skill_name(name: &str) -> &str {
+    name.rsplit_once(':').map(|(_, bare)| bare).unwrap_or(name)
+}
+
+/// GET /capabilities — unified MCP + skills inventory with per-scope disable state.
+/// The WebUI renders ONE toggle component for both families, so switching projects
+/// surfaces each project's own disable differences.
+async fn capabilities(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let working_dir = { state.project.read().await.working_dir.clone() };
+
+    // MCP: disable state from mcp.json (global + project), enriched with live status.
+    let mcp_status = build_mcp_status(&state).await;
+    let mut items: Vec<CapItemResponse> = Vec::new();
+    for item in jeikcode_capabilities::control::mcp_items(&working_dir) {
+        let row = mcp_status
+            .servers
+            .iter()
+            .find(|s| s.name == item.id && !item.effective_disabled);
+        items.push(CapItemResponse {
+            kind: "mcp",
+            id: item.id,
+            name: item.name,
+            description: item.description,
+            global_disabled: item.global_disabled,
+            project_disabled: item.project_disabled,
+            effective_disabled: item.effective_disabled,
+            status: row.map(|r| r.status.clone()),
+            tool_count: row.and_then(|r| r.tool_count),
+            error: row.and_then(|r| r.error.clone()),
+            dir: None,
+        });
+    }
+
+    // Skills: disable state from skills.json (global + project).
+    let mut registry = jeikcode_capabilities::skills::SkillRegistry::new();
+    jeikcode_capabilities::plugin::loader::reload_skill_registry(&mut registry, &working_dir);
+    let global = jeikcode_capabilities::skills::controls::load_global();
+    let project = jeikcode_capabilities::skills::controls::load_project(&working_dir);
+    for skill in registry.user_invocable() {
+        let global_disabled =
+            jeikcode_capabilities::skills::controls::is_skill_disabled(&global, &skill.name);
+        let project_disabled =
+            jeikcode_capabilities::skills::controls::is_skill_disabled(&project, &skill.name);
+        items.push(CapItemResponse {
+            kind: "skill",
+            id: skill.name.clone(),
+            name: bare_skill_name(&skill.name).to_string(),
+            description: skill.description.clone(),
+            global_disabled,
+            project_disabled,
+            effective_disabled: global_disabled || project_disabled,
+            status: None,
+            tool_count: None,
+            error: None,
+            dir: Some(skill.skill_dir.to_string_lossy().to_string()),
+        });
+    }
+
+    Json(serde_json::json!({ "items": items }))
+}
+
+#[derive(serde::Deserialize)]
+struct CapToggleRequest {
+    kind: jeikcode_capabilities::control::CapKind,
+    id: String,
+    scope: jeikcode_capabilities::control::CapScope,
+    disabled: bool,
+}
+
+/// POST /capabilities/toggle — persist a capability's disabled flag at the chosen
+/// scope, then rebuild capabilities (MCP registry + live runtime + skills) so the
+/// change lands in the VERY NEXT prompt.
+async fn capabilities_toggle(
+    State(state): State<AppState>,
+    Json(req): Json<CapToggleRequest>,
+) -> axum::response::Response {
+    let working_dir = { state.project.read().await.working_dir.clone() };
+    if let Err(error) = jeikcode_capabilities::control::set_disabled(
+        &working_dir,
+        req.kind,
+        &req.id,
+        req.scope,
+        req.disabled,
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": error })),
+        )
+            .into_response();
+    }
+    let runtime_reloaded = reload_mcp_and_live_runtime(&state).await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "runtime_reloaded": runtime_reloaded })),
+    )
+        .into_response()
 }
 
 /// Wait for the first shutdown signal (Ctrl-C, SIGTERM on Unix, or watch channel).
@@ -9009,8 +10929,21 @@ pub async fn ensure_webui_with_repair_backend(
     // - 绑定到具体非回环地址（如 Tailscale 100.x）时，socket 只监听那一个地址，127.0.0.1 不在
     //   监听集合内，用它打开会 ERR_CONNECTION_REFUSED。此时必须用真实绑定地址打开。
     let is_wildcard = bound_host == "0.0.0.0" || bound_host == "::" || bound_host == "[::]";
+    // 桌面窗口只用 127.0.0.1。先把这条地址刷出 stderr，再去做局域网探测，
+    // 避免第一次启动时 UDP 选路或防火墙提示把启动页卡住。
+    if std::env::var_os("JEIKCODE_DESKTOP").is_some() {
+        let mut early = format!("http://127.0.0.1:{actual_port}/?token={token}");
+        if let Some(id) = session_id.map(str::trim).filter(|id| !id.is_empty()) {
+            let short: String = id.chars().take(8).collect();
+            early.push_str("&session=");
+            early.push_str(&short);
+        }
+        eprintln!("webui 已启动：{early}");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+    }
     // 通配绑定（用户意在暴露到网络）时探测本机局域网/公网 IP（优先 IPv4，回退 IPv6）。
-    let lan_ip = if is_wildcard {
+    // 桌面壳自己改写到 127.0.0.1，探测只增加启动等待，第一次还可能弹出防火墙提示。
+    let lan_ip = if is_wildcard && std::env::var_os("JEIKCODE_DESKTOP").is_none() {
         primary_lan_ipv4().or_else(primary_lan_ipv6)
     } else {
         None
@@ -9409,6 +11342,11 @@ async fn get_skills(State(state): State<AppState>) -> impl IntoResponse {
     // SkillRegistry remains independent of plugin storage.
     let mut registry = jeikcode_capabilities::skills::SkillRegistry::new();
     jeikcode_capabilities::plugin::loader::reload_skill_registry(&mut registry, &working_dir);
+    // Honor the persisted GLOBAL/PROJECT disable state — the same set the prompt
+    // catalog and the sidebar capability list use, so all three agree.
+    registry.retain_enabled(&jeikcode_capabilities::skills::controls::load_disabled(
+        &working_dir,
+    ));
     let skills: Vec<SkillInfo> = registry
         .user_invocable()
         .map(|s| SkillInfo {
@@ -9484,14 +11422,18 @@ pub fn list_system_shortcuts() -> Vec<FsShortcut> {
             path: home_clean.to_string_lossy().to_string(),
         });
 
-        let desktop = home.join("Desktop");
-        if desktop.is_dir() {
-            let clean = jeikcode_capabilities::pathnorm::strip_verbatim_path(&desktop);
-            shortcuts.push(FsShortcut {
-                id: "desktop",
-                name: "Desktop",
-                path: clean.to_string_lossy().to_string(),
-            });
+        // 桌面：与 shell `$DESKTOP` / 内置工具 `$DESKTOP` 同源解析（Windows 走 OS Known
+        // Folder / 注册表 `User Shell Folders\Desktop`，重定向与 OneDrive 桌面均已生效），
+        // 不再假设 `~/Desktop`。
+        if let Some(desktop) = jeikcode_capabilities::special_dirs::desktop_dir() {
+            if desktop.is_dir() {
+                let clean = jeikcode_capabilities::pathnorm::strip_verbatim_path(&desktop);
+                shortcuts.push(FsShortcut {
+                    id: "desktop",
+                    name: "Desktop",
+                    path: clean.to_string_lossy().to_string(),
+                });
+            }
         }
 
         let downloads = home.join("Downloads");
@@ -10079,6 +12021,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         pending_user_inputs: permission_bridge::UserInputResponders::new(),
         bind_host: host.clone(),
         bind_port: port,
+        bind_working_dir: initial_mcp_project.clone(),
         // `port` here is the ACTUAL bound port (the enforce_token=true webui path
         // pre-binds via `bind_scanning` and passes its `local_addr` port), so two
         // instances get distinct cookie names.
@@ -10141,6 +12084,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
             get(get_session_freshness),
         )
         .route(
+            "/projects/:hash/sessions/:id/lineage",
+            get(get_session_lineage),
+        )
+        .route(
             "/projects/:hash/sessions/:id",
             get(get_session_detail).delete(delete_session),
         )
@@ -10154,6 +12101,11 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
             "/projects/:hash/sessions/:id/truncate",
             post(truncate_session),
         )
+        .route(
+            "/projects/:hash/sessions/:id/fork",
+            post(fork_session),
+        )
+        .route("/sessions/:id/fork", post(fork_session_by_id))
         // Model API
         .route("/models", get(get_models))
         // Chat API
@@ -10182,6 +12134,9 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/chat/pending", get(chat_pending))
         // Reattach to a turn started by another client (OpenAI API / another tab).
         .route("/chat/watch", get(chat_watch))
+        // 跨实例增量推送（会话行/活动/待交互卡片）——所有实例共用的唯一全局信道。
+        // 经 helper 挂载：与路由级测试共用同一份定义。
+        .merge(with_global_events_route(Router::<AppState>::new()))
         .route("/chat/permission", post(chat_permission))
         .route("/chat/user-input", post(chat_user_input))
         // OpenAI / Anthropic compatible surface (same token gate as /chat).
@@ -10218,7 +12173,11 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/tunnel/status", get(get_tunnel_status))
         // Live session API (阶段②)
         .route("/live", get(live_api::live_stream))
-        .route("/live/message", post(live_api::live_message))
+        .route(
+            "/live/message",
+            post(live_api::live_message)
+                .layer(DefaultBodyLimit::max(CHAT_REQUEST_BODY_LIMIT_BYTES)),
+        )
         .route("/live/stop", post(live_api::live_stop))
         .route("/live/permission", post(live_api::live_permission))
         .route("/live/user-input", post(live_api::live_user_input))
@@ -10271,6 +12230,9 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/api/mcp", get(mcp_status))
         .route("/api/mcp/status", get(mcp_status))
         .route("/api/mcp/reload", post(mcp_reload))
+        // Unified capability surface (MCP + skills, GLOBAL + PROJECT scopes)
+        .route("/capabilities", get(capabilities))
+        .route("/capabilities/toggle", post(capabilities_toggle))
         // Config API (P0)
         .route("/config", get(api_config::get_config))
         .route("/config/reload", post(api_config::reload_config))
@@ -10390,6 +12352,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         println!("  POST   /projects/sidebar/reveal        - Unhide a project (live activity)");
         println!("  GET    /projects/:hash/sessions        - List sessions in a project");
         println!("  GET    /projects/:hash/sessions/:id    - Get session detail");
+        println!("  GET    /projects/:hash/sessions/:id/lineage - Get fork lineage and branches");
         println!("  DELETE /projects/:hash/sessions/:id    - Delete a session");
         println!("  PATCH  /projects/:hash/sessions/:id/rename - Rename a session");
         println!("  POST   /projects/:hash/sessions/:id/repair - Inspect or repair a session");
@@ -11037,6 +13000,20 @@ mod tests {
         assert!(!body.error.contains("unexpected storage failure"));
     }
 
+    #[tokio::test]
+    async fn get_session_lineage_rejects_invalid_project_and_reports_not_found() {
+        let invalid_resp = get_session_lineage(Path(("../invalid".into(), "s1".into())))
+            .await
+            .into_response();
+        assert_eq!(invalid_resp.status(), StatusCode::BAD_REQUEST);
+
+        let not_found_resp =
+            get_session_lineage(Path(("0123456789abcdef".into(), "nonexistent_session".into())))
+                .await
+                .into_response();
+        assert_eq!(not_found_resp.status(), StatusCode::NOT_FOUND);
+    }
+
     #[test]
     fn session_repair_dry_run_does_not_write_and_apply_restores_strict_load() {
         use jeikcode_capabilities::session::{PresentationFile, SessionMeta, StorageOwner};
@@ -11166,8 +13143,11 @@ mod tests {
 
     pub(crate) struct ScopedChatHome {
         _lock: std::sync::MutexGuard<'static, ()>,
-        previous: Option<std::ffi::OsString>,
         _dir: tempfile::TempDir,
+        /// Thread-local home override instead of `set_var("JEIKCODE_HOME")`:
+        /// runtime env stays constant (the resolved-once production path depends
+        /// on that) and parallel tests keep the real home.
+        _home: jeikcode_config::test_util::IsolatedHome,
     }
 
     impl ScopedChatHome {
@@ -11175,22 +13155,12 @@ mod tests {
             let lock = jeikcode_home_test_lock()
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            let previous = std::env::var_os("JEIKCODE_HOME");
             let dir = tempfile::tempdir().expect("chat test home");
-            std::env::set_var("JEIKCODE_HOME", dir.path());
+            let home = jeikcode_config::test_util::IsolatedHome::at(dir.path());
             Self {
                 _lock: lock,
-                previous,
                 _dir: dir,
-            }
-        }
-    }
-
-    impl Drop for ScopedChatHome {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(value) => std::env::set_var("JEIKCODE_HOME", value),
-                None => std::env::remove_var("JEIKCODE_HOME"),
+                _home: home,
             }
         }
     }
@@ -11235,6 +13205,7 @@ mod tests {
             pending_user_inputs: permission_bridge::UserInputResponders::new(),
             bind_host: "127.0.0.1".into(),
             bind_port: 13456,
+            bind_working_dir: working_dir.clone(),
             webui_cookie_name: auth_token::webui_cookie_name(13456),
             yolo: false,
             token_optional: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -11270,6 +13241,24 @@ mod tests {
             event_rx.try_recv(),
             Ok(ChatEvent::SessionAssigned { session_id: assigned }) if assigned == session_id
         ));
+    }
+
+    #[test]
+    fn protocol_bind_dir_stays_on_serve_cwd_when_webui_switches_project() {
+        let home = ScopedChatHome::new();
+        let state = chat_test_state(&home);
+        let bind = state.bind_working_dir.clone();
+        let other = home._dir.path().join("other-project");
+        std::fs::create_dir_all(&other).unwrap();
+        {
+            let mut project = state.project.try_write().expect("project lock");
+            crate::update_project_state(&mut project, &other);
+        }
+        assert_eq!(state.bind_working_dir, bind);
+        assert_ne!(
+            state.project.try_read().expect("project lock").working_dir,
+            state.bind_working_dir
+        );
     }
 
     #[test]
@@ -11885,6 +13874,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminated_chat_operation_is_not_treated_as_live_by_watch() {
+        let registry = ActiveChatRegistry::default();
+        let admission = registry.admit(Some("session-term"), None).await.unwrap();
+        registry.mark_terminal(&admission.operation_id).await;
+
+        // subscribe_live_with_replay should return None for terminated turn
+        assert!(registry
+            .subscribe_live_with_replay("session-term")
+            .await
+            .is_none());
+
+        // subscribe_or_standby should return Standby and remove stale alias
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let outcome = registry.subscribe_or_standby("session-term", &tx).await;
+        assert!(matches!(outcome, WatchOutcome::Standby));
+    }
+
+    #[tokio::test]
     async fn stale_chat_cleanup_cannot_remove_a_replacement_operation() {
         let registry = ActiveChatRegistry::default();
         let first = registry.admit(Some("session-1"), None).await.unwrap();
@@ -12028,6 +14035,16 @@ mod tests {
         .unwrap();
         assert_eq!(json["type"], "user");
         assert_eq!(json["created_at"], 42);
+
+        // 身份回传事件：与可见气泡分离的纯身份通道。
+        let identified = serde_json::to_value(ChatEvent::UserIdentified {
+            message_id: "m-user-1".into(),
+            turn_ordinal: 3,
+        })
+        .unwrap();
+        assert_eq!(identified["type"], "user_identified");
+        assert_eq!(identified["message_id"], "m-user-1");
+        assert_eq!(identified["turn_ordinal"], 3);
     }
 
     #[tokio::test]
@@ -12036,11 +14053,33 @@ mod tests {
         let first = registry.admit(Some("session-1"), None).await.unwrap();
         assert!(
             !registry
-                .stop_and_wait("session-1".into(), Duration::from_millis(30))
+                .stop_and_wait("session-1".into(), Some(Duration::from_millis(30)))
                 .await
         );
         assert!(first.cancellation.is_cancelled());
         registry.complete(&first.operation_id).await;
+    }
+
+    #[tokio::test]
+    async fn stop_and_wait_without_timeout_returns_only_after_the_operation_left() {
+        let registry = ActiveChatRegistry::default();
+        let first = registry.admit(Some("session-1"), None).await.unwrap();
+        let operation_id = first.operation_id.clone();
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let registry_bg = registry.clone();
+        let flag = released.clone();
+        let completer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            registry_bg.complete(&operation_id).await;
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        });
+
+        // Uncapped wait: the verdict must be the real release, never an early
+        // "still busy" that would bounce a send-now message back into the queue.
+        assert!(registry.stop_and_wait("session-1".into(), None).await);
+        completer.await.unwrap();
+        assert!(released.load(std::sync::atomic::Ordering::Acquire));
+        assert!(first.cancellation.is_cancelled());
     }
 
     #[tokio::test]
@@ -13097,6 +15136,7 @@ mod tests {
             images: None,
             created_at: None,
             elapsed_ms,
+            id: None,
         }
     }
 
@@ -13211,7 +15251,7 @@ mod tests {
         assert_eq!(events.len(), 5, "{events:?}");
         assert!(matches!(
             &events[0],
-            ChatEvent::TextDelta { content } if content == "验证：\n"
+            ChatEvent::TextDelta { content, .. } if content == "验证：\n"
         ));
         assert!(matches!(
             &events[1],
@@ -13228,8 +15268,95 @@ mod tests {
         assert!(matches!(&events[3], ChatEvent::ArtifactEnd { .. }));
         assert!(matches!(
             &events[4],
-            ChatEvent::TextDelta { content } if content == "完成"
+            ChatEvent::TextDelta { content, .. } if content == "完成"
         ));
+    }
+
+    #[test]
+    fn artifact_detector_preserves_nested_code_blocks_and_avoids_fragmentation() {
+        let mut detector = ArtifactDetector::new();
+        let input = "前言：\n````markdown\n模板：\n```mermaid\ngraph TD\n    A --> B\n```\n````\n#### 结论：完成";
+        let events = detector.process(input);
+
+        assert_eq!(events.len(), 5, "Events: {events:#?}");
+        assert!(
+            matches!(&events[0], ChatEvent::TextDelta { content, .. } if content == "前言：\n")
+        );
+        assert!(matches!(
+            &events[1],
+            ChatEvent::ArtifactStart {
+                ref artifact_type,
+                ref language,
+                fence_len,
+                ..
+            } if artifact_type == "markdown" && language.as_deref() == Some("markdown") && *fence_len == 4
+        ));
+        assert!(matches!(
+            &events[2],
+            ChatEvent::ArtifactContent { ref content, .. }
+                if content.contains("```mermaid") && content.contains("graph TD")
+        ));
+        assert!(matches!(&events[3], ChatEvent::ArtifactEnd { .. }));
+        assert!(matches!(
+            &events[4],
+            ChatEvent::TextDelta { content, .. } if content == "#### 结论：完成"
+        ));
+    }
+
+    #[test]
+    fn artifact_detector_depth_tracks_same_length_nested_blocks() {
+        let mut detector = ArtifactDetector::new();
+        let input = "```markdown\n```bash\necho 1\n```\n```\n后续正文";
+        let events = detector.process(input);
+
+        assert_eq!(events.len(), 5, "Events: {events:#?}");
+        assert!(matches!(&events[0], ChatEvent::ArtifactStart { .. }));
+        assert!(matches!(&events[1], ChatEvent::ArtifactContent { .. }));
+        assert!(matches!(&events[2], ChatEvent::ArtifactContent { .. }));
+        assert!(matches!(&events[3], ChatEvent::ArtifactEnd { .. }));
+        assert!(
+            matches!(&events[4], ChatEvent::TextDelta { content, .. } if content == "后续正文")
+        );
+    }
+
+    #[test]
+    fn artifact_detector_recognizes_quoted_fence_closure() {
+        let mut detector = ArtifactDetector::new();
+        let input = "修改方式：\n```bash\nsed -i 's/cpu/cuda/g' config.py\n> ```\n\n---\n\n### 第二步：为什么把并发定在 6~8？\n正文";
+        let events = detector.process(input);
+
+        // 验证：文本必须切分为 前导文本 -> 开启 -> 代码内容 -> 闭合 -> 后续文本
+        assert!(
+            matches!(&events[0], ChatEvent::TextDelta { content, .. } if content == "修改方式：\n")
+        );
+        assert!(
+            matches!(&events[1], ChatEvent::ArtifactStart { language, .. } if language.as_deref() == Some("bash"))
+        );
+        assert!(
+            matches!(&events[2], ChatEvent::ArtifactContent { content, .. } if content.contains("sed -i"))
+        );
+        assert!(matches!(&events[3], ChatEvent::ArtifactEnd { .. }));
+        assert!(
+            matches!(&events[4], ChatEvent::TextDelta { content, .. } if content.contains("### 第二步"))
+        );
+    }
+
+    #[test]
+    fn artifact_detector_structural_terminator_heals_unclosed_code_block() {
+        let mut detector = ArtifactDetector::new();
+        let input = "```bash\necho 1\n\n### 第二步：为什么把并发定在 6~8？\n正文";
+        let events = detector.process(input);
+
+        assert!(
+            matches!(&events[0], ChatEvent::ArtifactStart { language, .. } if language.as_deref() == Some("bash"))
+        );
+        assert!(
+            matches!(&events[1], ChatEvent::ArtifactContent { content, .. } if content.contains("echo 1"))
+        );
+        assert!(matches!(&events[2], ChatEvent::ArtifactEnd { .. }));
+        assert!(
+            matches!(&events[3], ChatEvent::TextDelta { content, .. } if content.contains("### 第二步"))
+        );
     }
 
     #[test]
@@ -13380,6 +15507,7 @@ mod tests {
                 images,
                 created_at: None,
                 elapsed_ms: None,
+                id: None,
             }
         }
         let real = |tag: &str| ImageData {
@@ -13570,6 +15698,136 @@ utun7: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1300
         );
         assert_eq!(extract_ip_eq("no ip here"), None);
     }
+
+    #[tokio::test]
+    async fn fork_session_creates_independent_branch_with_optional_truncation() {
+        use jeikcode_capabilities::session::{PresentationFile, SessionMeta, StorageOwner};
+        use jeikcode_kernel::message::{Message, MessageMeta, SessionSnapshot};
+
+        let home = ScopedChatHome::new();
+        let state = chat_test_state(&home);
+        let working_dir = home._dir.path().join("project");
+        std::fs::create_dir_all(&working_dir).unwrap();
+        let project_hash = NativeSessionManager::project_hash(&working_dir);
+        let manager = NativeSessionManager::for_project(&working_dir);
+
+        let source_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let source_lease = manager.acquire_lease(source_id).unwrap();
+        let mut m1 = Message::user("first question");
+        m1.meta = Some(MessageMeta {
+            turn_id: 1,
+            request_id: 1,
+            ..Default::default()
+        });
+        let mut m2 = Message::assistant("first answer", Vec::new());
+        m2.meta = Some(MessageMeta {
+            turn_id: 1,
+            request_id: 1,
+            ..Default::default()
+        });
+        let mut m3 = Message::user("second question");
+        m3.meta = Some(MessageMeta {
+            turn_id: 2,
+            request_id: 2,
+            ..Default::default()
+        });
+        let mut m4 = Message::assistant("second answer", Vec::new());
+        m4.meta = Some(MessageMeta {
+            turn_id: 2,
+            request_id: 2,
+            ..Default::default()
+        });
+        let snapshot = SessionSnapshot::new(vec![m1, m2, m3, m4]);
+        let mut meta = SessionMeta::new(source_id, working_dir.to_string_lossy(), 100);
+        meta.owner = StorageOwner::Native;
+        meta.name = "Original Session".into();
+        meta.user_renamed = true;
+        meta.message_count = 4;
+        meta.turn_count = 2;
+        manager
+            .commit_native_import(
+                &source_lease,
+                Some(&snapshot),
+                Some(&PresentationFile::default()),
+                &meta,
+            )
+            .unwrap();
+        drop(source_lease);
+
+        // 1. Full fork with custom title
+        let full_resp = fork_session(
+            State(state.clone()),
+            axum::Extension(SessionMode::Ide),
+            Path((project_hash.clone(), source_id.to_string())),
+            Some(Json(ForkSessionRequest {
+                title: Some("Branched Full".into()),
+                ..Default::default()
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(full_resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(full_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let full_fork: ForkSessionResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(full_fork.success);
+        assert_ne!(full_fork.id, source_id);
+        assert_eq!(full_fork.name, "Branched Full");
+        assert_eq!(full_fork.parent_id, source_id);
+        assert_eq!(full_fork.root_id, source_id);
+        assert_eq!(full_fork.message_count, 4);
+        assert_eq!(full_fork.turn_count, 2);
+
+        // 2. Truncated fork at index 1 (inclusive -> keeps first 2 messages / 1 turn)
+        let trunc_resp = fork_session_by_id(
+            State(state.clone()),
+            axum::Extension(SessionMode::Ide),
+            Path(source_id.to_string()),
+            Some(Json(ForkSessionRequest {
+                target_index: Some(1),
+                inclusive: Some(true),
+                ..Default::default()
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(trunc_resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(trunc_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let trunc_fork: ForkSessionResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(trunc_fork.success);
+        assert_eq!(trunc_fork.parent_id, source_id);
+        assert_eq!(trunc_fork.root_id, source_id);
+        assert_eq!(trunc_fork.message_count, 2);
+        assert_eq!(trunc_fork.turn_count, 1);
+
+        let loaded_trunc = manager.load_native_session(&trunc_fork.id).unwrap();
+        assert_eq!(loaded_trunc.snapshot.messages.len(), 2);
+        assert_eq!(loaded_trunc.snapshot.messages[0].text, "first question");
+        assert_eq!(loaded_trunc.snapshot.messages[1].text, "first answer");
+
+        // 3. Source session immutability & first fork preserved
+        let loaded_source = manager.load_native_session(source_id).unwrap();
+        assert_eq!(loaded_source.snapshot.messages.len(), 4);
+        assert_eq!(loaded_source.meta.message_count, 4);
+        assert!(manager.load_native_session(&full_fork.id).is_ok());
+
+        // 4. 404 on missing session
+        let missing_resp = fork_session(
+            State(state),
+            axum::Extension(SessionMode::Ide),
+            Path((
+                project_hash,
+                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".to_string(),
+            )),
+            None,
+        )
+        .await
+        .into_response();
+        assert_eq!(missing_resp.status(), StatusCode::NOT_FOUND);
+    }
 }
 
 #[cfg(test)]
@@ -13674,6 +15932,7 @@ mod channel_mode_tests {
                 id: "c1".into(),
                 name: "task".into(),
                 arguments: "{}".into(),
+                message_id: None,
             },
             ChatEvent::PermissionRequest {
                 session_id: "s1".into(),
@@ -13721,7 +15980,7 @@ mod channel_mode_tests {
             ChatEvent::PermissionRequest {
                 session_id: "s1".into(),
                 approval_id: "approval-c1".into(),
-                tool_name: "edit_file".into(),
+                tool_name: "edit".into(),
                 reason: "Requires approval".into(),
                 call_id: "c1".into(),
                 arguments: "{}".into(),
@@ -13877,5 +16136,183 @@ mod channel_mode_tests {
             shortcuts.iter().any(|s| s.id == "home"),
             "system shortcuts should contain home entry"
         );
+    }
+
+    #[test]
+    fn resolve_target_message_index_matches_reasoning_and_text() {
+        use jeikcode_kernel::message::Message;
+        let mut msg_with_reasoning = Message::assistant("这是正式回答", Vec::new());
+        msg_with_reasoning.reasoning = Some("这是详细的思考过程".into());
+
+        let messages = vec![
+            Message::user("你好"),
+            msg_with_reasoning,
+            Message::user("第二问"),
+            Message::assistant("第二答", Vec::new()),
+        ];
+
+        // 1. 通过正文匹配
+        let idx1 =
+            resolve_target_message_index(&messages, 1, Some("这是正式回答"), Some("assistant"));
+        assert_eq!(idx1, Some(1));
+
+        // 2. 通过思考过程匹配
+        let idx2 = resolve_target_message_index(
+            &messages,
+            1,
+            Some("这是详细的思考过程"),
+            Some("assistant"),
+        );
+        assert_eq!(idx2, Some(1));
+
+        // 3. 通过前端拼接的全文（思考过程 + 正文）匹配
+        let combined = "这是详细的思考过程\n这是正式回答";
+        let idx3 = resolve_target_message_index(&messages, 1, Some(combined), Some("assistant"));
+        assert_eq!(idx3, Some(1));
+
+        // 4. 第二轮助手匹配
+        let idx4 = resolve_target_message_index(&messages, 3, Some("第二答"), Some("assistant"));
+        assert_eq!(idx4, Some(3));
+    }
+
+    #[test]
+    fn delete_session_message_turn_and_agent_isolation() {
+        use jeikcode_kernel::message::{Message, Role};
+        let mut turn0_tool = Message::assistant("", Vec::new());
+        turn0_tool.tool_calls = vec![jeikcode_kernel::tool::ToolCall {
+            id: "call-1".into(),
+            name: "read".into(),
+            arguments: "{}".into(),
+        }];
+
+        let mut messages = vec![
+            Message::user("问题1"),
+            turn0_tool,
+            Message::tool_result("call-1", "文件内容", false),
+            Message::assistant("问题1最终回答", Vec::new()),
+            Message::user("问题2"),
+            Message::assistant("问题2回答", Vec::new()),
+        ];
+
+        // 模拟删除问题1的 Agent 回复（从中间输出到最终回答，保留问题1的 User 消息）
+        let target_idx =
+            resolve_target_message_index(&messages, 3, Some("问题1最终回答"), Some("assistant"))
+                .unwrap();
+        assert_eq!(target_idx, 3);
+
+        // 模拟 delete_turn: false 下的 Agent 范围清理逻辑
+        let mut start = target_idx;
+        while start > 0 && messages[start - 1].role != Role::User {
+            start -= 1;
+        }
+        let mut end = target_idx + 1;
+        while end < messages.len() && messages[end].role != Role::User {
+            end += 1;
+        }
+        messages.drain(start..end);
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, Role::User);
+        assert_eq!(messages[0].text, "问题1");
+        assert_eq!(messages[1].role, Role::User);
+        assert_eq!(messages[1].text, "问题2");
+        assert_eq!(messages[2].role, Role::Assistant);
+        assert_eq!(messages[2].text, "问题2回答");
+
+        // 验证元数据计数器派生正确性
+        let (turn_c, req_c) = jeikcode_kernel::message::SessionSnapshot::derive_counters(&messages);
+        assert_eq!(turn_c, 0);
+        assert_eq!(req_c, 0);
+    }
+
+    #[test]
+    fn format_tool_args_supports_modern_and_legacy_tool_names() {
+        // 1. read / read_file
+        let read_args = r#"{"path":"src/main.rs","offset":10,"limit":50}"#;
+        assert_eq!(format_tool_args("read", read_args), "src/main.rs L10-60");
+        let read_legacy = r#"{"file_path":"crates/core/lib.rs"}"#;
+        assert_eq!(
+            format_tool_args("read_file", read_legacy),
+            ".../core/lib.rs"
+        );
+
+        // 2. write / write_file / create_file
+        let write_args = r#"{"path":"index.html","content":"<html></html>"}"#;
+        assert_eq!(
+            format_tool_args("write", write_args),
+            "index.html (13 bytes)"
+        );
+        let write_legacy = r#"{"file_path":"app.py","content":"print(1)"}"#;
+        assert_eq!(
+            format_tool_args("create_file", write_legacy),
+            "app.py (8 bytes)"
+        );
+
+        // 3. edit / edit_file
+        let edit_args = r#"{"path":"crates/jeikcode-daemon/src/lib.rs"}"#;
+        assert_eq!(format_tool_args("edit", edit_args), ".../src/lib.rs");
+        let edit_legacy = r#"{"file_path":"crates/jeikcode-daemon/src/lib.rs"}"#;
+        assert_eq!(format_tool_args("edit_file", edit_legacy), ".../src/lib.rs");
+
+        // 4. run_command / bash with command or cmd
+        let cmd_args = r#"{"command":"cargo test","summary":"run test suite"}"#;
+        assert_eq!(
+            format_tool_args("run_command", cmd_args),
+            "run test suite — `cargo test`"
+        );
+        let cmd_alias = r#"{"cmd":"git status"}"#;
+        assert_eq!(format_tool_args("run_command", cmd_alias), "`git status`");
+
+        // 5. code_explore
+        let explore_args = r#"{"query":"CodeExploreTool","path":"crates/capabilities"}"#;
+        assert_eq!(
+            format_tool_args("code_explore", explore_args),
+            "\"CodeExploreTool\" in crates/capabilities"
+        );
+
+        // 6. task
+        let task_args = r#"{"tasks":[{"description":"sub1"},{"description":"sub2"}]}"#;
+        assert_eq!(format_tool_args("task", task_args), "2 subtask(s)");
+    }
+
+    #[test]
+    fn extract_artifacts_supports_modern_write_edit_and_cmd() {
+        let calls = vec![
+            (
+                "write",
+                r#"{"path":"chart.html","content":"<h1>Chart</h1>"}"#,
+            ),
+            ("edit", r#"{"path":"diagram.svg","content":"<svg></svg>"}"#),
+            (
+                "create_file",
+                r##"{"file_path":"notes.md","content":"# Notes"}"##,
+            ),
+            ("run_command", r#"{"cmd":"echo 'Report' > report.md"}"#),
+            ("bash", r#"{"command":"python script.py >> results.html"}"#),
+        ];
+
+        let artifacts = extract_artifacts_from_call_fields(calls).expect("artifacts extracted");
+        assert_eq!(artifacts.len(), 5);
+
+        // 1. write -> chart.html
+        assert_eq!(artifacts[0].artifact_type, "html");
+        assert_eq!(artifacts[0].title.as_deref(), Some("chart.html"));
+        assert_eq!(artifacts[0].content, "<h1>Chart</h1>");
+
+        // 2. edit -> diagram.svg
+        assert_eq!(artifacts[1].artifact_type, "svg");
+        assert_eq!(artifacts[1].title.as_deref(), Some("diagram.svg"));
+
+        // 3. create_file -> notes.md
+        assert_eq!(artifacts[2].artifact_type, "markdown");
+        assert_eq!(artifacts[2].title.as_deref(), Some("notes.md"));
+
+        // 4. run_command -> report.md via redirect
+        assert_eq!(artifacts[3].artifact_type, "markdown");
+        assert_eq!(artifacts[3].title.as_deref(), Some("report.md"));
+
+        // 5. bash -> results.html via append redirect
+        assert_eq!(artifacts[4].artifact_type, "html");
+        assert_eq!(artifacts[4].title.as_deref(), Some("results.html"));
     }
 }

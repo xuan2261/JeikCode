@@ -167,6 +167,25 @@ pub(super) fn validate_allowed(path: &str) -> Result<()> {
         "crates/jeikcode-updater",
         "crates/jeikcode-auth",
         "crates/jeikcode-cli/src/repair",
+        // The repair CLI entry point and daemon routing/token admission are
+        // part of this feature's own trust boundary, not eligible patch scope.
+        "crates/jeikcode-cli/src/lib.rs",
+        "crates/jeikcode-cli/src/main.rs",
+        "crates/jeikcode-daemon/src/api_repair.rs",
+        "crates/jeikcode-daemon/src/auth_token.rs",
+        "crates/jeikcode-daemon/src/lib.rs",
+        "crates/jeikcode-daemon/src/main.rs",
+        // Shared WebUI modules below implement the repair launch, token
+        // transport, pre-I/O local path guard and digest acknowledgment.
+        // Even unrelated edits there need ordinary review outside self-repair.
+        "webui/src/app.tsx",
+        "webui/src/api.ts",
+        "webui/src/components/cwdpicker.tsx",
+        "webui/src/components/repairevidencedialog.tsx",
+        "webui/src/lib/displaypath.ts",
+        "webui/src/lib/displaypath.test.ts",
+        "webui/src/lib/repairevidence.ts",
+        "webui/src/lib/repairevidence.test.ts",
         "crates/jeikcode-cli/src/build_info.rs",
         "crates/jeikcode-cli/build.rs",
         "crates/jeikcode-capabilities/src/skills",

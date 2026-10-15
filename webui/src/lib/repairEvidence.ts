@@ -70,13 +70,30 @@ function nullableString(value: unknown): value is string | null {
 const sha256 = /^[0-9a-f]{64}$/;
 const gitObject = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
-/** Only explicit absolute host paths can be sent to the repair endpoints. */
+/** Repair paths must be absolute and local, not Windows network/device paths. */
 export function isAbsoluteRepairPath(path: string): boolean {
-  return !path.includes('\0') && (
+  // Reject UNC, forward-slash UNC and verbatim/device namespaces before any
+  // repair picker can send a filesystem request (which could contact SMB).
+  if (/[\x00-\x1f\x7f]/.test(path) ||
+      path.startsWith('\\\\') || path.startsWith('//') || path.startsWith('/?/')) {
+    return false;
+  }
+  return (
     path.startsWith('/') ||
-    /^[A-Za-z]:[\\/]/.test(path) ||
-    /^\\\\[^\\/]+[\\/][^\\/]+/.test(path)
+    /^[A-Za-z]:[\\/]/.test(path)
   );
+}
+
+/** Normalize only host-returned canonical Windows *disk* paths. Rust's
+ * canonicalize() may return `\\?\C:\...` on Windows, which is valid local
+ * output but is deliberately not an accepted user/picker input. Never remove
+ * UNC, device or other namespace prefixes to manufacture a local path.
+ */
+function trustedRepairResponsePath(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const localDisk = /^\\\\\?\\([A-Za-z]:[\\/].*)$/.exec(value);
+  const path = localDisk ? localDisk[1] : value;
+  return isAbsoluteRepairPath(path) ? path : null;
 }
 
 export function parseRepairCapability(value: unknown): RepairCapability {
@@ -89,8 +106,8 @@ export function parseRepairCapability(value: unknown): RepairCapability {
 }
 
 export function parseRepairInfo(value: unknown): RepairInfoResponse {
-  if (!record(value) || typeof value.source_root !== 'string' ||
-      !isAbsoluteRepairPath(value.source_root) || !record(value.source) ||
+  const sourceRoot = record(value) ? trustedRepairResponsePath(value.source_root) : null;
+  if (!record(value) || sourceRoot === null || !record(value.source) ||
       typeof value.source.repository !== 'string' ||
       typeof value.source.commit !== 'string' || !gitObject.test(value.source.commit) ||
       typeof value.source.tree !== 'string' || !gitObject.test(value.source.tree) ||
@@ -109,12 +126,14 @@ export function parseRepairInfo(value: unknown): RepairInfoResponse {
       !(build.source_dirty === null || typeof build.source_dirty === 'boolean')) {
     throw new Error('Invalid repair build observation response');
   }
-  return value as unknown as RepairInfoResponse;
+  return { ...value, source_root: sourceRoot } as unknown as RepairInfoResponse;
 }
 
 export function parseRepairPreview(value: unknown, expectedSource: string): RepairPreviewResponse {
-  if (!record(value) || value.source_root !== expectedSource ||
-      typeof value.run_root !== 'string' || !isAbsoluteRepairPath(value.run_root) ||
+  const sourceRoot = record(value) ? trustedRepairResponsePath(value.source_root) : null;
+  const runRoot = record(value) ? trustedRepairResponsePath(value.run_root) : null;
+  if (!record(value) || sourceRoot !== expectedSource ||
+      runRoot === null ||
       !record(value.packet) || value.packet.schema_version !== 1 ||
       typeof value.packet.sha256 !== 'string' || !sha256.test(value.packet.sha256) ||
       !record(value.packet.files)) {
@@ -126,7 +145,7 @@ export function parseRepairPreview(value: unknown, expectedSource: string): Repa
     throw new Error('Repair preview must contain exactly the five frozen text files');
   }
   // Keep the original strings: parsing the display metadata must never rewrite payload bytes.
-  return value as unknown as RepairPreviewResponse;
+  return { ...value, source_root: sourceRoot, run_root: runRoot } as unknown as RepairPreviewResponse;
 }
 
 function jsonRecord(text: string): Record<string, unknown> {
@@ -182,10 +201,10 @@ export function makeRepairExportRequest(
 }
 
 export function parseRepairExport(value: unknown, expectedDigest: string): RepairExportResponse {
+  const output = record(value) ? trustedRepairResponsePath(value.output) : null;
   if (!record(value) || value.status !== 'exported_local' ||
-      value.sha256 !== expectedDigest || typeof value.output !== 'string' ||
-      !isAbsoluteRepairPath(value.output)) {
+      value.sha256 !== expectedDigest || output === null) {
     throw new Error('Invalid repair export result; no confirmed export is available');
   }
-  return value as unknown as RepairExportResponse;
+  return { ...value, output } as unknown as RepairExportResponse;
 }

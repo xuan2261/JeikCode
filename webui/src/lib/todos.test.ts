@@ -677,5 +677,58 @@ test('applyLiveTodoToolCall does not consume callId when live args are empty, al
   assert.equal(appliedIds.has('call_clear_1'), true); // now consumed
 });
 
+test('a replayed plan call never reverts a completed list once its call id is applied', () => {
+  const planArgs = JSON.stringify({
+    todos: [
+      { content: '任务一', status: 'pending' },
+      { content: '任务二', status: 'pending' },
+    ],
+  });
+  const doneArgs = JSON.stringify({
+    actions: [
+      { action: 'update', id: 1, status: 'completed' },
+      { action: 'update', id: 2, status: 'completed' },
+    ],
+  });
+
+  // 直播：plan（全 pending）→ 全完成。幂等键随折叠记下两个 callId
+  // （持久化与"全完成不清空"由 Chat.tsx + todoAppliedIds 负责）。
+  const appliedIds = new Set<string>();
+  const planned = applyLiveTodoToolCall({
+    current: null,
+    name: 'todowrite',
+    args: planArgs,
+    callId: 'call-plan',
+    appliedIds,
+  });
+  const completed = applyLiveTodoToolCall({
+    current: planned,
+    name: 'todowrite',
+    args: doneArgs,
+    callId: 'call-upd',
+    appliedIds,
+  });
+  assert.ok(completed && completed.every((t) => t.status === 'completed'));
+
+  // 刷新后的 watch 整轮重放：plan 帧必须被幂等键拦住，
+  // 否则 todo 会定格在"模型之前某一次打钩状态"。
+  const replayedPlan = applyLiveTodoToolCall({
+    current: completed,
+    name: 'todowrite',
+    args: planArgs,
+    callId: 'call-plan',
+    appliedIds,
+  });
+  assert.deepEqual(replayedPlan, completed, '已完成的清单不得被重放回退');
+  const replayedUpdate = applyLiveTodoToolCall({
+    current: replayedPlan,
+    name: 'todowrite',
+    args: doneArgs,
+    callId: 'call-upd',
+    appliedIds,
+  });
+  assert.deepEqual(replayedUpdate, completed, '整轮重放后状态一字不变（幂等）');
+});
+
 
 

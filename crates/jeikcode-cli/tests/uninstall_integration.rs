@@ -54,7 +54,7 @@ fn no_tty_no_flag_exits_2() {
         .assert()
         .failure()
         .code(2)
-        .stderr(predicates::str::contains("refusing to run interactively"));
+        .stderr(predicates::str::contains("jeikcode uninstall simple"));
     // Nothing touched.
     assert!(data.join("auth.toml").exists());
 }

@@ -329,6 +329,28 @@ pub struct ForkInfo {
     pub base_turn_count: u32,
 }
 
+/// Child branch/fork descriptor in a conversation lineage tree.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionForkChild {
+    pub session_id: String,
+    pub name: String,
+    pub forked_at_ms: i64,
+    pub turn_count: u32,
+    pub message_count: u32,
+    pub updated_at: i64,
+}
+
+/// Complete conversation lineage graph for a given session.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionLineage {
+    pub session_id: String,
+    pub root_id: String,
+    pub parent_id: Option<String>,
+    pub fork_info: Option<ForkInfo>,
+    pub children: Vec<SessionForkChild>,
+    pub lineage_size: usize,
+}
+
 /// How a session was created. Stored in [`SessionMeta`] so that automated
 /// scheduled-task sessions can be excluded from user-facing history pickers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1999,9 +2021,33 @@ impl SessionManager {
         destination_id: &str,
         now_ms: i64,
     ) -> SessionResult<(LoadedSession, SessionLease)> {
-        let source = self.load_native_session(source_id)?;
+        self.fork_native_session_at(source_id, destination_id, None, now_ms)
+    }
+
+    /// Clone a committed native aggregate under a new identity, optionally
+    /// truncating the message history to the first `target_message_count`
+    /// messages to support conversation branching.
+    pub fn fork_native_session_at(
+        &self,
+        source_id: &str,
+        destination_id: &str,
+        target_message_count: Option<usize>,
+        now_ms: i64,
+    ) -> SessionResult<(LoadedSession, SessionLease)> {
+        let mut source = self.load_native_session(source_id)?;
         self.reap_abandoned_forks(&source);
         let destination_lease = self.acquire_lease(destination_id)?;
+        if let Some(count) = target_message_count {
+            let keep = count.min(source.snapshot.messages.len());
+            source.snapshot.messages.truncate(keep);
+            let (turn_c, req_c) =
+                jeikcode_kernel::message::SessionSnapshot::derive_counters(&source.snapshot.messages);
+            source.snapshot.turn_counter = turn_c;
+            source.snapshot.request_counter = req_c;
+            source.snapshot.cache_epoch = source.snapshot.cache_epoch.saturating_add(1);
+            source.meta.message_count = u32::try_from(source.snapshot.messages.len()).unwrap_or(0);
+            source.meta.turn_count = u32::try_from(turn_c).unwrap_or(0);
+        }
         let source_name_was_placeholder =
             SessionMeta::name_needs_fallback(&source.meta.name, source_id);
         let root_id = source
@@ -2986,6 +3032,60 @@ impl SessionManager {
             meta.name = name.to_string();
             meta.user_renamed = true;
         })
+    }
+
+    /// Inspect the conversation lineage tree for a session: finds root ID, direct parent
+    /// (if forked), direct children branches, and total lineage size.
+    pub fn session_lineage(&self, id: &str) -> SessionResult<Option<SessionLineage>> {
+        let target = match self.read_meta(id) {
+            Ok(m) => m,
+            Err(SessionStoreError::NotFound { .. }) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let root_id = target
+            .fork_info
+            .as_ref()
+            .map(|f| f.root_id.clone())
+            .unwrap_or_else(|| id.to_string());
+        let parent_id = target.fork_info.as_ref().map(|f| f.parent_id.clone());
+
+        let all_sessions = self.list();
+        let mut children = Vec::new();
+        let mut lineage_size = 0;
+
+        for session in &all_sessions {
+            let is_in_lineage = session.id == root_id
+                || session
+                    .fork_info
+                    .as_ref()
+                    .map(|f| f.root_id.as_str())
+                    == Some(root_id.as_str());
+            if is_in_lineage {
+                lineage_size += 1;
+            }
+            if let Some(fork) = &session.fork_info {
+                if fork.parent_id == id {
+                    children.push(SessionForkChild {
+                        session_id: session.id.clone(),
+                        name: session.name.clone(),
+                        forked_at_ms: fork.forked_at_ms,
+                        turn_count: session.turn_count,
+                        message_count: session.message_count,
+                        updated_at: session.updated_at,
+                    });
+                }
+            }
+        }
+        children.sort_by(|a, b| b.forked_at_ms.cmp(&a.forked_at_ms));
+
+        Ok(Some(SessionLineage {
+            session_id: id.to_string(),
+            root_id,
+            parent_id,
+            fork_info: target.fork_info,
+            children,
+            lineage_size,
+        }))
     }
 
     /// Remove native data plus the corresponding historical core JSON. The caller
@@ -4966,6 +5066,81 @@ mod tests {
     }
 
     #[test]
+    fn fork_native_session_at_truncates_messages_and_updates_counters_for_branching() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        let source_lease = mgr.acquire_lease("source").unwrap();
+        let mut m1 = Message::user("turn 1 question");
+        m1.meta = Some(jeikcode_kernel::message::MessageMeta {
+            turn_id: 1,
+            request_id: 1,
+            ..Default::default()
+        });
+        let mut m2 = Message::assistant("turn 1 answer", Vec::new());
+        m2.meta = Some(jeikcode_kernel::message::MessageMeta {
+            turn_id: 1,
+            request_id: 1,
+            ..Default::default()
+        });
+        let mut m3 = Message::user("turn 2 question");
+        m3.meta = Some(jeikcode_kernel::message::MessageMeta {
+            turn_id: 2,
+            request_id: 2,
+            ..Default::default()
+        });
+        let mut m4 = Message::assistant("turn 2 answer", Vec::new());
+        m4.meta = Some(jeikcode_kernel::message::MessageMeta {
+            turn_id: 2,
+            request_id: 3,
+            ..Default::default()
+        });
+        let mut snapshot = SessionSnapshot::new(vec![m1, m2, m3, m4]);
+        snapshot.cache_epoch = 5;
+        let presentation = PresentationFile::default();
+        let mut source_meta = SessionMeta::new("source", "/project", 10);
+        source_meta.owner = StorageOwner::Native;
+        source_meta.name = "branching session".into();
+        source_meta.user_renamed = true;
+        source_meta.turn_count = 2;
+        source_meta.message_count = 4;
+        mgr.commit_native_import(
+            &source_lease,
+            Some(&snapshot),
+            Some(&presentation),
+            &source_meta,
+        )
+        .unwrap();
+
+        let (forked, _fork_lease) = mgr
+            .fork_native_session_at("source", "branch", Some(2), 30)
+            .unwrap();
+
+        assert_eq!(forked.snapshot.messages.len(), 2);
+        assert_eq!(forked.snapshot.messages[0].text, "turn 1 question");
+        assert_eq!(forked.snapshot.messages[1].text, "turn 1 answer");
+        assert_eq!(forked.snapshot.turn_counter, 1);
+        assert_eq!(forked.snapshot.request_counter, 1);
+        assert_eq!(forked.snapshot.cache_epoch, 6);
+        assert_eq!(forked.meta.message_count, 2);
+        assert_eq!(forked.meta.turn_count, 1);
+        assert_eq!(
+            forked.meta.fork_info,
+            Some(ForkInfo {
+                root_id: "source".into(),
+                parent_id: "source".into(),
+                forked_at_ms: 30,
+                base_message_count: 2,
+                base_turn_count: 1,
+            })
+        );
+        // Source session remains intact with all 4 messages
+        let reloaded_source = mgr.load_native_session("source").unwrap();
+        assert_eq!(reloaded_source.snapshot.messages.len(), 4);
+        assert_eq!(reloaded_source.meta.message_count, 4);
+        assert_eq!(reloaded_source.meta.turn_count, 2);
+    }
+
+    #[test]
     fn fork_native_session_does_not_publish_destination_when_source_is_missing() {
         let dir = tempfile::tempdir().unwrap();
         let mgr = SessionManager::with_root(dir.path());
@@ -5109,6 +5284,96 @@ mod tests {
             vec!["fork-b"]
         );
         assert!(mgr.load_native_session("fork-a").is_ok());
+    }
+
+    #[test]
+    fn session_lineage_tracks_root_parents_children_and_tree_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+
+        // 1. Missing session returns Ok(None)
+        assert_eq!(mgr.session_lineage("nonexistent").unwrap(), None);
+
+        // 2. Create root session
+        let root_lease = mgr.acquire_lease("session-root").unwrap();
+        let mut root_meta = SessionMeta::new("session-root", "/project", 100);
+        root_meta.owner = StorageOwner::Native;
+        root_meta.name = "Root Session".into();
+        root_meta.message_count = 5;
+        root_meta.turn_count = 2;
+        mgr.commit_native_import(
+            &root_lease,
+            Some(&snap(&["msg1"])),
+            Some(&PresentationFile::default()),
+            &root_meta,
+        )
+        .unwrap();
+
+        // 3. Create fork-1 off root
+        let fork1_lease = mgr.acquire_lease("session-fork-1").unwrap();
+        let mut fork1_meta = SessionMeta::new("session-fork-1", "/project", 200);
+        fork1_meta.owner = StorageOwner::Native;
+        fork1_meta.name = "Fork 1".into();
+        fork1_meta.message_count = 8;
+        fork1_meta.turn_count = 3;
+        fork1_meta.fork_info = Some(ForkInfo {
+            root_id: "session-root".into(),
+            parent_id: "session-root".into(),
+            forked_at_ms: 150,
+            base_message_count: 5,
+            base_turn_count: 2,
+        });
+        mgr.commit_native_import(
+            &fork1_lease,
+            Some(&snap(&["msg1", "fork1"])),
+            Some(&PresentationFile::default()),
+            &fork1_meta,
+        )
+        .unwrap();
+
+        // 4. Create fork-2 off root
+        let fork2_lease = mgr.acquire_lease("session-fork-2").unwrap();
+        let mut fork2_meta = SessionMeta::new("session-fork-2", "/project", 250);
+        fork2_meta.owner = StorageOwner::Native;
+        fork2_meta.name = "Fork 2".into();
+        fork2_meta.message_count = 6;
+        fork2_meta.turn_count = 2;
+        fork2_meta.fork_info = Some(ForkInfo {
+            root_id: "session-root".into(),
+            parent_id: "session-root".into(),
+            forked_at_ms: 220,
+            base_message_count: 5,
+            base_turn_count: 2,
+        });
+        mgr.commit_native_import(
+            &fork2_lease,
+            Some(&snap(&["msg1", "fork2"])),
+            Some(&PresentationFile::default()),
+            &fork2_meta,
+        )
+        .unwrap();
+
+        // 5. Query root lineage: should find 2 children, lineage_size = 3
+        let root_lineage = mgr.session_lineage("session-root").unwrap().expect("root lineage");
+        assert_eq!(root_lineage.session_id, "session-root");
+        assert_eq!(root_lineage.root_id, "session-root");
+        assert_eq!(root_lineage.parent_id, None);
+        assert_eq!(root_lineage.fork_info, None);
+        assert_eq!(root_lineage.lineage_size, 3);
+        assert_eq!(root_lineage.children.len(), 2);
+        // Children are sorted newest forked_at_ms first
+        assert_eq!(root_lineage.children[0].session_id, "session-fork-2");
+        assert_eq!(root_lineage.children[0].forked_at_ms, 220);
+        assert_eq!(root_lineage.children[1].session_id, "session-fork-1");
+        assert_eq!(root_lineage.children[1].forked_at_ms, 150);
+
+        // 6. Query fork-1 lineage: should reflect root and parent pointing to root
+        let fork1_lineage = mgr.session_lineage("session-fork-1").unwrap().expect("fork1 lineage");
+        assert_eq!(fork1_lineage.session_id, "session-fork-1");
+        assert_eq!(fork1_lineage.root_id, "session-root");
+        assert_eq!(fork1_lineage.parent_id, Some("session-root".into()));
+        assert_eq!(fork1_lineage.lineage_size, 3);
+        assert!(fork1_lineage.children.is_empty());
     }
 
     #[test]
@@ -5687,22 +5952,25 @@ mod tests {
         assert_eq!(both.presence, CatalogPresence::Both);
         assert_eq!(both.project_bucket, "0123456789abcdef");
         assert_eq!(both.working_dir, PathBuf::from("/native"));
+        assert_eq!(both.created_at_ms, 2_000);
         assert_eq!(both.updated_at_ms, 4_000);
+        let legacy = scan
+            .entries
+            .iter()
+            .find(|entry| entry.id == "legacy")
+            .unwrap();
         assert_eq!(
-            scan.entries
-                .iter()
-                .find(|entry| entry.id == "legacy")
-                .unwrap()
-                .presence,
-            CatalogPresence::LegacyOnly
+            (legacy.presence, legacy.created_at_ms, legacy.updated_at_ms),
+            (CatalogPresence::LegacyOnly, 1_000, 2_000)
         );
+        let native = scan
+            .entries
+            .iter()
+            .find(|entry| entry.id == "native")
+            .unwrap();
         assert_eq!(
-            scan.entries
-                .iter()
-                .find(|entry| entry.id == "native")
-                .unwrap()
-                .presence,
-            CatalogPresence::NativeOnly
+            (native.presence, native.created_at_ms, native.updated_at_ms),
+            (CatalogPresence::NativeOnly, 1_000, 1_000)
         );
         assert_eq!(scan.diagnostics.len(), 3);
         assert!(scan
@@ -6972,7 +7240,7 @@ mod tests {
                 "waiting on approval",
                 vec![jeikcode_kernel::tool::ToolCall {
                     id: "c1".into(),
-                    name: "write_file".into(),
+                    name: "write".into(),
                     arguments: "{}".into(),
                 }],
             ),

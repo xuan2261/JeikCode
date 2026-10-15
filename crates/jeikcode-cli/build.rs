@@ -6,7 +6,7 @@ fn main() {
     // Embed icon when targeting Windows.
     let bin_name = std::env::var("CARGO_BIN_NAME").unwrap_or_default();
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
-        && (bin_name.is_empty() || bin_name == "jeikcode" || bin_name == "atomcode")
+        && (bin_name.is_empty() || bin_name == "jeikcode")
     {
         let icon = "assets/jeikcode.ico";
         println!("cargo:rerun-if-changed={}", icon);

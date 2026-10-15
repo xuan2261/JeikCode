@@ -1138,12 +1138,20 @@ fn load_codegraph_ignore(root: &Path) -> ignore::gitignore::Gitignore {
     let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
     let cfg = crate::paths::config_dir();
     for p in [
+        // `.codegraphignore` = noise rules shared with glob/grep search;
+        // `.codegraphignore.graph` = GRAPH-ONLY sensitive rules (`.env*`, keys, SSH) —
+        // search must still find what the user explicitly asks for, so those rules are
+        // never registered with the search walker. Two scopes, two files, no duplication.
         root.join(".codegraphignore"),
         root.join(".codegraignore"),
+        root.join(".codegraphignore.graph"),
+        root.join(".codegraignore.graph"),
         root.join(".jeikcode").join(".codegraphignore"),
-        root.join(".atomcode").join(".codegraphignore"),
+        root.join(".jeikcode").join(".codegraphignore.graph"),
         cfg.join(".codegraphignore"),
         cfg.join(".codegraignore"),
+        cfg.join(".codegraphignore.graph"),
+        cfg.join(".codegraignore.graph"),
     ] {
         if p.is_file() {
             let _ = builder.add(&p);
@@ -1154,6 +1162,36 @@ fn load_codegraph_ignore(root: &Path) -> ignore::gitignore::Gitignore {
             .build()
             .expect("empty gitignore")
     })
+}
+
+/// The GRAPH-ONLY sensitive list must keep credentials out of indexing while the SHARED
+/// noise list stays search-visible (see `assets/.codegraphignore.graph`).
+#[cfg(test)]
+mod graph_ignore_scope_tests {
+    use super::load_codegraph_ignore;
+
+    #[test]
+    fn graph_only_list_hides_credentials_from_indexing() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join(".codegraphignore.graph"),
+            include_str!("../../assets/.codegraphignore.graph"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(d.path().join("src")).unwrap();
+        let gi = load_codegraph_ignore(d.path());
+        for hidden in [".env", ".env.local", "id_rsa", ".ssh"] {
+            assert!(
+                gi.matched(d.path().join(hidden), hidden == ".ssh")
+                    .is_ignore(),
+                "graph must not index {hidden}"
+            );
+        }
+        assert!(
+            !gi.matched(d.path().join("src/main.rs"), false).is_ignore(),
+            "source files must stay indexed"
+        );
+    }
 }
 
 fn codegraph_ignored(gi: &ignore::gitignore::Gitignore, root: &Path, path: &Path) -> bool {
@@ -1450,14 +1488,10 @@ fn collect_files_fallback(root: &Path) -> Vec<Walked> {
         builder.add_ignore(global_ignore2);
     }
 
-    // Also check .jeikcode/.codegraphignore and legacy .atomcode/.codegraphignore inside project root
+    // Also check .jeikcode/.codegraphignore inside project root
     let project_jeikcode_ignore = root.join(".jeikcode").join(".codegraphignore");
     if project_jeikcode_ignore.is_file() {
         builder.add_ignore(project_jeikcode_ignore);
-    }
-    let project_atomcode_ignore = root.join(".atomcode").join(".codegraphignore");
-    if project_atomcode_ignore.is_file() {
-        builder.add_ignore(project_atomcode_ignore);
     }
 
     for entry in builder
@@ -3624,7 +3658,7 @@ impl CodeIndex {
             // (`ReparseBudget::Unlimited`) creates a first index.
             if !matches!(budget, ReparseBudget::Unlimited) {
                 on_progress(
-                    "Code graph: no index — skipped auto-build. Use list_directory; \
+                    "Code graph: no index — skipped auto-build. Use read; \
                      leave `jeikcode init` to the user.",
                 );
                 let mut guard = match self.inner.lock() {

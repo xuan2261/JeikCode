@@ -1,18 +1,23 @@
 //! `bash` — run a shell command in the working directory until it exits, the
-//! configured `[tools.bash] max_timeout_secs` hard cap, a short-command idle
-//! kill (`[tools.bash] silent_kill_secs`, skipped for compile/test families),
-//! or cancel (cancel ⇒ the child is killed via `kill_on_drop`). Live
+//! configured `[tools.bash] max_timeout_secs` hard cap, or cancel (cancel ⇒
+//! the child is killed via `kill_on_drop`). `[tools.bash] silent_kill_secs` is
+//! a short-command **recheck interval** (skipped for compile/test families):
+//! pager/REPL/TUI fingerprints and foreground resident servers are killed;
+//! CPU-busy work is auto-promoted; a silent CPU-idle process with no
+//! interactive fingerprint keeps running until exit or the hard cap. Live
 //! stdout/stderr is forwarded through [`ToolContext::progress`]. There is no
 //! per-call `timeout` argument: the model does not choose a wait budget.
-//! Captured output is kept even when the hard cap or idle kill stops the process.
+//! Captured output is kept even when the hard cap or a fingerprint kill stops
+//! the process.
 //!
 //! `risk()` is ARG-AWARE: a command is `Risky` only when [`check_destructive_command`]
 //! flags it (a faithful port of the production destructive-command classifier —
 //! privilege escalation, recursive force deletes, `find -delete`, `dd`, fork bombs,
 //! destructive git, remote-script-piped-to-shell, …); everything else is `Safe`.
 
+use super::bash_log::BackgroundLogWriter;
 use super::bash_runtime::{
-    classify_idle, decision_prompt, is_generic_long_keyword, legacy_bash_runtime_state, new_bashid,
+    classify_idle, decision_prompt, is_generic_long_keyword, legacy_bash_runtime_state,
     tree_is_busy, BackgroundAlert, BashRuntimeState, BusyKind, IdleAction, LiveBash,
     KILLED_BY_TOOL_MARK, PROMOTED_MARK,
 };
@@ -440,10 +445,14 @@ impl Tool for BashTool {
         );
         let idle_note_secs = idle.map(|d| d.as_secs()).unwrap_or(0);
         let started_short = idle.is_some();
-        let bashid = new_bashid();
+        let child_pid_val = child_pid.unwrap_or(0);
+        let session_id = runtime.session_id().unwrap_or_else(|| {
+            std::env::var("JEIKCODE_SESSION_ID").unwrap_or_else(|_| "default".to_string())
+        });
         let second_levell_secs = agent_second_level_secs(bash_cfg.second_levell_secs);
         let live = Arc::new(LiveBash {
-            bashid: bashid.clone(),
+            pid: child_pid_val,
+            session_id: session_id.clone(),
             command: effective_command.clone(),
             promoted: AtomicBool::new(idle.is_none()),
             second_level: AtomicBool::new(false),
@@ -494,7 +503,7 @@ impl Tool for BashTool {
                         if let Some(pgid) = child_pid {
                             unsafe { killpg(pgid as i32, SIGKILL) };
                         }
-                        runtime.unregister_live_bash(&bashid);
+                        runtime.unregister_live_bash(child_pid_val);
                         let (out, errb) = snapshot();
                         return annotate(err(with_note(&out, &errb, "bash: cancelled before completion.")));
                     }
@@ -505,7 +514,7 @@ impl Tool for BashTool {
                         if let Some(pgid) = child_pid {
                             unsafe { killpg(pgid as i32, SIGKILL) };
                         }
-                        runtime.unregister_live_bash(&bashid);
+                        runtime.unregister_live_bash(child_pid_val);
                         let (out, errb) = snapshot();
                         return annotate(err(with_note(&out, &errb, KILLED_BY_TOOL_MARK)));
                     }
@@ -514,7 +523,7 @@ impl Tool for BashTool {
                         {
                             child.terminated = true;
                         }
-                        runtime.unregister_live_bash(&bashid);
+                        runtime.unregister_live_bash(child_pid_val);
                         let (out, errb) = snapshot();
                         return annotate(match status {
                             Ok(st) if st.success() => {
@@ -571,8 +580,17 @@ impl Tool for BashTool {
             let (init_out, init_err) = snapshot();
             let initial_output = format_streams(&init_out, &init_err, None, false);
 
+            let pid_num = child_pid.unwrap_or(0);
+            let mut bg_writer = BackgroundLogWriter::create(&session_id, pid_num, &initial_output)
+                .await
+                .ok();
+            let bg_log_path_display = bg_writer
+                .as_ref()
+                .map(|w| w.path_display())
+                .unwrap_or_else(|| format!("jeikcode-back-{session_id}-{pid_num}.log"));
+
             let bg_live = live.clone();
-            let bg_bashid = bashid.clone();
+            let bg_pid = child_pid_val;
             let bg_cmd = effective_command.clone();
             let bg_runtime = Arc::clone(&runtime);
             tokio::spawn(async move {
@@ -598,7 +616,7 @@ impl Tool for BashTool {
                             if let Some(pgid) = child_pid {
                                 unsafe { killpg(pgid as i32, SIGKILL) };
                             }
-                            bg_runtime.unregister_live_bash(&bg_bashid);
+                            bg_runtime.unregister_live_bash(bg_pid);
                             break;
                         }
                         status = bg_child.wait() => {
@@ -606,13 +624,13 @@ impl Tool for BashTool {
                             {
                                 bg_child.terminated = true;
                             }
-                            bg_runtime.unregister_live_bash(&bg_bashid);
+                            bg_runtime.unregister_live_bash(bg_pid);
                             if !bg_live.kill.is_cancelled() {
                                 if let Ok(st) = status {
                                     if !st.success() {
                                         let tail = bg_live.tail_logs(5).join("\n");
                                         bg_runtime.push_background_alert(BackgroundAlert {
-                                            bashid: bg_bashid,
+                                            pid: bg_pid,
                                             command: bg_cmd,
                                             exit_code: st.code(),
                                             error_tail: tail,
@@ -627,6 +645,9 @@ impl Tool for BashTool {
                                 Ok(0) => out_done = true,
                                 Ok(n) => {
                                     if let Some(chunk) = decode_stream_chunk(&mut out_dec, &out_buf[..n], false) {
+                                        if let Some(ref mut writer) = bg_writer {
+                                            let _ = writer.append(&chunk).await;
+                                        }
                                         for line in chunk.lines() {
                                             bg_live.push_log_line(line);
                                         }
@@ -640,6 +661,9 @@ impl Tool for BashTool {
                                 Ok(0) => err_done = true,
                                 Ok(n) => {
                                     if let Some(chunk) = decode_stream_chunk(&mut err_dec, &err_buf[..n], false) {
+                                        if let Some(ref mut writer) = bg_writer {
+                                            let _ = writer.append(&chunk).await;
+                                        }
                                         for line in chunk.lines() {
                                             bg_live.push_log_line(line);
                                         }
@@ -652,24 +676,66 @@ impl Tool for BashTool {
                 }
             });
 
+            // Report ids a model can ACT on: the workload's WinPID (`taskkill`) plus
+            // its Git-Bash pid (`kill`) — see `render_background_pid_block` for why the
+            // wrapper shell's number alone is not enough.
+            #[cfg(target_os = "windows")]
+            let workloads = {
+                let rows = match child_pid {
+                    Some(pid) => windows_descendant_rows(pid),
+                    None => Vec::new(),
+                };
+                let leaves = workload_leaves(&rows);
+                let winpids: Vec<u32> = leaves.iter().map(|(pid, _)| *pid).collect();
+                let mut msys = msys_pids_for(&winpids).await;
+                leaves
+                    .into_iter()
+                    .map(|(pid, name)| (pid, msys.remove(&pid), name))
+                    .collect::<Vec<_>>()
+            };
+            #[cfg(not(target_os = "windows"))]
+            let workloads: Vec<(u32, Option<u32>, String)> = Vec::new();
+
             let pid_info = match child_pid {
-                Some(pid) => format!("PID: {pid}"),
+                Some(pid) => render_background_pid_block(pid, &workloads),
                 None => "PID: unknown".to_string(),
             };
             let detected_ports = detect_listening_ports_from_output(&initial_output);
+            // Health-check every port the startup output declared: a listener that ACCEPTS
+            // on 127.0.0.1 is real evidence the service is up. "Not reachable yet" stays an
+            // observation (bind addresses vary), never a failure claim.
             let port_info = if !detected_ports.is_empty() {
-                let port_str = detected_ports
-                    .iter()
-                    .map(|p| p.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("\nPort: {port_str}")
+                let mut parts = Vec::with_capacity(detected_ports.len());
+                for port in &detected_ports {
+                    parts.push(if port_accepts_loopback(*port).await {
+                        format!("{port} (accepting on 127.0.0.1)")
+                    } else {
+                        format!("{port} (not reachable on 127.0.0.1 yet)")
+                    });
+                }
+                format!("\nPort: {}", parts.join(", "))
             } else {
                 String::new()
             };
+            // "Alive" is not "ready": with neither output nor a declared port there is no
+            // evidence at all, so the report says so instead of reading as a successful start.
+            let unverified_note = if initial_output.trim().is_empty() && detected_ports.is_empty() {
+                "\n[Note: no output and no listening port detected yet — the process is alive \
+                 but its readiness is UNVERIFIED; check the log path before relying on it.]"
+            } else {
+                ""
+            };
+            let log_info = format!("\nLog path: {bg_log_path_display}");
+
+            let guidance_note = format!(
+                "\n\n[Note: The process is detached and actively running in the background. It may still be initializing, loading model weights, or warming up. If initial connection attempts fail, wait a few moments for startup to complete, poll the health endpoint/port, or inspect live progress via the log path above.\n\
+                 Tips for fast log inspection with `read`:\n\
+                 - To inspect latest logs at the tail: call `read` with a negative offset (e.g. `read(path=\"{bg_log_path_display}\", offset=-50)`).\n\
+                 - To search keywords or error context: call `read` with `key_string` and adjust `upward`/`downward` (e.g. `read(path=\"{bg_log_path_display}\", key_string=\"<keyword>\", upward=10, downward=20)`).]"
+            );
 
             return annotate(ok(format!(
-                "Background process started.\nCommand: `{effective_command}`\n{pid_info}{port_info}\n\nInitial output (settled for {settle_secs}s):\n{initial_output}"
+                "Background process started.\nCommand: `{effective_command}`\n{pid_info}{port_info}{log_info}{unverified_note}\n\nInitial output (settled for {settle_secs}s):\n{initial_output}{guidance_note}"
             )));
         }
 
@@ -721,7 +787,7 @@ impl Tool for BashTool {
                     if let Some(pgid) = child_pid {
                         unsafe { killpg(pgid as i32, SIGKILL) };
                     }
-                    runtime.unregister_live_bash(&bashid);
+                    runtime.unregister_live_bash(child_pid_val);
                     let (out, errb) = snapshot();
                     break Drive::Result(err(with_note(&out, &errb, "bash: cancelled before completion.")));
                 }
@@ -732,7 +798,7 @@ impl Tool for BashTool {
                     if let Some(pgid) = child_pid {
                         unsafe { killpg(pgid as i32, SIGKILL) };
                     }
-                    runtime.unregister_live_bash(&bashid);
+                    runtime.unregister_live_bash(child_pid_val);
                     progress.emit(format!("{KILLED_BY_TOOL_MARK}\n"));
                     let (out, errb) = snapshot();
                     break Drive::Result(err(with_note(&out, &errb, KILLED_BY_TOOL_MARK)));
@@ -787,7 +853,7 @@ impl Tool for BashTool {
                             if let Some(pgid) = child_pid {
                                 unsafe { killpg(pgid as i32, SIGKILL) };
                             }
-                            runtime.unregister_live_bash(&bashid);
+                            runtime.unregister_live_bash(child_pid_val);
                             let (out, errb) = snapshot();
                             break Drive::Result(err(with_note(
                                 &out,
@@ -805,7 +871,35 @@ impl Tool for BashTool {
                     {
                         child.terminated = true;
                     }
-                    runtime.unregister_live_bash(&bashid);
+                    runtime.unregister_live_bash(child_pid_val);
+                    while !stdout_done {
+                        match stdout.read(&mut out_buf).await {
+                            Ok(0) | Err(_) => stdout_done = true,
+                            Ok(n) => {
+                                stdout_cap.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(&out_buf[..n]);
+                                if let Some(chunk) = decode_stream_chunk(&mut stdout_decode, &out_buf[..n], false) {
+                                    emit_live_chunk(&progress, live_sent.as_ref(), &chunk);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(chunk) = decode_stream_chunk(&mut stdout_decode, &[], true) {
+                        emit_live_chunk(&progress, live_sent.as_ref(), &chunk);
+                    }
+                    while !stderr_done {
+                        match stderr.read(&mut err_buf).await {
+                            Ok(0) | Err(_) => stderr_done = true,
+                            Ok(n) => {
+                                stderr_cap.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(&err_buf[..n]);
+                                if let Some(chunk) = decode_stream_chunk(&mut stderr_decode, &err_buf[..n], false) {
+                                    emit_live_chunk(&progress, live_sent.as_ref(), &chunk);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(chunk) = decode_stream_chunk(&mut stderr_decode, &[], true) {
+                        emit_live_chunk(&progress, live_sent.as_ref(), &chunk);
+                    }
                     break Drive::Result(match status {
                         Ok(st) => {
                             let (out, errb) = snapshot();
@@ -843,7 +937,7 @@ impl Tool for BashTool {
                                 if let Some(pgid) = child_pid {
                                     unsafe { killpg(pgid as i32, SIGKILL) };
                                 }
-                                runtime.unregister_live_bash(&bashid);
+                                runtime.unregister_live_bash(child_pid_val);
                                 break Drive::Result(err(with_note(
                                     &out,
                                     &errb,
@@ -853,42 +947,10 @@ impl Tool for BashTool {
                                     ),
                                 )));
                             }
-                            let already_second = live.second_level.swap(true, Ordering::SeqCst);
-                            if has_output()
-                                && second_levell_secs > 0
-                                && !already_second
-                                && !live.promoted.load(Ordering::SeqCst)
-                            {
-                                *last_byte.lock().unwrap_or_else(|e| e.into_inner()) =
-                                    Instant::now();
-                                progress.emit(format!(
-                                    "[bash second-level idle {second_levell_secs}s] \
-                                     output already seen; giving a silent compile a chance to start.\n"
-                                ));
-                            } else if has_output()
-                                && !live.promoted.load(Ordering::SeqCst)
-                            {
-                                break Drive::Yield;
-                            } else {
-                            #[cfg(windows)]
-                            crate::process_utils::kill_windows_tree(&job_guard, child_pid);
-                            #[cfg(not(target_os = "windows"))]
-                            if let Some(pgid) = child_pid {
-                                unsafe { killpg(pgid as i32, SIGKILL) };
-                            }
-                            runtime.unregister_live_bash(&bashid);
-                            let (out, errb) = snapshot();
-                            break Drive::Result(err(with_note(
-                                &out,
-                                &errb,
-                                &format!(
-                                    "bash: no new output for {idle_note_secs}s and the process is idle \
-                                     (pager, follow/watch, REPL, or waiting for a key). \
-                                     Captured output is above. Do not retry the same blocking command. \
-                                     Resident services must be started detached (nohup/systemd/docker -d)."
-                                ),
-                            )));
-                            }
+                            // Silent wait: `silent_kill_secs` is a recheck interval.
+                            // No pager/REPL/TUI fingerprint → keep running until the
+                            // process exits or `max_timeout_secs`.
+                            *last_byte.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
                         }
                         IdleAction::KillResident => {
                             #[cfg(windows)]
@@ -897,7 +959,7 @@ impl Tool for BashTool {
                             if let Some(pgid) = child_pid {
                                 unsafe { killpg(pgid as i32, SIGKILL) };
                             }
-                            runtime.unregister_live_bash(&bashid);
+                            runtime.unregister_live_bash(child_pid_val);
                             let (out, errb) = snapshot();
                             break Drive::Result(err(with_note(
                                 &out,
@@ -920,7 +982,7 @@ impl Tool for BashTool {
                     if let Some(pgid) = child_pid {
                         unsafe { killpg(pgid as i32, SIGKILL) };
                     }
-                    runtime.unregister_live_bash(&bashid);
+                    runtime.unregister_live_bash(child_pid_val);
                     let (out, errb) = snapshot();
                     break Drive::Result(err(with_note(
                         &out,
@@ -937,8 +999,7 @@ impl Tool for BashTool {
             Drive::Result(r) => annotate(r),
             Drive::Yield => {
                 let suggested = suggested_long_keyword(&effective_command);
-                let prompt =
-                    decision_prompt(&bashid, idle_note_secs, second_levell_secs, &suggested);
+                let prompt = decision_prompt(idle_note_secs, second_levell_secs, &suggested);
                 progress.emit(format!("{prompt}\n"));
                 let (out, errb) = snapshot();
                 let body = with_note(&out, &errb, &prompt);
@@ -948,7 +1009,7 @@ impl Tool for BashTool {
                 let stderr_cap_bg = stderr_cap.clone();
                 let last_byte_bg = last_byte.clone();
                 let live_bg = live.clone();
-                let bashid_bg = bashid.clone();
+                let pid_bg = child_pid_val;
                 let runtime_bg = Arc::clone(&runtime);
                 #[cfg(windows)]
                 let job_guard_bg = job_guard;
@@ -972,7 +1033,7 @@ impl Tool for BashTool {
                                     unsafe { killpg(pgid as i32, SIGKILL) };
                                 }
                                 progress_bg.emit(format!("{KILLED_BY_TOOL_MARK}\n"));
-                                runtime_bg.unregister_live_bash(&bashid_bg);
+                                runtime_bg.unregister_live_bash(pid_bg);
                                 return;
                             }
                             n = stdout.read(&mut out_buf), if !stdout_done => {
@@ -1004,11 +1065,14 @@ impl Tool for BashTool {
                             status = child.wait() => {
                                 #[cfg(not(target_os = "windows"))]
                                 {
-                                    child.terminated = true;
+                                    // Flag the pgroup as reaped so `Drop` skips its final
+                                    // SIGKILL. Routed through a method because rustc cannot
+                                    // observe the `Drop` read across the detached `async move`.
+                                    child.mark_terminated();
                                 }
                                 let code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
                                 progress_bg.emit(format!("[exit code {code}]\n"));
-                                runtime_bg.unregister_live_bash(&bashid_bg);
+                                runtime_bg.unregister_live_bash(pid_bg);
                                 return;
                             }
                             _ = tokio::time::sleep(until_hard) => {
@@ -1021,7 +1085,7 @@ impl Tool for BashTool {
                                 progress_bg.emit(format!(
                                     "bash: reached configured max_timeout_secs ({max_timeout}s); the process was stopped.\n"
                                 ));
-                                runtime_bg.unregister_live_bash(&bashid_bg);
+                                runtime_bg.unregister_live_bash(pid_bg);
                                 return;
                             }
                         }
@@ -1078,7 +1142,7 @@ fn shell_tool_description(
         () => {
             "Run a shell command and return stdout, stderr, and exit code. \
              Use for builds, tests, package management, Git operations, binaries, and process checks. \
-             Prefer dedicated tools for files: `read_file`, `grep`, `glob`, `list_directory`, `edit_file`, `write_file`. \
+             Prefer dedicated tools for files: `read` (also lists directories), `grep`, `glob`, `edit`, `write`. \
              `&&`, `||`, and `|` are supported. Use `;` only when the next command must run even if the previous failed. \
              Shell pipelines and aggregation (such as wc, sort, uniq, git log) are supported."
         };
@@ -1092,11 +1156,11 @@ fn shell_tool_description(
              key or Ctrl+C — they hang the tool even after the useful output is printed. \
              Use one-shot flags (`--no-pager`, `-n`, `-c`, `--batch`) and \
              `systemctl is-active`/`show` or `ss`/`lsof` for ports. Never chain a \
-             blocking command with later steps in one call. Short commands idle after \
-             config `silent_kill_secs`: CPU-busy work is auto-promoted to a batch job; \
-             disk/network IO is NOT auto-promoted and takes the `second_levell_secs` \
-             grace, then `[bash-await-decision]` so you can kill or temporarily upgrade. \
-             A silent idle with no output is killed (pager/REPL). \
+             blocking command with later steps in one call. Short commands recheck \
+             every config `silent_kill_secs`: CPU-busy work is auto-promoted to a batch job; \
+             pager/REPL/TUI fingerprints and foreground resident servers are killed. \
+             A silent CPU-idle process with no interactive fingerprint is a wait and \
+             keeps running until it exits or `max_timeout_secs`. \
              Resident servers (uvicorn/nginx/npm run dev) should be started with background=true (or started detached). \
              Compile/test families wait on `max_timeout_secs`."
         };
@@ -1117,7 +1181,7 @@ fn shell_tool_description(
              `Get-ChildItem -LiteralPath '\\\\server\\share$'`. Always quote paths \
              containing spaces, e.g. `if exist \"C:\\Program Files\"` — an unquoted spaced path \
              splits into two tokens and reports a false \"not found\".\n\
-             The dedicated file tools above (read_file / grep / glob / list_directory) also \
+             The dedicated file tools above (read / grep / glob) also \
              sidestep cmd's type/find/dir and all the quoting pitfalls here."
         };
     }
@@ -1137,9 +1201,10 @@ fn shell_tool_description(
              Windows-native tools (where, reg, tasklist, sc) are still callable by name. Do \
              NOT emit cmd.exe builtins (`dir`, `type`, `copy`, `%VAR%`) — use their bash \
              equivalents (`ls`, `cat`, `cp`, `$VAR`) or the dedicated file tools above.\n\
-             OUTPUT: discard a stream with `>/dev/null` (or `2>/dev/null`), NEVER `nul` — \
-             here `> nul` does not mean the null device; it creates a stray, undeletable \
-             `nul` file in the working directory."
+             OUTPUT: discard a stream with `>/dev/null` (or `2>/dev/null`) — no special \
+             spelling is needed.\n\
+             PATHS & FLAGS: hand paths to native Windows programs as `$TMPDIR`/`$DESKTOP` \
+             (never a hardcoded `/tmp/x` — that only works for MSYS tools)."
         };
     }
     // Tell the model interactive password prompts work — ONLY when the askpass
@@ -1329,13 +1394,324 @@ fn powershell_encoded_command(command: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(utf16_le)
 }
 
+/// All descendants of `root` as `(pid, parent, exe name)` rows (BFS over a Toolhelp
+/// snapshot, depth-bounded so a re-parenting process cannot spin this). The wrapper
+/// shell is excluded: MSYS `kill` cannot signal it (foreign session), so it is only
+/// ever reported as the `taskkill /F /T` tree-kill root.
+#[cfg(target_os = "windows")]
+fn windows_descendant_rows(root: u32) -> Vec<(u32, u32, String)> {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    /// Closes the snapshot handle on every exit path (including early returns).
+    struct Snapshot(HANDLE);
+    impl Drop for Snapshot {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Vec::new();
+    }
+    let snapshot = Snapshot(snapshot);
+
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut rows: Vec<(u32, u32, String)> = Vec::new();
+    let mut more = unsafe { Process32FirstW(snapshot.0, &mut entry) } != 0;
+    while more {
+        let len = entry
+            .szExeFile
+            .iter()
+            .position(|c| *c == 0)
+            .unwrap_or(entry.szExeFile.len());
+        rows.push((
+            entry.th32ProcessID,
+            entry.th32ParentProcessID,
+            String::from_utf16_lossy(&entry.szExeFile[..len]),
+        ));
+        more = unsafe { Process32NextW(snapshot.0, &mut entry) } != 0;
+    }
+
+    let mut found: Vec<(u32, u32, String)> = Vec::new();
+    let mut frontier = vec![root];
+    for _ in 0..4 {
+        let mut next: Vec<u32> = Vec::new();
+        for (pid, parent, name) in &rows {
+            if frontier.contains(parent) && *pid != root && !found.iter().any(|(p, _, _)| p == pid)
+            {
+                found.push((*pid, *parent, name.clone()));
+                next.push(*pid);
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    found
+}
+
+/// The workload processes worth reporting: the LEAVES among the descendants — the
+/// server/worker itself (python/node/…), not the inner shells that merely wait on it.
+/// Killing a leaf unwinds the wrapper (verified: the wrapper exits once its child
+/// dies), while killing an inner shell would orphan the real workload.
+/// Console hosts are dropped: Windows spawns `conhost.exe`/`OpenConsole.exe` as children
+/// of a console app, and they are never the user's workload.
+/// Only the Windows reporting path calls this; the unit tests cover it everywhere.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn workload_leaves(rows: &[(u32, u32, String)]) -> Vec<(u32, String)> {
+    rows.iter()
+        .filter(|(pid, _, _)| !rows.iter().any(|(_, parent, _)| parent == pid))
+        .filter(|(_, _, name)| {
+            let name = name.to_ascii_lowercase();
+            name != "conhost.exe" && name != "openconsole.exe"
+        })
+        .map(|(pid, _, name)| (*pid, name.clone()))
+        .collect()
+}
+
+/// `ps -W` rows are `PID PPID PGID WINPID TTY UID STIME COMMAND`; the WINPID → MSYS
+/// pid map is what lets the report print an id that Git Bash's `kill` can actually
+/// signal. Pure so it is unit-tested against a real capture from this platform.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn parse_ps_w_ids(text: &str) -> std::collections::HashMap<u32, u32> {
+    let mut map = std::collections::HashMap::new();
+    for line in text.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 4 || cols[0] == "PID" {
+            continue;
+        }
+        if let (Ok(pid), Ok(winpid)) = (cols[0].parse::<u32>(), cols[3].parse::<u32>()) {
+            map.insert(winpid, pid);
+        }
+    }
+    map
+}
+
+/// Resolve Git-Bash pids for `winpids` with ONE `ps -W` spawn (MSYS keeps its own pid
+/// namespace, so the mapping can only be read from inside a shell). Best-effort: any
+/// failure degrades to `WinPID`-only reporting, never to a wrong id.
+#[cfg(target_os = "windows")]
+async fn msys_pids_for(winpids: &[u32]) -> std::collections::HashMap<u32, u32> {
+    if winpids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let Ok(mut cmd) = build_command("ps -W", ShellMode::Default) else {
+        return std::collections::HashMap::new();
+    };
+    let Ok(out) = cmd.output().await else {
+        return std::collections::HashMap::new();
+    };
+    if !out.status.success() {
+        return std::collections::HashMap::new();
+    }
+    parse_ps_w_ids(&String::from_utf8_lossy(&out.stdout))
+        .into_iter()
+        .filter(|(winpid, _)| winpids.contains(winpid))
+        .collect()
+}
+
+/// Does something ACCEPT a TCP connection on `127.0.0.1:port`? A cheap, portable readiness
+/// probe for a just-started background service: connect + immediate close (no bytes are
+/// sent, so an HTTP server logs no request). A negative result is reported as an
+/// observation, not a failure — services may bind only a specific interface.
+async fn port_accepts_loopback(port: u16) -> bool {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            tokio::net::TcpStream::connect(addr),
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
+/// Model-facing PID block for a background task.
+///
+/// Printing ONE number without its semantics is what made the old report
+/// untrustworthy (`kill <pid>` → "No such process"; `taskkill /F /PID` → orphan).
+/// Windows therefore prints the workload's TWO real ids with the recipe for each,
+/// and falls back to the wrapper's `WinPID` + whole-tree kill when no workload child
+/// can be attributed yet. Unix prints the process-group recipe (the wrapper leads it).
+fn render_background_pid_block(
+    wrapper_winpid: u32,
+    workloads: &[(u32, Option<u32>, String)],
+) -> String {
+    if !cfg!(windows) {
+        return format!(
+            "PID: {wrapper_winpid} (process-group leader)\nStop: `kill -TERM -{wrapper_winpid}` (whole process group)"
+        );
+    }
+    if workloads.is_empty() {
+        return format!(
+            "PID: WinPID {wrapper_winpid} (wrapper shell — no child process attributed yet)\n\
+             Stop: `taskkill /F /T /PID {wrapper_winpid}` (whole process tree)"
+        );
+    }
+    const SHOWN: usize = 3;
+    let shown = &workloads[..workloads.len().min(SHOWN)];
+    let mut pid_line = String::from("PID: ");
+    for (index, (winpid, msys, name)) in shown.iter().enumerate() {
+        if index > 0 {
+            pid_line.push_str(", ");
+        }
+        match msys {
+            Some(msys) => {
+                pid_line.push_str(&format!("{msys} (Git Bash) / WinPID {winpid} ({name})"))
+            }
+            None => pid_line.push_str(&format!("WinPID {winpid} ({name})")),
+        }
+    }
+    if workloads.len() > SHOWN {
+        pid_line.push_str(&format!(" (+{} more)", workloads.len() - SHOWN));
+    }
+    let kill_ids: Vec<String> = shown
+        .iter()
+        .filter_map(|(_, msys, _)| msys.map(|m| m.to_string()))
+        .collect();
+    let stop_line = if kill_ids.is_empty() {
+        format!("Stop: `taskkill /F /T /PID {wrapper_winpid}` (whole process tree)")
+    } else {
+        format!(
+            "Stop: `kill {}` (Git Bash) or `taskkill /F /T /PID {wrapper_winpid}` (wrapper shell, whole tree)",
+            kill_ids.join(" ")
+        )
+    };
+    format!("{pid_line}\n{stop_line}")
+}
+
+/// Export shell-agnostic, OS-resolved special directories so tools and native
+/// programs invoked from the shell agree on one real path (cross-platform).
+///
+/// Temp (`TMPDIR`/`TMP`/`TEMP`):
+/// - Windows/MSYS: MSYS path-argument conversion is disabled elsewhere (the `/flags`
+///   hardening in the Windows `build_command`), so a POSIX `/tmp/...` passed to a
+///   native tool (git.exe/node.exe) is mis-resolved by Win32 as `<drive>:\tmp\...`
+///   and fails with "No such file". We export the real temp dir in a WINDOWS-NATIVE,
+///   forward-slash form (`C:/Users/.../Temp`), so `"$TMPDIR/x"` works verbatim in
+///   bash AND native tools with no conversion.
+/// - POSIX: `std::env::temp_dir()` is already `/tmp`-style; exporting it honors a
+///   custom `TMPDIR` (e.g. sandboxes) instead of hardcoding `/tmp`.
+///
+/// Desktop (`DESKTOP`): the real desktop via the OS Known Folder API on Windows
+/// (`dirs::desktop_dir()` → registry-backed `SHGetKnownFolderPath(FOLDERID_Desktop)`),
+/// with `User Shell Folders\Desktop` as the direct-registry fallback, so a relocated /
+/// OneDrive-redirected desktop is honored instead of assuming `%USERPROFILE%\Desktop`.
+/// Native forward-slash form; skipped when unresolved or empty.
+///
+/// The values come from `crate::special_dirs` — the SAME source the built-in tools'
+/// `$VAR` path expansion uses (`pathutil::resolve_path`), so a shell child and a
+/// `read`/`grep`/`glob`/`edit` call can no longer disagree about `$TMPDIR`/`$DESKTOP`.
+fn apply_shell_env(cmd: &mut tokio::process::Command) {
+    for name in ["TMPDIR", "TMP", "TEMP", "DESKTOP"] {
+        let Some(dir) = crate::special_dirs::lookup(name) else {
+            continue;
+        };
+        if let Some(value) = native_dir_env_value(&dir) {
+            cmd.env(name, value);
+        }
+    }
+
+    // A second, NATIVE form under names MSYS does NOT rewrite. Experimentally verified:
+    // `MSYS2_ENV_CONV_EXCL` cannot stop the name-based conversion of TMPDIR/TMP/TEMP (a
+    // native parent spawning bash always yields the `/tmp` view), while an unknown name
+    // survives verbatim (`TMPDIR_WIN=F:/temp` → `F:/temp` inside bash). Native programs
+    // that receive a PATH ARGUMENT need this form:
+    // `python --directory "$TMPDIR_WIN/app"`.
+    #[cfg(windows)]
+    for (handle, source) in [("TMPDIR_WIN", "TMPDIR"), ("DESKTOP_WIN", "DESKTOP")] {
+        let Some(dir) = crate::special_dirs::lookup(source) else {
+            continue;
+        };
+        if let Some(value) = native_dir_env_value(&dir) {
+            cmd.env(handle, value);
+        }
+    }
+
+    #[cfg(windows)]
+    apply_bash_env_rc(cmd);
+}
+
+/// Name of the rc file every bash child sources (`BASH_ENV`) and of the variable carrying
+/// the user's previous `BASH_ENV` so ours chains instead of clobbering it.
+const SHELL_ENV_RC_FILE: &str = "jeikcode-shell-env.sh";
+const USER_BASH_ENV_VAR: &str = "JEIKCODE_USER_BASH_ENV";
+
+/// MSYS rewrites `TMPDIR`/`TMP`/`TEMP` into its POSIX view when a NATIVE parent starts a
+/// bash child — by variable NAME, and `MSYS2_ENV_CONV_EXCL` cannot stop it (verified on
+/// this platform), so whatever we export in the environment arrives as `/tmp`.
+///
+/// Re-exporting the native values from INSIDE the shell is the fix: bash sources
+/// `BASH_ENV` before running `-c`, and MSYS does not touch anything the runtime evaluates.
+/// Verified end to end: after this rc runs, `"$TMPDIR"` is `F:/temp` and a native program
+/// (`powershell Test-Path $env:TMPDIR`) resolves it — so `python --directory "$TMPDIR/app"`
+/// works without the model having to know any extra variable name.
+const SHELL_ENV_RC: &str = "\
+# JeikCode shell env — sourced via BASH_ENV before every `bash -c` (see bash.rs).\n\
+if [ -n \"$JEIKCODE_USER_BASH_ENV\" ] && [ -r \"$JEIKCODE_USER_BASH_ENV\" ]; then . \"$JEIKCODE_USER_BASH_ENV\"; fi\n\
+: \"${TMPDIR_WIN:=$TMPDIR}\"\n\
+export TMPDIR=\"$TMPDIR_WIN\" TMP=\"$TMPDIR_WIN\" TEMP=\"$TMPDIR_WIN\"\n\
+if [ -n \"$DESKTOP_WIN\" ]; then export DESKTOP=\"$DESKTOP_WIN\"; fi\n\
+";
+
+/// Install the rc file and point `BASH_ENV` at it (best-effort: any failure degrades to the
+/// previous behavior — the MSYS view — with `$TMPDIR_WIN` still available as a handle).
+///
+/// The file is PID-suffixed and written exactly ONCE per process ([`Once`]): tool shells are
+/// spawned from many threads (and many shells), and a child must never source a half-written
+/// rc — one writer per file and one write per process removes that window entirely.
+/// A missing file simply leaves `BASH_ENV` unset (bash would otherwise print a load error).
+#[cfg(windows)]
+fn apply_bash_env_rc(cmd: &mut tokio::process::Command) {
+    use std::sync::Once;
+
+    static INSTALL: Once = Once::new();
+    let rc =
+        crate::special_dirs::temp_dir().join(format!("{SHELL_ENV_RC_FILE}.{}", std::process::id()));
+    INSTALL.call_once(|| {
+        let _ = std::fs::write(&rc, SHELL_ENV_RC);
+    });
+    if !rc.exists() {
+        return;
+    }
+    if let Some(existing) = std::env::var_os("BASH_ENV") {
+        if !existing.is_empty() && existing.as_os_str() != rc.as_os_str() {
+            cmd.env(USER_BASH_ENV_VAR, existing);
+        }
+    }
+    cmd.env("BASH_ENV", &rc);
+}
+
+/// Native forward-slash form of a directory for shell export, without a trailing
+/// separator: `"$TMPDIR/x"` must not read `<dir>//x`. Never trims a drive root
+/// (`C:/` keeps its slash — `C:` alone is drive-relative).
+fn native_dir_env_value(dir: &std::path::Path) -> Option<String> {
+    let native = dir.to_string_lossy().replace('\\', "/");
+    let trimmed = native
+        .strip_suffix('/')
+        .filter(|rest| !rest.ends_with(':'))
+        .unwrap_or(native.as_str());
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
 fn build_powershell_command(command: &str) -> tokio::process::Command {
     #[cfg(windows)]
     let executable = "powershell.exe";
     #[cfg(not(windows))]
     let executable = "pwsh";
     let mut cmd = tokio::process::Command::new(executable);
-    let encoded = powershell_encoded_command(command);
+    let wrapped = format!(
+        "$ProgressPreference = 'SilentlyContinue'; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8;\n{}",
+        command
+    );
+    let encoded = powershell_encoded_command(&wrapped);
     cmd.args([
         "-NoLogo",
         "-NoProfile",
@@ -1343,6 +1719,7 @@ fn build_powershell_command(command: &str) -> tokio::process::Command {
         "-EncodedCommand",
         &encoded,
     ]);
+    apply_shell_env(&mut cmd);
     cmd
 }
 
@@ -1385,6 +1762,7 @@ fn build_command(command: &str, shell_mode: ShellMode) -> Result<tokio::process:
     let shell = detect_unix_shell();
     let mut cmd = tokio::process::Command::new(shell);
     cmd.arg("-c").arg(&command);
+    apply_shell_env(&mut cmd);
     Ok(cmd)
 }
 
@@ -1713,6 +2091,218 @@ fn rewrite_nul_redirect(command: &str) -> Cow<'_, str> {
     }
     result.push_str(&command[last_copied..]);
     Cow::Owned(result)
+}
+
+/// MSYS-convention ARGUMENT rewrites for the Windows Git Bash path.
+///
+/// `build_command` deliberately disables the MSYS argument conversion (the `/flags`
+/// hardening), which leaves two common spellings broken when an ARGUMENT is consumed by a
+/// native program. Both are rewritten here so neither the model nor the user has to know
+/// the difference:
+/// - `//X…` → `/X…`: the Git-Bash escape convention (`//F` used to arrive as `/F` because
+///   the runtime folded the doubled slash).
+/// - `/dev/null` → `NUL`: an MSYS tool wants `/dev/null`, but a NATIVE program resolves it
+///   as `<drive>:\dev\null` — it fails (curl exit 23) or, worse, writes a REAL file.
+///   Only NON-redirect tokens are rewritten (bash redirection handles `/dev/null` itself),
+///   and only when the segment's program classifies as native: `NUL` is a plain filename to
+///   an MSYS tool (`grep -f NUL` → "No such file or directory", verified).
+///
+/// Conservative by construction — single-quoted words, double-quoted words and
+/// heredoc/here-string commands are left ENTIRELY alone (they may be literal payload), and
+/// anything the classifier cannot place stays as written: a miss, never corruption.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn rewrite_msys_arg_conventions<'a>(
+    command: &'a str,
+    git_root: Option<&std::path::Path>,
+) -> Cow<'a, str> {
+    let bytes = command.as_bytes();
+    if command.contains("<<") || !bytes.contains(&b'/') {
+        return Cow::Borrowed(command);
+    }
+
+    // Words that only ever lead to ANOTHER program — the real program is later, so a
+    // classification here would be wrong. Leaving it unclassified means "no rewrite".
+    const WRAPPERS: [&str; 7] = ["env", "command", "sudo", "time", "nohup", "nice", "xargs"];
+
+    let n = bytes.len();
+    let mut result = String::new();
+    let mut last_copied = 0usize;
+    let mut changed = false;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut segment_program: Option<String> = None;
+    let mut redirect_target_next = false;
+    let mut i = 0usize;
+    while i < n {
+        let c = bytes[i];
+        if in_single {
+            if c == b'\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double {
+            if c == b'\\' && i + 1 < n {
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_double = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' => {
+                in_single = true;
+                i += 1;
+            }
+            b'"' => {
+                in_double = true;
+                i += 1;
+            }
+            b'\\' if i + 1 < n => i += 2,
+            b';' | b'|' | b'&' | b'(' | b')' | b'{' | b'}' | b'\n' => {
+                segment_program = None;
+                redirect_target_next = false;
+                i += 1;
+            }
+            b'<' | b'>' => {
+                let mut op_end = i + 1;
+                while op_end < n
+                    && (bytes[op_end] == b'<' || bytes[op_end] == b'>' || bytes[op_end] == b'|')
+                {
+                    op_end += 1;
+                }
+                let mut t = op_end;
+                while t < n && (bytes[t] == b' ' || bytes[t] == b'\t') {
+                    t += 1;
+                }
+                redirect_target_next = true;
+                i = t;
+            }
+            b' ' | b'\t' | b'\r' => i += 1,
+            _ => {
+                // A bare word (quotes are handled above, so a quote immediately ends it).
+                let start = i;
+                while i < n
+                    && !matches!(
+                        bytes[i],
+                        b' ' | b'\t'
+                            | b'\r'
+                            | b'\n'
+                            | b';'
+                            | b'|'
+                            | b'&'
+                            | b'('
+                            | b')'
+                            | b'{'
+                            | b'}'
+                            | b'<'
+                            | b'>'
+                            | b'\''
+                            | b'"'
+                    )
+                {
+                    i += 1;
+                }
+                let word = &command[start..i];
+                // `2>/dev/null`: the fd digits belong to the operator, not to a program.
+                if word.bytes().all(|b| b.is_ascii_digit())
+                    && matches!(bytes.get(i), Some(b'>') | Some(b'<'))
+                {
+                    continue;
+                }
+                if redirect_target_next {
+                    redirect_target_next = false;
+                    continue;
+                }
+                let is_first_word = segment_program.is_none();
+                // Before the real program: wrapper OPTIONS (`env -i curl`) and env-style
+                // ASSIGNMENTS (`env FOO=1 curl`) are not programs themselves — skipping them
+                // keeps the classification pointed at the actual binary.
+                let skippable_prefix = is_first_word
+                    && (word.starts_with('-')
+                        || word.find('=').is_some_and(|eq| {
+                            eq > 0
+                                && word[..eq]
+                                    .chars()
+                                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                        }));
+                if is_first_word && !skippable_prefix && !WRAPPERS.contains(&word) {
+                    segment_program = Some(word.to_owned());
+                }
+                let word_bytes = word.as_bytes();
+                let doubled_switch = word_bytes.len() > 2
+                    && word_bytes[0] == b'/'
+                    && word_bytes[1] == b'/'
+                    && word_bytes[2].is_ascii_alphabetic()
+                    && !word[2..].contains('/');
+                if doubled_switch {
+                    result.push_str(&command[last_copied..start]);
+                    result.push_str(&word[1..]);
+                    last_copied = i;
+                    changed = true;
+                    continue;
+                }
+                if word == "/dev/null" {
+                    let Some(program) = segment_program.as_deref() else {
+                        continue;
+                    };
+                    if program_is_native_windows(program, git_root) == Some(true) {
+                        result.push_str(&command[last_copied..start]);
+                        result.push_str("NUL");
+                        last_copied = i;
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    if !changed {
+        return Cow::Borrowed(command);
+    }
+    result.push_str(&command[last_copied..]);
+    Cow::Owned(result)
+}
+
+/// Classify a command word as a native Windows binary (`Some(true)` → `NUL` is right for
+/// it) or an MSYS tool (`Some(false)` → `/dev/null` is right). `None` = cannot tell.
+///
+/// The MSYS runtime ships its POSIX tool set under `<git_root>/usr/bin`, while the
+/// mingw64/clang64/ucrt64 trees are NATIVE builds — that split is exactly the `NUL` vs
+/// `/dev/null` split, and it is checkable from the shell's own Git root.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn program_is_native_windows(program: &str, git_root: Option<&std::path::Path>) -> Option<bool> {
+    let program = program.trim();
+    if program.is_empty() {
+        return None;
+    }
+    let lower = program.to_ascii_lowercase();
+    if lower.starts_with('/') {
+        if lower.starts_with("/usr/") || lower.starts_with("/bin/") {
+            return Some(false);
+        }
+        if lower.starts_with("/mingw") || lower.starts_with("/clang") || lower.starts_with("/ucrt")
+        {
+            return Some(true);
+        }
+        return None;
+    }
+    if program.len() > 1 && program.as_bytes()[1] == b':' {
+        return Some(true); // drive-letter path
+    }
+    if lower.contains('/') {
+        return None; // some other POSIX-ish path
+    }
+    let root = git_root?;
+    let name = if lower.ends_with(".exe") {
+        lower.clone()
+    } else {
+        format!("{lower}.exe")
+    };
+    Some(!root.join("usr").join("bin").join(name).exists())
 }
 
 /// Win32 PATH surgery for Git Bash. String-based (not `std::path::Path`) so the
@@ -2055,6 +2645,7 @@ fn build_command(command: &str, shell_mode: ShellMode) -> Result<tokio::process:
         let mut cmd = tokio::process::Command::new("cmd.exe");
         cmd.arg("/C");
         cmd.as_std_mut().raw_arg(&command);
+        apply_shell_env(&mut cmd);
         return Ok(cmd);
     }
     if let Some(bash) = detect_windows_bash() {
@@ -2065,12 +2656,23 @@ fn build_command(command: &str, shell_mode: ShellMode) -> Result<tokio::process:
         // is a plain filename, so `> nul` would create a stray, undeletable `nul` file in
         // the cwd (see `rewrite_nul_redirect`).
         let command = rewrite_nul_redirect(&command);
+        // Fold the Git-Bash `//X` convention and give a native program's own output argument
+        // a working discard target (`/dev/null` → `NUL`) — the run-time conversion that used
+        // to do this is deliberately disabled. See `rewrite_msys_arg_conventions`.
+        let git_root = std::path::Path::new(&bash)
+            .parent()
+            .and_then(|p| p.parent())
+            .map(std::path::Path::to_path_buf);
+        let command = rewrite_msys_arg_conventions(command.as_ref(), git_root.as_deref());
         let command = crate::process_utils::rewrite_python3_for_windows_shell(command.as_ref());
         let mut cmd = tokio::process::Command::new(&bash);
 
         // Grok-Build hardening: prevent MSYS2 from rewriting /flags (e.g. /NOLOGO, /DEBUG, /t:Build) into pseudo paths
         cmd.env("MSYS_NO_PATHCONV", "1");
         cmd.env("MSYS2_ARG_CONV_EXCL", "*");
+        // Shell env normalization (cross-platform helper): export native-form
+        // `$TMPDIR`/`TMP`/`TEMP` and the OS-resolved `$DESKTOP`.
+        apply_shell_env(&mut cmd);
         cmd.env("PYTHONUTF8", "1");
         cmd.env("PYTHONIOENCODING", "utf-8:surrogateescape");
 
@@ -2242,9 +2844,63 @@ fn decode_stream_chunk(pending: &mut Vec<u8>, bytes: &[u8], eof: bool) -> Option
     if emit_len == 0 {
         return None;
     }
-    let text = decode_output(&pending[..emit_len]);
+    let text = decode_mixed_span(&pending[..emit_len]);
     pending.drain(..emit_len);
     Some(text)
+}
+
+/// Decode a byte span that may MIX UTF-8 text with legacy (GBK/Big5/…) text — the shape
+/// of real Windows command output: a native tool's localized line (GBK) sitting between
+/// UTF-8 lines from bash/MSYS.
+///
+/// The span is split into maximal same-class runs at line boundaries: a UTF-8 run is
+/// emitted verbatim, and only a legacy run goes to [`decode_output`]. Decoding the whole
+/// span with ONE codepage (the previous behavior) garbled every UTF-8 line as soon as a
+/// single legacy line appeared in the same read — e.g. `echo "中文"; taskkill /F …` came
+/// back as mojibake because taskkill's localized error line pulled the whole span into
+/// the GBK decoder.
+fn decode_mixed_span(span: &[u8]) -> String {
+    // Fast path: nothing legacy in the span (the overwhelmingly common case).
+    if let Ok(text) = std::str::from_utf8(span) {
+        return text.to_owned();
+    }
+
+    let mut ranges: Vec<(bool, usize, usize)> = Vec::new();
+    let mut line_start = 0usize;
+    for (index, byte) in span.iter().enumerate() {
+        if matches!(byte, b'\n' | b'\r') {
+            let end = index + 1;
+            push_line_range(&mut ranges, span, line_start, end);
+            line_start = end;
+        }
+    }
+    if line_start < span.len() {
+        push_line_range(&mut ranges, span, line_start, span.len());
+    }
+
+    let mut out = String::with_capacity(span.len());
+    for (is_utf8, start, end) in ranges {
+        let run = &span[start..end];
+        if is_utf8 {
+            out.push_str(std::str::from_utf8(run).unwrap_or_default());
+        } else {
+            out.push_str(&decode_output(run));
+        }
+    }
+    out
+}
+
+/// Append one line's `[start, end)` to `ranges`, merging it into the previous range when
+/// the UTF-8/legacy class matches — so a multi-line legacy block is still handed to the
+/// detector as ONE unit (isolated short lines detect poorly).
+fn push_line_range(ranges: &mut Vec<(bool, usize, usize)>, span: &[u8], start: usize, end: usize) {
+    let is_utf8 = std::str::from_utf8(&span[start..end]).is_ok();
+    match ranges.last_mut() {
+        Some((last_is_utf8, _, last_end)) if *last_is_utf8 == is_utf8 && *last_end == start => {
+            *last_end = end;
+        }
+        _ => ranges.push((is_utf8, start, end)),
+    }
 }
 
 #[cfg(windows)]
@@ -2300,6 +2956,75 @@ fn consume_string_sequence(bytes: &[u8], start: usize) -> usize {
     j
 }
 
+/// Filter out PowerShell CLIXML stream noise in stderr (e.g. progress records like "正在使用模块...",
+/// InformationRecord, etc.) and extract real errors if present.
+fn clean_powershell_clixml(s: &str) -> String {
+    if !s.contains("#< CLIXML") {
+        return s.to_string();
+    }
+    let had_trailing_newline = s.ends_with('\n') || s.ends_with('\r');
+    let mut result = String::new();
+    let mut in_error = false;
+    let mut error_buf = String::new();
+
+    for line in s.lines() {
+        if line.starts_with("#< CLIXML") {
+            continue;
+        }
+        if line.contains("<S S=\"Error\">") {
+            in_error = true;
+            let start = line.find("<S S=\"Error\">").unwrap() + "<S S=\"Error\">".len();
+            let remainder = &line[start..];
+            if let Some(end) = remainder.find("</S>") {
+                error_buf.push_str(&remainder[..end]);
+                in_error = false;
+            } else {
+                error_buf.push_str(remainder);
+            }
+            continue;
+        }
+        if in_error {
+            if let Some(end) = line.find("</S>") {
+                error_buf.push_str(&line[..end]);
+                in_error = false;
+            } else {
+                error_buf.push_str(line);
+            }
+            continue;
+        }
+        if line.trim().starts_with('<') && line.trim().ends_with('>') {
+            continue;
+        }
+        if !line.is_empty() {
+            if !result.is_empty() {
+                result.push('\n');
+            }
+            result.push_str(line);
+        }
+    }
+
+    if !error_buf.is_empty() {
+        let cleaned_error = error_buf
+            .replace("_x000D__x000A_", "\n")
+            .replace("_x000D_", "\n")
+            .replace("_x000A_", "\n")
+            .replace("_x0020_", " ")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&");
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        result.push_str(cleaned_error.trim());
+    }
+
+    if had_trailing_newline && !result.is_empty() && !result.ends_with('\n') {
+        result.push('\n');
+    }
+
+    result
+}
+
 /// Strip ANSI escape sequences and resolve `\r` progress-line rewrites so bash
 /// output is clean text before it enters the model's context (and, downstream,
 /// the TUI). Without this, git hooks / cargo / docker / progress bars emit CSI
@@ -2309,6 +3034,15 @@ fn consume_string_sequence(bytes: &[u8], start: usize) -> usize {
 /// (`jeikcode-core/src/tool/bash.rs`) with 8-bit C1 introducers and DCS/SOS/PM/APC
 /// string sequences.
 fn sanitize_terminal_output(s: &str) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
+    let had_trailing_newline = s.ends_with('\n') || s.ends_with('\r');
+    let s = if s.contains("#< CLIXML") {
+        clean_powershell_clixml(s)
+    } else {
+        s.to_string()
+    };
     if s.is_empty() {
         return String::new();
     }
@@ -2369,20 +3103,29 @@ fn sanitize_terminal_output(s: &str) -> String {
     // in the common case.
     let cleaned = String::from_utf8_lossy(&stripped).into_owned();
 
-    // Resolve `\r` progress rewrites. For each logical line, when `\r` appears
-    // mid-line the terminal would repaint from column 0, so only the suffix
-    // after the final `\r` is actually visible to the user. We keep just that.
-    let mut out = String::with_capacity(cleaned.len());
-    for (idx, line) in cleaned.split('\n').enumerate() {
+    // Resolve `\r` progress rewrites and preserve stage newlines so CLI tools (pip,
+    // cargo, docker, git) don't concatenate into a single unreadable unbroken line.
+    let normalized = cleaned.replace("\r\n", "\n");
+    let mut out = String::with_capacity(normalized.len());
+
+    for (idx, line) in normalized.split('\n').enumerate() {
         if idx > 0 {
             out.push('\n');
         }
-        let line = line.trim_end_matches('\r');
-        if let Some(pos) = line.rfind('\r') {
-            out.push_str(&line[pos + 1..]);
+        let line_ends_with_cr = line.ends_with('\r');
+        let trimmed_line = line.trim_end_matches('\r');
+        if let Some(pos) = trimmed_line.rfind('\r') {
+            out.push_str(&trimmed_line[pos + 1..]);
         } else {
-            out.push_str(line);
+            out.push_str(trimmed_line);
         }
+        if line_ends_with_cr && !out.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+
+    if had_trailing_newline && !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
     }
 
     // Drop any remaining C0 control characters except tab and newline — they
@@ -2499,8 +3242,9 @@ fn format_streams(
     exit: Option<(bool, Option<i32>)>,
     incremental: bool,
 ) -> String {
-    let stdout = sanitize_terminal_output(&decode_output(stdout));
-    let stderr = sanitize_terminal_output(&decode_output(stderr));
+    // Mixed-encoding aware: a legacy (GBK) line must not drag the UTF-8 lines with it.
+    let stdout = sanitize_terminal_output(&decode_mixed_span(stdout));
+    let stderr = sanitize_terminal_output(&decode_mixed_span(stderr));
     let mut s = String::new();
     if !stdout.is_empty() {
         s.push_str(&stdout);
@@ -3345,17 +4089,13 @@ pub fn check_interactive_command(command: &str) -> Option<String> {
             }
         }
 
-        // 3. Git interactive prompts
-        if bin == "git" {
-            let has_interactive_flag = args.iter().any(|a| {
-                let w = arg_word(a);
-                matches!(w, "-p" | "--patch" | "-i" | "--interactive")
-            });
-            if has_interactive_flag {
-                return Some(
-                    "bash: interactive git flag (-p/--patch/-i/--interactive) requires a TTY and cannot run. Use non-interactive git commands instead.".to_string(),
-                );
-            }
+        // 3. Git interactive prompts. Flag meaning is subcommand-specific:
+        // `git log -p` / `git show -p` dump patches; `git log -i` is ignore-case.
+        // Only hunk-picking / interactive-add / rebase -i need a TTY.
+        if bin == "git" && git_args_are_interactive(args) {
+            return Some(
+                "bash: interactive git flag (-p/--patch/-i/--interactive) requires a TTY and cannot run. Use non-interactive git commands instead.".to_string(),
+            );
         }
 
         // 4. Bare REPLs (only when stdin is not redirected/piped)
@@ -3942,6 +4682,56 @@ fn arg_word(s: &str) -> &str {
     s.trim_matches(|c| c == '"' || c == '\'' || c == '`')
 }
 
+/// Git global flags that consume the next argv token before the subcommand.
+const GIT_GLOBAL_VALUE_FLAGS: &[&str] = &[
+    "-C",
+    "-c",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--exec-path",
+    "--config-env",
+    "--list-cmds",
+    "--attr-source",
+];
+
+fn git_invocation_subcommand(args: &[String]) -> Option<&str> {
+    let mut i = 0;
+    while i < args.len() {
+        let w = arg_word(&args[i]);
+        if w.starts_with('-') {
+            let glued = w.contains('=');
+            let takes_value = GIT_GLOBAL_VALUE_FLAGS
+                .iter()
+                .any(|f| w.eq_ignore_ascii_case(f));
+            i += if takes_value && !glued { 2 } else { 1 };
+            continue;
+        }
+        return Some(w);
+    }
+    None
+}
+
+/// `-p`/`-i` are interactive only on the subcommands that pick hunks or open a TUI.
+fn git_args_are_interactive(args: &[String]) -> bool {
+    let Some(sub) = git_invocation_subcommand(args) else {
+        return false;
+    };
+    let patch_picks_hunks = matches!(
+        sub,
+        "add" | "checkout" | "restore" | "reset" | "stash" | "commit"
+    );
+    let dash_i_is_tui = matches!(sub, "add" | "rebase" | "clean" | "commit");
+    args.iter().any(|a| {
+        let w = arg_word(a);
+        match w {
+            "-p" | "--patch" => patch_picks_hunks,
+            "-i" | "--interactive" => dash_i_is_tui,
+            _ => false,
+        }
+    })
+}
+
 /// Non-flag argv words. Skips `-x`, `--foo`, and cargo toolchains (`+nightly`).
 fn non_flag_words(args: &[String]) -> Vec<&str> {
     args.iter()
@@ -4362,9 +5152,9 @@ pub(crate) fn looks_like_resident_service(command: &str) -> bool {
         .any(|tok| RESIDENT_BINS.contains(&command_basename(tok).as_str()))
 }
 
-/// Idle budget for agent `bash` / `!cmd` short commands from
+/// Recheck interval for agent `bash` short commands from
 /// `[tools.bash] silent_kill_secs`. Long compile/install subcommands skip it.
-/// Unknown binaries are short. `silent_kill_secs = 0` disables.
+/// Unknown binaries are short. `silent_kill_secs = 0` disables rechecks.
 fn agent_bash_idle_timeout(command: &str, silent_kill_secs: u64) -> Option<Duration> {
     let runtime = legacy_bash_runtime_state();
     agent_bash_idle_timeout_with_runtime(runtime.as_ref(), command, silent_kill_secs)
@@ -4651,6 +5441,12 @@ impl PgroupChild {
             pgid,
             terminated: false,
         }
+    }
+
+    /// Flag the pgroup as already reaped so `Drop` skips its final SIGKILL.
+    /// Used from the detached driver, where the store's only reader is `Drop`.
+    fn mark_terminated(&mut self) {
+        self.terminated = true;
     }
 
     /// Graceful pgroup shutdown: SIGTERM → 200ms grace → SIGKILL → reap.
@@ -4957,8 +5753,8 @@ pub async fn run_shell(
         chunk_cb(&format!("[stderr] {}", sanitize_terminal_output(&chunk)));
     }
 
-    let stdout_str = decode_output(&stdout_buf);
-    let stderr_str = decode_output(&stderr_buf);
+    let stdout_str = decode_mixed_span(&stdout_buf);
+    let stderr_str = decode_mixed_span(&stderr_buf);
     let elapsed_secs = start_instant.elapsed().as_secs_f64();
 
     let exit = match result {
@@ -5533,8 +6329,9 @@ mod tests {
 
     #[tokio::test]
     async fn run_command_background_success_and_kill() {
-        use crate::tools::bash_runtime;
-        let tool = BashTool;
+        use crate::tools::bash_runtime::BashRuntimeState;
+        let runtime = Arc::new(BashRuntimeState::new());
+        let tool = BashTool::with_runtime_state(Arc::clone(&runtime));
         let dir = tempfile::tempdir().unwrap();
         let ctx = ToolContext {
             working_dir: dir.path().to_path_buf(),
@@ -5566,12 +6363,36 @@ mod tests {
             "content: {:?}",
             res.content
         );
+        assert!(
+            res.content.contains("Log path:"),
+            "must include Log path: {:?}",
+            res.content
+        );
+        assert!(
+            res.content.contains("offset=-50"),
+            "must include tail read guidance: {:?}",
+            res.content
+        );
+        assert!(
+            res.content.contains("key_string"),
+            "must include keyword search guidance: {:?}",
+            res.content
+        );
 
-        // Find bashid in active tasks
-        let active = bash_runtime::active_background_tasks();
+        let log_line = res.content.lines().find(|l| l.starts_with("Log path: "));
+        assert!(log_line.is_some(), "Log path line must be present");
+        let log_path_str = log_line.unwrap().trim_start_matches("Log path: ").trim();
+        let log_path = std::path::PathBuf::from(log_path_str);
+        assert!(
+            log_path.exists(),
+            "log file must exist while background task is active"
+        );
+
+        // Find task in active tasks
+        let active = runtime.active_background_tasks();
         let matched = active.iter().find(|t| t.command == cmd);
         assert!(matched.is_some(), "must be in active_background_tasks");
-        let bashid = matched.unwrap().bashid.clone();
+        let task_pid = matched.unwrap().pid;
 
         // Testing idempotency guard: starting the exact same command while active must fail
         let duplicate_res = tool.execute(&args, &ctx).await;
@@ -5585,19 +6406,25 @@ mod tests {
             duplicate_res.content
         );
 
-        // Kill the task using kill_by_id
+        // Kill the task using kill_by_pid
         assert!(
-            bash_runtime::kill_by_id(&bashid),
-            "kill_by_id must return true"
+            runtime.kill_by_pid(task_pid),
+            "kill_by_pid must return true"
         );
 
         // Wait a small moment for unregister
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let active_after = bash_runtime::active_background_tasks();
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let active_after = runtime.active_background_tasks();
         assert!(
-            !active_after.iter().any(|t| t.bashid == bashid),
+            !active_after.iter().any(|t| t.pid == task_pid),
             "killed task must be removed from active tasks"
         );
+        // Log file is preserved for diagnostics after process exit, not immediately deleted
+        assert!(
+            log_path.exists(),
+            "log file must be preserved for diagnostics after process exit"
+        );
+        let _ = tokio::fs::remove_file(&log_path).await;
     }
 
     #[test]
@@ -5727,10 +6554,12 @@ mod tests {
         assert!(BashTool.aliases().contains(&"bash"));
         let desc = shell_tool_description(false, false, false);
         assert!(
-            desc.contains("`read_file`")
-                && desc.contains("`grep`")
-                && desc.contains("`list_directory`"),
+            desc.contains("`read`") && desc.contains("`grep`") && desc.contains("`edit`"),
             "schema must steer file work to dedicated tools: {desc}"
+        );
+        assert!(
+            !desc.contains("list_directory") && !desc.contains("read_file"),
+            "schema must not advertise purged/legacy tool names: {desc}"
         );
         assert!(
             !desc.contains("not available in this shell tool"),
@@ -5866,6 +6695,26 @@ mod tests {
             sanitize_terminal_output("Downloading...\rDownloading 100%"),
             "Downloading 100%"
         );
+        // Trailing \r must be preserved as newline so sequential progress stages do not concatenate
+        assert_eq!(
+            sanitize_terminal_output("Downloading 100%\r"),
+            "Downloading 100%\n"
+        );
+        assert_eq!(
+            sanitize_terminal_output("Collecting A (38 kB)\r"),
+            "Collecting A (38 kB)\n"
+        );
+    }
+
+    #[test]
+    fn sanitize_cleans_powershell_clixml_noise_and_extracts_errors() {
+        // Pure progress / information noise without real error must be silenced completely
+        let noise = "#< CLIXML\r\n<Objs Version=\"1.1.0.1\"><Obj S=\"progress\"><PR N=\"Record\"><AV>正在使用模块...</AV></PR></Obj></Objs>";
+        assert_eq!(sanitize_terminal_output(noise), "");
+
+        // Real PowerShell error in CLIXML must be extracted cleanly without XML tags
+        let err = "#< CLIXML\r\n<Objs Version=\"1.1.0.1\"><S S=\"Error\">Cannot find file_x000D__x000A_At line:1</S></Objs>";
+        assert_eq!(sanitize_terminal_output(err), "Cannot find file\nAt line:1");
     }
 
     #[test]
@@ -6251,7 +7100,7 @@ mod tests {
         // Prefer jeikcode's native file tools over shell file ops.
         assert!(win.contains("glob"), "must steer to glob: {win}");
         assert!(win.contains("grep"), "must steer to grep: {win}");
-        assert!(win.contains("read_file"), "must steer to read_file: {win}");
+        assert!(win.contains("`read`"), "must steer to read: {win}");
         // The unix description stays lean (no Windows shell noise).
         let unix = shell_tool_description(false, false, false);
         assert!(
@@ -6290,7 +7139,7 @@ mod tests {
         );
         // Base steering (native file tools) still present.
         assert!(
-            d.contains("read_file") && d.contains("glob"),
+            d.contains("`read`") && d.contains("glob"),
             "base steering retained: {d}"
         );
         // Must steer output-discard to /dev/null, NOT `nul`: under Git Bash `> nul`
@@ -6350,12 +7199,16 @@ mod tests {
     #[test]
     fn unix_description_steers_file_ops_to_native_tools() {
         let unix = shell_tool_description(false, false, false);
-        for tool in ["read_file", "grep", "glob", "list_directory"] {
+        for tool in ["read", "grep", "glob"] {
             assert!(
                 unix.contains(tool),
                 "unix desc must steer to {tool}: {unix}"
             );
         }
+        assert!(
+            !unix.contains("read_file") && !unix.contains("list_directory"),
+            "unix desc must not advertise purged/legacy tool names: {unix}"
+        );
         let lc = unix.to_lowercase();
         assert!(
             lc.contains("aggregation") || lc.contains("pipeline"),
@@ -6712,7 +7565,7 @@ mod tests {
                 .execute(r#"{"command":"echo streamed && sleep 8"}"#, &cx)
                 .await
         });
-        let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
             .await
             .expect("stdout should stream before sleep finishes")
             .expect("progress channel stayed open");
@@ -6764,38 +7617,42 @@ mod tests {
         assert!(r.content.contains("cancelled"), "{}", r.content);
     }
 
-    #[tokio::test]
-    async fn execute_idle_kills_short_command_with_no_output() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn execute_silent_sleep_survives_idle_recheck() {
         let _guard = super::TestIdleGuard::set(1);
         let d = tempfile::tempdir().unwrap();
         let started = Instant::now();
         let r = BashTool
-            .execute(r#"{"command":"sleep 30"}"#, &ctx(d.path()))
+            .execute(r#"{"command":"sleep 2"}"#, &ctx(d.path()))
             .await;
         assert!(
             started.elapsed() < Duration::from_secs(8),
-            "idle kill should return in ~1s, took {:.1}s",
+            "sleep 2 should finish on its own, took {:.1}s",
             started.elapsed().as_secs_f64()
         );
-        assert!(r.is_error, "{}", r.content);
         assert!(
-            r.content.contains("process is idle") || r.content.contains("stuck"),
-            "idle-kill note missing: {}",
+            !r.is_error,
+            "silent wait must not be idle-killed: {}",
+            r.content
+        );
+        assert!(
+            !r.content.contains("process is idle"),
+            "must not report idle-kill: {}",
             r.content
         );
     }
 
-    #[tokio::test]
-    async fn execute_idle_after_output_kills_when_cpu_idle() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn execute_output_then_sleep_survives_idle_recheck() {
         let _guard = super::TestIdleGuard::set(1);
         let d = tempfile::tempdir().unwrap();
         let started = Instant::now();
         let r = BashTool
-            .execute(r#"{"command":"echo ready && sleep 30"}"#, &ctx(d.path()))
+            .execute(r#"{"command":"echo ready && sleep 2"}"#, &ctx(d.path()))
             .await;
         assert!(
             started.elapsed() < Duration::from_secs(8),
-            "idle path should return in ~1s, took {:.1}s",
+            "echo+sleep 2 should finish on its own, took {:.1}s",
             started.elapsed().as_secs_f64()
         );
         assert!(
@@ -6803,28 +7660,19 @@ mod tests {
             "captured output must be kept: {}",
             r.content
         );
-        let killed = r.is_error
-            && (r.content.contains("process is idle")
-                || r.content.contains("stuck")
-                || r.content.contains("resident service"));
-        let asked = r
-            .content
-            .contains(crate::tools::bash_runtime::AWAIT_DECISION_MARK);
         assert!(
-            killed || asked,
-            "0-CPU after output must kill (or await if CPU sample unknown): {}",
+            !r.is_error,
+            "wait after output must not be idle-killed: {}",
             r.content
         );
-        if asked {
-            let id = r
-                .content
-                .lines()
-                .find_map(|l| l.strip_prefix("bashid: "))
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            let _ = crate::tools::bash_runtime::kill_by_id(&id);
-        }
+        assert!(
+            !r.content.contains("process is idle")
+                && !r
+                    .content
+                    .contains(crate::tools::bash_runtime::AWAIT_DECISION_MARK),
+            "must not idle-kill or await-decision a finite sleep: {}",
+            r.content
+        );
     }
 
     #[test]
@@ -7113,7 +7961,7 @@ mod tests {
         assert!(check_interactive_command("btop").is_some());
         assert!(check_interactive_command("top -b -n 1").is_none());
 
-        // Git interactive flags
+        // Git interactive flags (hunk picking / rebase -i)
         assert!(check_interactive_command("git add -p").is_some());
         assert!(check_interactive_command("git checkout -p").is_some());
         assert!(check_interactive_command("git rebase -i HEAD~2").is_some());
@@ -7121,6 +7969,16 @@ mod tests {
         assert!(check_interactive_command("git add .").is_none());
         assert!(check_interactive_command("git commit -m 'feat: test'").is_none());
         assert!(check_interactive_command("git rebase --continue").is_none());
+        // `git log/show/diff/grep -p|-i` are output/search flags, not a TTY picker.
+        assert!(check_interactive_command(r#"git log -S "allow-lan" -p myori.yaml"#).is_none());
+        assert!(
+            check_interactive_command("cd config && git log -S allow-lan -p myori.yaml").is_none()
+        );
+        assert!(check_interactive_command("git show -p HEAD").is_none());
+        assert!(check_interactive_command("git diff -p").is_none());
+        assert!(check_interactive_command("git log -i -S foo").is_none());
+        assert!(check_interactive_command("git grep -i -p allow-lan").is_none());
+        assert!(check_interactive_command("git -C config log -p myori.yaml").is_none());
 
         // Bare REPLs
         assert!(check_interactive_command("python").is_some());
@@ -7246,5 +8104,252 @@ mod tests {
         // Commands with arguments or pipes are allowed
         assert!(check_interactive_command("python3 script.py").is_none());
         assert!(check_interactive_command("echo 'select 1;' | sqlite3").is_none());
+    }
+}
+
+#[cfg(test)]
+mod background_pid_block_tests {
+    use super::*;
+
+    #[test]
+    fn ps_w_rows_map_winpid_to_msys_pid() {
+        // A REAL capture from this platform (Git Bash `ps -W`): the daemon-spawned
+        // wrapper shows uid 0 (foreign MSYS session) while a native child carries the
+        // user uid. Only the mapping matters here.
+        let sample = "\
+      PID    PPID    PGID     WINPID   TTY         UID    STIME COMMAND
+  4227900       0       0      33596  ?              0 19:03:44 C:\\Program Files\\Git\\bin\\bash.exe
+      676       1     676        416  ?         197108 19:03:43 /f/Python/Python312/python
+";
+        let map = parse_ps_w_ids(sample);
+        assert_eq!(map.get(&33596), Some(&4227900));
+        assert_eq!(map.get(&416), Some(&676));
+        assert_eq!(map.get(&999_999), None);
+    }
+
+    #[test]
+    fn workload_leaves_keep_the_process_the_command_started() {
+        // wrapper -> inner bash -> python: the LEAF is the workload (killing it unwinds
+        // the wrapper); killing the inner shell would orphan python.
+        let rows = vec![
+            (100u32, 1u32, "bash.exe".to_string()),
+            (200, 100, "python.exe".to_string()),
+        ];
+        assert_eq!(
+            workload_leaves(&rows),
+            vec![(200, "python.exe".to_string())]
+        );
+    }
+
+    #[test]
+    fn workload_leaves_keep_siblings_and_drop_parents() {
+        let rows = vec![
+            (100u32, 1u32, "node.exe".to_string()),
+            (200, 100, "esbuild.exe".to_string()),
+            (300, 100, "worker.exe".to_string()),
+        ];
+        let leaves = workload_leaves(&rows);
+        assert_eq!(leaves.len(), 2);
+        assert!(leaves.iter().any(|(pid, _)| *pid == 200));
+        assert!(leaves.iter().any(|(pid, _)| *pid == 300));
+    }
+
+    #[test]
+    fn workload_leaves_drop_windows_console_hosts() {
+        // Windows spawns a console host as a child of every console app; reporting it
+        // would hand the model a useless pid next to the real workload.
+        let rows = vec![
+            (100u32, 1u32, "bash.exe".to_string()),
+            (200, 100, "sleep.exe".to_string()),
+            (300, 100, "conhost.exe".to_string()),
+            (400, 100, "OpenConsole.exe".to_string()),
+        ];
+        assert_eq!(workload_leaves(&rows), vec![(200, "sleep.exe".to_string())]);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_block_reports_both_ids_then_falls_back_to_the_tree_kill() {
+        // Workload with a resolved Git-Bash pid → BOTH recipes, each named.
+        let one = render_background_pid_block(33596, &[(416, Some(676), "python".into())]);
+        assert!(
+            one.contains("676 (Git Bash) / WinPID 416 (python)"),
+            "{one}"
+        );
+        assert!(one.contains("`kill 676` (Git Bash)"), "{one}");
+        assert!(one.contains("`taskkill /F /T /PID 33596`"), "{one}");
+
+        // No attributable child yet → wrapper WinPID + whole-tree kill only.
+        let none = render_background_pid_block(33596, &[]);
+        assert!(none.contains("WinPID 33596"), "{none}");
+        assert!(none.contains("`taskkill /F /T /PID 33596`"), "{none}");
+
+        // >3 workloads collapse with a count; the tree kill stays the complete recipe.
+        let many: Vec<(u32, Option<u32>, String)> = (0..5)
+            .map(|i| (400 + i, Some(700 + i), format!("w{i}")))
+            .collect();
+        let block = render_background_pid_block(33596, &many);
+        assert!(block.contains("(+2 more)"), "{block}");
+        assert!(block.contains("`taskkill /F /T /PID 33596`"), "{block}");
+
+        // A workload with no MSYS pid must NOT advertise a `kill` recipe.
+        let winpid_only = render_background_pid_block(33596, &[(416, None, "python".into())]);
+        assert!(!winpid_only.contains("`kill "), "{winpid_only}");
+        assert!(
+            winpid_only.contains("`taskkill /F /T /PID 33596`"),
+            "{winpid_only}"
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn unix_block_reports_the_process_group_recipe() {
+        let block = render_background_pid_block(4242, &[]);
+        assert!(
+            block.contains("PID: 4242 (process-group leader)"),
+            "{block}"
+        );
+        assert!(block.contains("`kill -TERM -4242`"), "{block}");
+    }
+}
+
+#[cfg(test)]
+mod mixed_encoding_tests {
+    use super::*;
+
+    #[test]
+    fn a_legacy_line_does_not_mangle_neighbouring_utf8_lines() {
+        // The reported bug: taskkill's localized (GBK) error line pulled the whole read
+        // span into the GBK decoder, so the UTF-8 lines around it came back as mojibake.
+        let (gbk, _, _) = encoding_rs::GB18030.encode("错误 err\n");
+        let mut chunk = "中文行 first\n".as_bytes().to_vec();
+        chunk.extend_from_slice(&gbk);
+        chunk.extend_from_slice("中文行 last\n".as_bytes());
+
+        let mut pending = Vec::new();
+        let out = decode_stream_chunk(&mut pending, &chunk, true).expect("mixed chunk");
+        assert!(out.contains("中文行 first"), "{out:?}");
+        assert!(out.contains("中文行 last"), "{out:?}");
+        assert!(out.contains("err"), "{out:?}");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn a_pending_legacy_line_still_lets_utf8_lines_through() {
+        // Streaming: a complete UTF-8 line must be emitted even while a later legacy line
+        // is still incomplete (it waits for its own newline).
+        let mut pending = Vec::new();
+        let mut chunk = "第一行\n".as_bytes().to_vec();
+        chunk.extend_from_slice(&encoding_rs::GB18030.encode("错误").0);
+        let out = decode_stream_chunk(&mut pending, &chunk, false).expect("utf8 line");
+        assert_eq!(out, "第一行\n");
+        assert!(!pending.is_empty(), "legacy tail must stay buffered");
+    }
+
+    #[test]
+    fn pure_spans_keep_the_previous_decoding() {
+        // Pure UTF-8: byte-for-byte (fast path).
+        assert_eq!(decode_mixed_span("héllo 世界\n".as_bytes()), "héllo 世界\n");
+        // Pure legacy: the whole block still reaches the detector as ONE unit, so the
+        // result is identical to the historical `decode_output` behavior.
+        let (gbk, _, _) = encoding_rs::GB18030.encode("福建省新闻正文\n第二行\n");
+        assert_eq!(decode_mixed_span(&gbk), decode_output(&gbk));
+    }
+
+    #[test]
+    fn final_formatted_output_keeps_utf8_around_a_legacy_line() {
+        // The model-visible path: `format_streams` decodes the captured buffers.
+        let (gbk, _, _) = encoding_rs::GB18030.encode("错误 err\n");
+        let mut stdout = "构建输出\n".as_bytes().to_vec();
+        stdout.extend_from_slice(&gbk);
+        let formatted = format_streams(&stdout, &[], Some((true, Some(0))), false);
+        assert!(formatted.contains("构建输出"), "{formatted:?}");
+        assert!(formatted.contains("err"), "{formatted:?}");
+    }
+}
+
+#[cfg(test)]
+mod msys_arg_rewrite_tests {
+    use super::*;
+
+    fn rewrite(cmd: &str, git_root: Option<&std::path::Path>) -> String {
+        rewrite_msys_arg_conventions(cmd, git_root).into_owned()
+    }
+
+    #[test]
+    fn double_slash_switches_fold_to_single_slash() {
+        // The Git-Bash convention: `//F` meant `/F` while the runtime folded the doubled
+        // slash. Conversion is off now, so the fold happens here.
+        assert_eq!(
+            rewrite("taskkill //F //PID 123", None),
+            "taskkill /F /PID 123"
+        );
+        assert_eq!(
+            rewrite("msbuild //NOLOGO //t:Build", None),
+            "msbuild /NOLOGO /t:Build"
+        );
+        assert_eq!(rewrite("cmd //c ver", None), "cmd /c ver");
+        // A deeper path is NOT the convention — leave `//server/share` alone.
+        assert_eq!(rewrite("cd //server/share", None), "cd //server/share");
+        // Literal payload (single quotes, heredoc bodies) is never touched.
+        assert_eq!(rewrite("echo '//F'", None), "echo '//F'");
+        assert_eq!(rewrite("cat <<EOF\n//F\nEOF", None), "cat <<EOF\n//F\nEOF");
+        // Nothing to do → borrowed, not rebuilt.
+        assert!(matches!(
+            rewrite_msys_arg_conventions("echo plain", None),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn dev_null_becomes_nul_only_for_native_programs() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("usr/bin")).unwrap();
+        std::fs::write(root.path().join("usr/bin/grep.exe"), b"").unwrap();
+        std::fs::write(root.path().join("usr/bin/head.exe"), b"").unwrap();
+        let root = root.path();
+
+        // Native program (not in the MSYS tree) → `NUL`, so `-o` really discards.
+        assert_eq!(
+            rewrite("curl -s -o /dev/null http://x", Some(root)),
+            "curl -s -o NUL http://x"
+        );
+        assert_eq!(
+            rewrite(
+                "python app.py > out.log && curl -o /dev/null http://x",
+                Some(root)
+            ),
+            "python app.py > out.log && curl -o NUL http://x"
+        );
+        // MSYS tool → POSIX spelling kept (`NUL` would be a plain filename for it).
+        assert_eq!(
+            rewrite("grep -f /dev/null x", Some(root)),
+            "grep -f /dev/null x"
+        );
+        assert_eq!(
+            rewrite("head -c 1 /dev/null", Some(root)),
+            "head -c 1 /dev/null"
+        );
+        // Redirect targets belong to bash — never rewritten.
+        assert_eq!(
+            rewrite("curl -s http://x > /dev/null", Some(root)),
+            "curl -s http://x > /dev/null"
+        );
+        // Without a Git root the program cannot be classified → leave as written (a miss,
+        // never corruption).
+        assert_eq!(
+            rewrite("curl -o /dev/null http://x", None),
+            "curl -o /dev/null http://x"
+        );
+        // A wrapper + assignment still resolves to the REAL program: `env FOO=1 curl` →
+        // native (rewrite), `env FOO=1 grep -f` → MSYS (keep).
+        assert_eq!(
+            rewrite("env FOO=1 curl -o /dev/null http://x", Some(root)),
+            "env FOO=1 curl -o NUL http://x"
+        );
+        assert_eq!(
+            rewrite("env -i grep -f /dev/null x", Some(root)),
+            "env -i grep -f /dev/null x"
+        );
     }
 }

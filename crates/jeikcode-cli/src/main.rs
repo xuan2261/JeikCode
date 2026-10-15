@@ -768,6 +768,24 @@ fn build_i18n_command() -> clap::Command {
                     a.help(t(Msg::CliHelpUpgradeForce).into_owned())
                 })
                 .mut_arg("yes", |a| a.help(t(Msg::CliHelpUpgradeYes).into_owned()))
+                .mut_arg("beta", |a| a.help(t(Msg::CliHelpUpgradeBeta).into_owned()))
+                .mut_arg("main", |a| a.help(t(Msg::CliHelpUpgradeMain).into_owned()))
+        })
+        .mut_subcommand("list", |s| {
+            s.about(t(Msg::CliAboutList).into_owned())
+                .mut_arg("channel", |a| {
+                    a.help(t(Msg::CliHelpListChannel).into_owned())
+                })
+        })
+        .mut_subcommand("down", |s| {
+            s.about(t(Msg::CliAboutDown).into_owned())
+                .mut_arg("channel", |a| {
+                    a.help(t(Msg::CliHelpDownChannel).into_owned())
+                })
+                .mut_arg("version", |a| {
+                    a.help(t(Msg::CliHelpDownVersion).into_owned())
+                })
+                .mut_arg("yes", |a| a.help(t(Msg::CliHelpUpgradeYes).into_owned()))
         })
         .mut_subcommand("rollback", |s| {
             s.about(t(Msg::CliAboutRollback).into_owned())
@@ -783,6 +801,12 @@ fn build_i18n_command() -> clap::Command {
         .mut_subcommand("plugin", |s| s.about(t(Msg::CliAboutPlugin).into_owned()))
         .mut_subcommand("uninstall", |s| {
             s.about(t(Msg::CliAboutUninstall).into_owned())
+                .mut_subcommand("simple", |c| {
+                    c.about(t(Msg::CliAboutUninstallSimple).into_owned())
+                })
+                .mut_subcommand("all", |c| {
+                    c.about(t(Msg::CliAboutUninstallAll).into_owned())
+                })
         })
         .mut_subcommand("hooks", |s| s.about(t(Msg::CliAboutHooks).into_owned()));
 
@@ -877,7 +901,7 @@ fn invoked_cli_name() -> &'static str {
                 p.file_stem()
                     .map(|s| s.to_string_lossy().to_ascii_lowercase())
             })
-            .filter(|s| s == "jeikcode" || s == "atomcode")
+            .filter(|s| s == "jeikcode")
             .unwrap_or_else(|| "jeikcode".into())
     })
     .as_str()
@@ -1011,24 +1035,78 @@ enum UpgradeAction {
     Reset,
     /// Roll back to the previous version (.bak on disk)
     Rollback,
+    /// Latest beta, or one beta version (`jeikcode up beta [VERSION]`)
+    Beta {
+        /// Version to install (`v7.2.4-beta.9` or `7.2.4-beta.9`). Omit for the latest beta.
+        version: Option<String>,
+    },
+    /// Latest stable release, or one stable version (`jeikcode up main [VERSION]`)
+    Main {
+        /// Version to install (`v7.2.4` or `7.2.4`). Omit for the latest stable release.
+        version: Option<String>,
+    },
+    /// Alias of `main`
+    Stable {
+        /// Version to install (`v7.2.4` or `7.2.4`). Omit for the latest stable release.
+        version: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum UninstallPreset {
+    /// Remove only the program and PATH entry. Keep user configuration. No prompts.
+    Simple,
+    /// Remove the program, PATH entry, and all user configuration. No prompts.
+    All,
 }
 
 #[derive(Subcommand)]
 enum Commands {
     /// Show current provider / leftover-auth status
     Status,
-    /// Upgrade jeikcode in-place to the latest released version (aliases: update, updat)
-    #[command(alias = "update", alias = "updat")]
+    /// List historical versions (`jeikcode list`, `jeikcode list main`, `jeikcode list beta`)
+    List {
+        /// Channel: main (default, stable) or beta
+        #[arg(default_value = "main")]
+        channel: String,
+    },
+    /// Upgrade jeikcode in-place (aliases: update, updat, up)
+    #[command(alias = "update", alias = "updat", alias = "up")]
     Upgrade {
         /// Reinstall even when already on the latest version
-        #[arg(short = 'f', long)]
+        #[arg(short = 'f', long, global = true)]
         force: bool,
+        /// Automatically apply default config changes without interactive prompts
+        #[arg(short = 'y', long = "yes", global = true)]
+        yes: bool,
+        /// Upgrade from the beta (prerelease) channel
+        #[arg(long, conflicts_with = "main")]
+        beta: bool,
+        /// Upgrade from the stable/main channel (default)
+        #[arg(long, conflicts_with = "beta")]
+        main: bool,
+        /// Subcommand for update source configuration (e.g. set <URL>, get, reset, rollback)
+        /// or channel `beta` / `main` / `stable`, optionally followed by a version.
+        #[command(subcommand)]
+        action: Option<UpgradeAction>,
+    },
+    /// Install a specific release, including an older one
+    /// (`jeikcode down main v7.2.3`, `jeikcode down beta v7.2.4-beta.8`)
+    #[command(alias = "downgrade")]
+    Down {
+        /// Channel: main or beta
+        channel: String,
+        /// Version to install (`v7.2.3` or `7.2.4-beta.8`)
+        version: String,
         /// Automatically apply default config changes without interactive prompts
         #[arg(short = 'y', long = "yes")]
         yes: bool,
-        /// Subcommand for update source configuration (e.g. set <URL>, get, reset, rollback)
-        #[command(subcommand)]
-        action: Option<UpgradeAction>,
+    },
+    /// Configure or toggle the GitHub logo visibility in WebUI (`jeikcode ghimg [on|off]`)
+    #[command(alias = "ghlogo", alias = "github-logo")]
+    Ghimg {
+        /// "on" to show, "off" to hide; omitted displays current status
+        status: Option<String>,
     },
     /// Hidden internal command to run interactive or automatic config sync after binary upgrade
     #[command(hide = true, name = "__sync_config")]
@@ -1133,22 +1211,25 @@ enum Commands {
     /// slash command — anything installed via either path is visible to both.
     #[command(subcommand)]
     Plugin(PluginCli),
-    /// Uninstall JeikCode: remove the binary, PATH edit, and (interactively)
-    /// data under ~/.jeikcode/. With no flags, runs interactively and asks
-    /// per-group; pass --yes / --purge / --keep-data for non-interactive use.
+    /// Uninstall JeikCode. With no arguments, ask whether to keep user
+    /// configuration. `simple` removes only the program. `all` removes
+    /// the program and user configuration without prompts.
     Uninstall {
+        /// `simple` keeps user configuration. `all` removes it. Both are non-interactive.
+        #[command(subcommand)]
+        preset: Option<UninstallPreset>,
         /// Skip prompts; use per-group default decisions
         /// (binary=yes, credentials=no, state=yes).
-        #[arg(long)]
+        #[arg(long, global = true)]
         yes: bool,
         /// Wipe ~/.jeikcode/ entirely.
-        #[arg(long, conflicts_with = "keep_data")]
+        #[arg(long, global = true, conflicts_with = "keep_data")]
         purge: bool,
         /// Keep ~/.jeikcode/ entirely (only remove binary + PATH edit).
-        #[arg(long)]
+        #[arg(long, global = true)]
         keep_data: bool,
         /// Print the plan; do nothing.
-        #[arg(long)]
+        #[arg(long, global = true)]
         dry_run: bool,
     },
     /// Build (or refresh) the workspace code graph index and save it under
@@ -1565,6 +1646,15 @@ fn main() {
         return;
     }
 
+    // Successor after an in-place WebUI/serve upgrade waits here until the
+    // old process has exited and released the listen port.
+    jeikcode_updater::wait_for_predecessor_if_requested();
+
+    // Before any thread or child process exists: a Git-Bash launch leaves TMP/TEMP/TMPDIR
+    // as POSIX paths, which native children spawned directly (not via the bash tool) would
+    // resolve as `<drive>:\tmp`. Best-effort and cheap; a no-op when already native.
+    jeikcode_capabilities::special_dirs::sanitize_process_temp_env();
+
     // Run the entire program on a thread with a large, explicit stack.
     // Rust gives the *main* OS thread the platform-default stack — on
     // Windows that's only ~1 MB (vs 8 MB on Linux/macOS). The TUI event
@@ -1611,7 +1701,79 @@ fn merge_startup_notices(
     }
 }
 
+struct DesktopWebuiLaunch {
+    host: String,
+    port: u16,
+    no_open: bool,
+    token: Option<String>,
+}
+
+/// Desktop sets `JEIKCODE_DESKTOP=1` and a fixed argv. Skip clap, telemetry,
+/// and the pending-upgrade scan so the listen address can be printed immediately.
+fn desktop_webui_fast_launch() -> Option<DesktopWebuiLaunch> {
+    if std::env::var_os("JEIKCODE_DESKTOP").is_none() {
+        return None;
+    }
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    parse_desktop_webui_args(&args)
+}
+
+fn parse_desktop_webui_args(args: &[String]) -> Option<DesktopWebuiLaunch> {
+    if args.first().map(String::as_str) != Some("webui") {
+        return None;
+    }
+    let mut host = "127.0.0.1".to_string();
+    let mut port = jeikcode_daemon::WEBUI_DEFAULT_PORT;
+    let mut no_open = false;
+    let mut token = None;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--host" => {
+                index += 1;
+                host = args.get(index)?.clone();
+            }
+            "--port" => {
+                index += 1;
+                port = args.get(index)?.parse().ok()?;
+            }
+            "--no-open" => no_open = true,
+            "--token" => {
+                index += 1;
+                let value = args.get(index)?.trim();
+                if value.is_empty() {
+                    return None;
+                }
+                token = Some(value.to_string());
+            }
+            _ => return None,
+        }
+        index += 1;
+    }
+    Some(DesktopWebuiLaunch {
+        host,
+        port,
+        no_open,
+        token,
+    })
+}
+
 async fn async_main() {
+    if let Some(launch) = desktop_webui_fast_launch() {
+        let msg = jeikcode_daemon::ensure_webui(
+            &launch.host,
+            launch.port,
+            !launch.no_open,
+            launch.token.as_deref(),
+            None,
+        )
+        .await;
+        eprintln!("{msg}");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        wait_until_webui_stopped().await;
+        std::process::exit(0);
+    }
+
     let process_start = std::time::Instant::now();
     // Wire `tracing::` diagnostics to `<config_dir>/logs/jeikcode.log` (file-only,
     // TUI-safe). Must run before anything that emits traces so nothing is lost.
@@ -1710,7 +1872,9 @@ async fn async_main() {
             );
         }
     }
-    if !is_backup && !dev_mode && auto_update_cfg && !source_build {
+    let skip_pending = std::env::var("JEIKCODE_SKIP_PENDING_UPGRADE").is_ok()
+        || std::env::args().any(|a| a == "__sync_config" || a == "upgrade" || a == "update");
+    if !is_backup && !dev_mode && auto_update_cfg && !source_build && !skip_pending {
         let stage_start = std::time::Instant::now();
         // Capture current version BEFORE applying upgrade, so we can pass it to the re-exec'd child
         let current_version = format!("v{}", env!("CARGO_PKG_VERSION"));
@@ -2723,12 +2887,7 @@ fn into_tui_native_runtime(
 #[cfg(unix)]
 fn redirect_stderr_to_log_file() {
     use std::os::unix::io::AsRawFd;
-    let Some(home) = std::env::var_os("JEIKCODE_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".jeikcode")))
-    else {
-        return;
-    };
+    let home = jeikcode_config::Config::config_dir();
     if std::fs::create_dir_all(&home).is_err() {
         return;
     }
@@ -3450,38 +3609,71 @@ async fn handle_command(cmd: Commands, _telemetry: &std::sync::Arc<Telemetry>) -
             }
             Ok(())
         }
-        Commands::Upgrade { force, yes, action } => {
-            if let Some(action) = action {
-                match action {
-                    UpgradeAction::Set { target } => {
-                        handle_upgrade_set(target)?;
-                    }
-                    UpgradeAction::Get => {
-                        handle_upgrade_get();
-                    }
-                    UpgradeAction::Reset => {
-                        handle_upgrade_reset()?;
-                    }
-                    UpgradeAction::Rollback => {
-                        return run_rollback_cli();
-                    }
+        Commands::List { channel } => run_list_cli(channel).await,
+        Commands::Upgrade {
+            force,
+            yes,
+            beta,
+            main,
+            action,
+        } => {
+            let (channel, version) = match &action {
+                Some(UpgradeAction::Beta { version }) => {
+                    (jeikcode_updater::UpdateChannel::Beta, version.clone())
                 }
-                return Ok(());
+                Some(UpgradeAction::Main { version } | UpgradeAction::Stable { version }) => {
+                    (jeikcode_updater::UpdateChannel::Stable, version.clone())
+                }
+                _ if beta => (jeikcode_updater::UpdateChannel::Beta, None),
+                _ => (jeikcode_updater::UpdateChannel::Stable, None),
+            };
+            let _ = main;
+            match action {
+                Some(UpgradeAction::Set { target }) => handle_upgrade_set(target),
+                Some(UpgradeAction::Get) => {
+                    handle_upgrade_get();
+                    Ok(())
+                }
+                Some(UpgradeAction::Reset) => handle_upgrade_reset(),
+                Some(UpgradeAction::Rollback) => run_rollback_cli(),
+                Some(
+                    UpgradeAction::Beta { .. }
+                    | UpgradeAction::Main { .. }
+                    | UpgradeAction::Stable { .. },
+                )
+                | None => run_upgrade_cli(force, yes, channel, version).await,
             }
-            run_upgrade_cli(force, yes).await
+        }
+        Commands::Down {
+            channel,
+            version,
+            yes,
+        } => {
+            let channel = parse_cli_channel(&channel)?;
+            run_upgrade_cli(true, yes, channel, Some(version)).await
         }
         Commands::Rollback => run_rollback_cli(),
+        Commands::Ghimg { status } => handle_ghimg(status),
         Commands::Uninstall {
+            preset,
             yes,
             purge,
             keep_data,
             dry_run,
-        } => uninstall::run(uninstall::Args {
-            yes,
-            purge,
-            keep_data,
-            dry_run,
-        }),
+        } => {
+            let preset = match preset {
+                Some(UninstallPreset::Simple) => uninstall::Preset::Simple,
+                Some(UninstallPreset::All) => uninstall::Preset::All,
+                None => uninstall::Preset::Interactive,
+            };
+            uninstall::run(uninstall::Args {
+                preset,
+                yes,
+                purge,
+                keep_data,
+                dry_run,
+            })
+        }
         Commands::SyncConfig { .. } => {
             unreachable!("SyncConfig is handled inline in run() before handle_command")
         }
@@ -4148,23 +4340,241 @@ fn handle_upgrade_reset() -> Result<()> {
     Ok(())
 }
 
+fn notify_daemon_config_reload() {
+    let listen_file = jeikcode_config::Config::config_dir().join("webui-listen.json");
+    if let Ok(text) = std::fs::read_to_string(&listen_file) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+            let port = val.get("port").and_then(|p| p.as_u64()).unwrap_or(13456);
+            let token = val.get("token").and_then(|t| t.as_str()).unwrap_or("");
+            let client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_millis(600))
+                .build();
+            if let Ok(client) = client {
+                let mut req = client.post(format!("http://127.0.0.1:{port}/config/reload"));
+                if !token.is_empty() {
+                    req = req.header("authorization", format!("Bearer {token}"));
+                }
+                let _ = req.send();
+            }
+        }
+    }
+}
+
+fn handle_ghimg(status: Option<String>) -> Result<()> {
+    let store = jeikcode_config::ConfigStore::default_store();
+    let snapshot = store.read()?;
+    let current_state = snapshot.config.github_logo;
+
+    let lang = snapshot.config.language.unwrap_or_default().language_key();
+    let is_zh = lang.starts_with("zh");
+    let is_vi = lang.starts_with("vi");
+
+    let Some(raw_status) = status.filter(|s| !s.trim().is_empty()) else {
+        if is_zh {
+            println!(
+                "GitHub 仓库图标状态：{}",
+                if current_state {
+                    "已开启 (on)"
+                } else {
+                    "已隐藏 (off)"
+                }
+            );
+            println!("\n用法：");
+            println!("  jeikcode ghimg on    - 开启并显示 GitHub 图标");
+            println!("  jeikcode ghimg off   - 隐藏 GitHub 图标（适合公司内部演示/投屏）");
+        } else if is_vi {
+            println!(
+                "Trạng thái biểu tượng GitHub: {}",
+                if current_state {
+                    "Đã bật (on)"
+                } else {
+                    "Đã ẩn (off)"
+                }
+            );
+            println!("\nCách dùng:");
+            println!("  jeikcode ghimg on    - Bật và hiển thị biểu tượng GitHub");
+            println!(
+                "  jeikcode ghimg off   - Ẩn biểu tượng GitHub (phù hợp dùng trong nội bộ công ty)"
+            );
+        } else {
+            println!(
+                "GitHub logo display status: {}",
+                if current_state {
+                    "ON (enabled)"
+                } else {
+                    "OFF (hidden)"
+                }
+            );
+            println!("\nUsage:");
+            println!("  jeikcode ghimg on    - Enable and show the GitHub repository logo");
+            println!("  jeikcode ghimg off   - Hide the GitHub repository logo (ideal for corporate/internal use)");
+        }
+        return Ok(());
+    };
+
+    let target_enabled = match raw_status.trim().to_ascii_lowercase().as_str() {
+        "on" | "true" | "1" | "enable" | "enabled" | "yes" | "show" => true,
+        "off" | "false" | "0" | "disable" | "disabled" | "no" | "none" | "hide" => false,
+        other => {
+            if is_zh {
+                eprintln!("错误：无效的参数 \"{other}\"，仅支持 on 或 off。");
+            } else if is_vi {
+                eprintln!("Lỗi: Tham số không hợp lệ \"{other}\", chỉ hỗ trợ on hoặc off.");
+            } else {
+                eprintln!("Error: Invalid argument \"{other}\". Supported: on or off.");
+            }
+            std::process::exit(1);
+        }
+    };
+
+    store.update(|cfg| {
+        cfg.github_logo = target_enabled;
+        Ok(())
+    })?;
+
+    notify_daemon_config_reload();
+
+    if target_enabled {
+        if is_zh {
+            println!("✓ 已开启 WebUI 中的 GitHub 仓库图标（配置已保存，实时热重载生效）。");
+        } else if is_vi {
+            println!("✓ Đã bật biểu tượng kho lưu trữ GitHub trong WebUI (đã lưu, tự động áp dụng ngay).");
+        } else {
+            println!("✓ GitHub repository logo enabled in WebUI (config saved, hot-reloaded).");
+        }
+    } else {
+        if is_zh {
+            println!("✓ 已隐藏 WebUI 中的 GitHub 仓库图标（配置已保存，实时热重载生效）。");
+        } else if is_vi {
+            println!(
+                "✓ Đã ẩn biểu tượng kho lưu trữ GitHub trong WebUI (đã lưu, tự động áp dụng ngay)."
+            );
+        } else {
+            println!("✓ GitHub repository logo hidden in WebUI (config saved, hot-reloaded).");
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_cli_channel(raw: &str) -> Result<jeikcode_updater::UpdateChannel> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "main" | "stable" => Ok(jeikcode_updater::UpdateChannel::Stable),
+        "beta" => Ok(jeikcode_updater::UpdateChannel::Beta),
+        other => anyhow::bail!("unknown channel `{other}`; use main or beta"),
+    }
+}
+
+fn channel_label(channel: jeikcode_updater::UpdateChannel) -> &'static str {
+    match channel {
+        jeikcode_updater::UpdateChannel::Stable => "main",
+        jeikcode_updater::UpdateChannel::Beta => "beta",
+    }
+}
+
+async fn run_list_cli(channel_raw: String) -> Result<()> {
+    let channel = parse_cli_channel(&channel_raw)?;
+    let label = channel_label(channel);
+    let releases = jeikcode_updater::list_releases().await?;
+    let matched = jeikcode_updater::filter_channel_releases(&releases, channel);
+    if matched.is_empty() {
+        println!("no {label} releases found");
+        return Ok(());
+    }
+    let current =
+        jeikcode_updater::normalize_version_tag(&format!("v{}", env!("CARGO_PKG_VERSION")));
+    println!("{label}");
+    for (idx, rel) in matched.iter().enumerate() {
+        let tag = jeikcode_updater::normalize_version_tag(&rel.tag_name);
+        let mut marks = Vec::new();
+        if idx == 0 {
+            marks.push("latest");
+        }
+        if tag == current {
+            marks.push("current");
+        }
+        if marks.is_empty() {
+            println!("{}", rel.tag_name);
+        } else {
+            println!("{}  ({})", rel.tag_name, marks.join(", "));
+        }
+    }
+    Ok(())
+}
+
 /// CLI (non-TUI) upgrade driver — prints progress to stdout and
 /// success/error messages the same way `install.sh` does.
-async fn run_upgrade_cli(force: bool, yes: bool) -> Result<()> {
+///
+/// `version` installs that tag instead of the channel's latest release.
+/// Pass `force` to reinstall the current version or move to an older one
+/// (`jeikcode down` always sets it).
+async fn run_upgrade_cli(
+    force: bool,
+    yes: bool,
+    channel: jeikcode_updater::UpdateChannel,
+    version: Option<String>,
+) -> Result<()> {
     use jeikcode_updater::{self as self_update, UpgradeEvent, ALREADY_LATEST};
 
     let current = format!("v{}", env!("CARGO_PKG_VERSION"));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UpgradeEvent>();
+    let label = channel_label(channel);
+    let target_version = version
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(self_update::normalize_version_tag)
+        .filter(|s| s != "v");
 
+    if let Some(tag) = &target_version {
+        let tag_channel = self_update::channel_for_tag(tag);
+        if tag_channel != channel {
+            let got = channel_label(tag_channel);
+            anyhow::bail!(
+                "{tag} belongs to the {got} channel. Use `jeikcode up {got} {tag}` or `jeikcode down {got} {tag}`."
+            );
+        }
+        if !force && !self_update::version_is_newer(tag, &current) {
+            println!(
+                "  {tag} is not newer than {current}. To install it, run: jeikcode down {label} {tag}"
+            );
+            return Ok(());
+        }
+    }
+
+    if channel == jeikcode_updater::UpdateChannel::Beta {
+        println!("==> Channel: beta");
+    } else if target_version.is_some() {
+        println!("==> Channel: main");
+    }
+
+    let pinned = target_version.is_some();
     // Spawn the driver; consume events on the main task so stdout
     // writes don't interleave unpredictably with the upgrade work.
-    let driver = tokio::spawn(self_update::run_upgrade(current.clone(), force, tx));
+    let driver = if let Some(tag) = target_version.clone() {
+        let current_for_task = current.clone();
+        tokio::spawn(async move {
+            let manifest = self_update::fetch_manifest_for_tag(&tag).await?;
+            self_update::run_upgrade_with_manifest(manifest, current_for_task, force, tx).await
+        })
+    } else {
+        tokio::spawn(self_update::run_upgrade_for_channel(
+            channel,
+            current.clone(),
+            force,
+            tx,
+        ))
+    };
 
     let mut last_pct: i32 = -1;
     while let Some(ev) = rx.recv().await {
         match ev {
             UpgradeEvent::ManifestFetched { version } => {
-                println!("==> Latest: {}", version);
+                if pinned {
+                    println!("==> Target: {}", version);
+                } else {
+                    println!("==> Latest: {}", version);
+                }
             }
             UpgradeEvent::Downloading { bytes, total } => {
                 // Debounce to whole percents so we don't spam stdout —
@@ -4200,15 +4610,21 @@ async fn run_upgrade_cli(force: bool, yes: bool) -> Result<()> {
                     version,
                     backup.display()
                 );
-                println!("  Run `jeikcode` (or `atomcode`) to start the new version.");
+                println!("  Run `jeikcode` to start the new version.");
 
-                // 🔍 由替换后的新版本二进制拉起差异扫描与交互多选（加载新二进制的内置资产）
+                // 由替换后的新版本二进制拉起差异扫描。跳过 pending 套用，避免
+                // 后台自动更新把刚装上的文件再盖回旧包。
+                #[cfg(windows)]
+                std::thread::sleep(std::time::Duration::from_millis(300));
                 let mut sync_cmd = std::process::Command::new(&exe);
-                sync_cmd.arg("__sync_config");
+                sync_cmd
+                    .arg("__sync_config")
+                    .env("JEIKCODE_SKIP_PENDING_UPGRADE", "1");
                 if yes {
                     sync_cmd.arg("--auto");
                 }
                 let spawned = sync_cmd.status();
+                jeikcode_updater::clear_pending_pointer();
 
                 if spawned.is_err() {
                     // Fallback to in-process sync if spawning new binary fails
@@ -4292,7 +4708,7 @@ fn run_rollback_cli() -> Result<()> {
         summary.exe.display(),
         summary.backup.display()
     );
-    println!("  Run `jeikcode` (or `atomcode`) to start the rolled-back version.");
+    println!("  Run `jeikcode` to start the rolled-back version.");
     Ok(())
 }
 
@@ -4421,13 +4837,33 @@ mod tests {
         format_verbose_tool_chunk, headless_completion_exit_code,
         headless_completion_notify_reason, interactive_provider_bootstrap,
         is_completion_invocation, is_repair_invocation, jeikcode_log_path, merge_startup_notices,
-        normalize_attach_base, print_shell_completion, resolve_working_dir, runtime_config_from,
-        should_fork_busy_continue, token_from_url, truncate_log_line, Cli, Commands,
-        DEFAULT_LOG_DIRECTIVES,
+        normalize_attach_base, parse_desktop_webui_args, print_shell_completion,
+        resolve_working_dir, runtime_config_from, should_fork_busy_continue, token_from_url,
+        truncate_log_line, Cli, Commands, DEFAULT_LOG_DIRECTIVES,
     };
     use clap::Parser;
     use clap_complete::Shell;
     use std::path::PathBuf;
+
+    #[test]
+    fn desktop_webui_args_skip_the_full_cli_parser() {
+        let launch = parse_desktop_webui_args(&[
+            "webui".into(),
+            "--host".into(),
+            "0.0.0.0".into(),
+            "--port".into(),
+            "13457".into(),
+            "--no-open".into(),
+            "--token".into(),
+            "desk-token".into(),
+        ])
+        .expect("desktop argv");
+        assert_eq!(launch.host, "0.0.0.0");
+        assert_eq!(launch.port, 13457);
+        assert!(launch.no_open);
+        assert_eq!(launch.token.as_deref(), Some("desk-token"));
+        assert!(parse_desktop_webui_args(&["webui".into(), "--beta".into()]).is_none());
+    }
 
     #[test]
     fn repair_subcommand_preserves_the_inner_parser_arguments() {
@@ -5153,9 +5589,17 @@ mod tests {
         // 1. jeikcode update
         let cli = Cli::try_parse_from(["jeikcode", "update"]).unwrap();
         match cli.command {
-            Some(Commands::Upgrade { force, yes, action }) => {
+            Some(Commands::Upgrade {
+                force,
+                yes,
+                beta,
+                main,
+                action,
+            }) => {
                 assert!(!force);
                 assert!(!yes);
+                assert!(!beta);
+                assert!(!main);
                 assert!(action.is_none());
             }
             _ => panic!("Expected Commands::Upgrade"),
@@ -5164,9 +5608,17 @@ mod tests {
         // 2. jeikcode upgrade -y --force
         let cli = Cli::try_parse_from(["jeikcode", "upgrade", "-y", "--force"]).unwrap();
         match cli.command {
-            Some(Commands::Upgrade { force, yes, action }) => {
+            Some(Commands::Upgrade {
+                force,
+                yes,
+                beta,
+                main,
+                action,
+            }) => {
                 assert!(force);
                 assert!(yes);
+                assert!(!beta);
+                assert!(!main);
                 assert!(action.is_none());
             }
             _ => panic!("Expected Commands::Upgrade"),
@@ -5227,5 +5679,134 @@ mod tests {
             }) => {}
             _ => panic!("Expected UpgradeAction::Rollback"),
         }
+
+        let cli = Cli::try_parse_from(["jeikcode", "upgrade", "beta", "-y"]).unwrap();
+        match cli.command {
+            Some(Commands::Upgrade {
+                yes,
+                beta,
+                action: Some(UpgradeAction::Beta { version }),
+                ..
+            }) => {
+                assert!(yes);
+                assert!(!beta);
+                assert!(version.is_none());
+            }
+            _ => panic!("Expected UpgradeAction::Beta"),
+        }
+        let cli = Cli::try_parse_from(["jeikcode", "upgrade", "--beta", "-y"]).unwrap();
+        match cli.command {
+            Some(Commands::Upgrade {
+                yes, beta, action, ..
+            }) => {
+                assert!(yes);
+                assert!(beta);
+                assert!(action.is_none());
+            }
+            _ => panic!("Expected --beta"),
+        }
+        let cli = Cli::try_parse_from(["jeikcode", "upgrade", "--main"]).unwrap();
+        match cli.command {
+            Some(Commands::Upgrade {
+                main, beta, action, ..
+            }) => {
+                assert!(main);
+                assert!(!beta);
+                assert!(action.is_none());
+            }
+            _ => panic!("Expected --main"),
+        }
+        let cli = Cli::try_parse_from(["jeikcode", "upgrade", "--main", "-y"]).unwrap();
+        match cli.command {
+            Some(Commands::Upgrade {
+                yes,
+                main,
+                beta,
+                action,
+                ..
+            }) => {
+                assert!(yes);
+                assert!(main);
+                assert!(!beta);
+                assert!(action.is_none());
+            }
+            _ => panic!("Expected --main -y"),
+        }
+        let cli = Cli::try_parse_from(["jeikcode", "upgrade", "main", "-y"]).unwrap();
+        match cli.command {
+            Some(Commands::Upgrade {
+                yes,
+                action: Some(UpgradeAction::Main { version }),
+                ..
+            }) => {
+                assert!(yes);
+                assert!(version.is_none());
+            }
+            _ => panic!("Expected UpgradeAction::Main"),
+        }
+
+        let cli = Cli::try_parse_from(["jeikcode", "up", "main", "v7.2.4", "-y"]).unwrap();
+        match cli.command {
+            Some(Commands::Upgrade {
+                yes,
+                action: Some(UpgradeAction::Main { version }),
+                ..
+            }) => {
+                assert!(yes);
+                assert_eq!(version.as_deref(), Some("v7.2.4"));
+            }
+            _ => panic!("Expected up main <version>"),
+        }
+        let cli = Cli::try_parse_from(["jeikcode", "update", "beta", "7.2.4-beta.9"]).unwrap();
+        match cli.command {
+            Some(Commands::Upgrade {
+                action: Some(UpgradeAction::Beta { version }),
+                ..
+            }) => {
+                assert_eq!(version.as_deref(), Some("7.2.4-beta.9"));
+            }
+            _ => panic!("Expected update beta <version>"),
+        }
+        let cli = Cli::try_parse_from(["jeikcode", "list"]).unwrap();
+        match cli.command {
+            Some(Commands::List { channel }) => assert_eq!(channel, "main"),
+            _ => panic!("Expected list main by default"),
+        }
+        let cli = Cli::try_parse_from(["jeikcode", "list", "beta"]).unwrap();
+        match cli.command {
+            Some(Commands::List { channel }) => assert_eq!(channel, "beta"),
+            _ => panic!("Expected list beta"),
+        }
+        let cli = Cli::try_parse_from(["jeikcode", "down", "main", "v7.2.3", "-y"]).unwrap();
+        match cli.command {
+            Some(Commands::Down {
+                channel,
+                version,
+                yes,
+            }) => {
+                assert_eq!(channel, "main");
+                assert_eq!(version, "v7.2.3");
+                assert!(yes);
+            }
+            _ => panic!("Expected down main <version>"),
+        }
+        let cli = Cli::try_parse_from(["jeikcode", "downgrade", "beta", "v7.2.4-beta.8"]).unwrap();
+        match cli.command {
+            Some(Commands::Down {
+                channel, version, ..
+            }) => {
+                assert_eq!(channel, "beta");
+                assert_eq!(version, "v7.2.4-beta.8");
+            }
+            _ => panic!("Expected downgrade alias"),
+        }
+    }
+
+    #[test]
+    fn i18n_help_includes_list_and_down() {
+        let cmd = super::build_i18n_command();
+        assert!(cmd.find_subcommand("list").is_some());
+        assert!(cmd.find_subcommand("down").is_some());
+        assert!(cmd.find_subcommand("upgrade").is_some());
     }
 }

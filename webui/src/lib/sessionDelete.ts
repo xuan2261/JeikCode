@@ -14,6 +14,21 @@ export interface SessionDeleteFailure {
   cause: unknown;
 }
 
+/** 服务端“会话不存在”错误码（DeleteSessionError.code）——表示目标状态已达成。 */
+const SESSION_NOT_FOUND_CODE = 'SESSION_NOT_FOUND';
+
+/**
+ * 错误是否表示“该会话已不存在”（鸭式判定，避免 lib → api 的模块依赖，
+ * 保证 node 单测环境下可加载）。
+ */
+export function isSessionAlreadyGone(cause: unknown): boolean {
+  return (
+    typeof cause === 'object' &&
+    cause !== null &&
+    (cause as { code?: unknown }).code === SESSION_NOT_FOUND_CODE
+  );
+}
+
 /**
  * Delete sessions with a bounded worker pool. `onDeleted` fires as soon as each
  * HTTP DELETE succeeds so the sidebar can remove that row without waiting for
@@ -42,11 +57,17 @@ export async function deleteSessionsStreaming(
           await deleteOne(session.project_hash, session.id);
           onDeleted(session.id);
         } catch (cause) {
-          failed.push({
-            id: session.id,
-            name: session.name || session.id.slice(0, 8),
-            cause,
-          });
+          // 服务端已无此会话 = 目标状态已达成（例如别的实例/TUI 先删了）。
+          // 必须按“已删”处理并剔除本地行，否则陈旧行会残留到下一次重拉。
+          if (isSessionAlreadyGone(cause)) {
+            onDeleted(session.id);
+          } else {
+            failed.push({
+              id: session.id,
+              name: session.name || session.id.slice(0, 8),
+              cause,
+            });
+          }
         } finally {
           onSettled?.();
         }

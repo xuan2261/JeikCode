@@ -7,6 +7,12 @@
 
 const MAX_REPAIR_BYTES: usize = 512 * 1024;
 
+/// True iff `name` matches the canonical edit tool name (`"edit"`) or legacy alias (`"edit_file"`).
+#[inline]
+pub fn is_edit_tool_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("edit") || name.eq_ignore_ascii_case("edit_file")
+}
+
 /// Normalize tool-call arguments into valid JSON before execution.
 ///
 /// Runs the repair chain: direct parse → repair_json → tool-specific extractor →
@@ -28,9 +34,7 @@ pub fn repair_tool_args(tool_name: &str, args: &str) -> String {
 
     // Validate the original edits before any repair can close or discard a cut
     // hunk. A complete sibling must never authorize a partial edits request.
-    if (tool_name.eq_ignore_ascii_case("edit") || tool_name.eq_ignore_ascii_case("edit_file"))
-        && original_edits_are_incomplete(args)
-    {
+    if is_edit_tool_name(tool_name) && original_edits_are_incomplete(args) {
         return args.to_string();
     }
 
@@ -42,15 +46,14 @@ pub fn repair_tool_args(tool_name: &str, args: &str) -> String {
     // detects drive-letter strings and double-escapes their ambiguous
     // `\X` sequences so the resulting JSON encodes the path the model
     // actually meant. Idempotent on already-correctly-escaped input.
-    let lossless =
-        if tool_name.eq_ignore_ascii_case("edit") || tool_name.eq_ignore_ascii_case("edit_file") {
-            normalize_complete_edit_quotes(args)
-                .map(|raw| strip_complete_edit_trailing_commas(&raw))
-                .ok()
-                .filter(|raw| serde_json::from_str::<serde_json::Value>(raw).is_ok())
-        } else {
-            None
-        };
+    let lossless = if is_edit_tool_name(tool_name) {
+        normalize_complete_edit_quotes(args)
+            .map(|raw| strip_complete_edit_trailing_commas(&raw))
+            .ok()
+            .filter(|raw| serde_json::from_str::<serde_json::Value>(raw).is_ok())
+    } else {
+        None
+    };
     let pre = pre_escape_windows_paths_in_json(lossless.as_deref().unwrap_or(args));
 
     // Fast path: already valid JSON.
@@ -62,11 +65,10 @@ pub fn repair_tool_args(tool_name: &str, args: &str) -> String {
     if serde_json::from_str::<serde_json::Value>(&repaired).is_ok() {
         return repaired;
     }
-    // Specialized: edit_file often ships source code with unescaped quotes/newlines.
-    // Case-insensitive so a model that emits `Edit_File`/`EDIT_FILE` still gets the
-    // extractor (the kernel resolves tools strictly today, but the middleware now
-    // passes the resolved tool's canonical name — see `RepairToolArgsMiddleware`).
-    if tool_name.eq_ignore_ascii_case("edit_file") {
+    // Specialized: edit/edit_file often ships source code with unescaped quotes/newlines.
+    // Case-insensitive and covers both canonical `"edit"` and legacy alias `"edit_file"`
+    // (the middleware passes the resolved tool's canonical name — see `RepairToolArgsMiddleware`).
+    if is_edit_tool_name(tool_name) {
         if let Some(v) = extract_edit_file_args(&pre) {
             if let Ok(s) = serde_json::to_string(&v) {
                 return s;
@@ -283,13 +285,20 @@ fn repair_and_route_shell_args(tool_name: &str, args: &str) -> String {
     };
     let mut changed = false;
 
-    // 1. 协议无关/跨平台的命令字段自愈（兼容 cmd 别名）
-    if !object.contains_key("command") {
-        if let Some(cmd) = object.get("cmd").and_then(serde_json::Value::as_str) {
-            let cmd = cmd.to_string();
-            object.remove("cmd");
-            object.insert("command".into(), serde_json::Value::String(cmd));
-            changed = true;
+    // 1. 协议无关/跨平台的命令字段自愈（兼容 cmd 别名）。别名集合定义在 `shell_names`，
+    //    与门禁/策略共用同一真源，新增别名时只需改一处，杜绝多处硬编码漂移。
+    if !object.contains_key(crate::shell_names::SHELL_COMMAND_KEY) {
+        for alias in crate::shell_names::SHELL_COMMAND_ALIASES {
+            if let Some(cmd) = object.get(*alias).and_then(serde_json::Value::as_str) {
+                let cmd = cmd.to_string();
+                object.remove(*alias);
+                object.insert(
+                    crate::shell_names::SHELL_COMMAND_KEY.into(),
+                    serde_json::Value::String(cmd),
+                );
+                changed = true;
+                break;
+            }
         }
     }
 
@@ -2435,13 +2444,13 @@ mod tests {
     #[test]
     fn repair_tool_args_passes_valid_json_through() {
         let input = r#"{"file_path":"/tmp/a.rs","content":"x"}"#;
-        assert_eq!(repair_tool_args("write_file", input), input);
+        assert_eq!(repair_tool_args("write", input), input);
     }
 
     #[test]
     fn repair_tool_args_fixes_fence_wrapped_json() {
         let input = "```json\n{\"file_path\":\"/tmp/a.rs\",\"content\":\"x\"}\n```";
-        let out = repair_tool_args("write_file", input);
+        let out = repair_tool_args("write", input);
         let v: serde_json::Value = serde_json::from_str(&out).expect("should parse");
         assert_eq!(v["file_path"], "/tmp/a.rs");
     }
@@ -2450,7 +2459,7 @@ mod tests {
     fn repair_tool_args_keeps_empty_object_untouched() {
         // Empty `{}` is valid JSON — we must not paper over it by inventing fields.
         // Callers surface it as a user-visible error instead.
-        assert_eq!(repair_tool_args("write_file", "{}"), "{}");
+        assert_eq!(repair_tool_args("write", "{}"), "{}");
     }
 
     #[test]
@@ -2458,7 +2467,7 @@ mod tests {
         // Pure garbage with no extractable key=value pairs → return as-is so
         // the tool emits the real parse error (not a misleading repaired stub).
         let input = "!!!";
-        assert_eq!(repair_tool_args("write_file", input), "!!!");
+        assert_eq!(repair_tool_args("write", input), "!!!");
     }
 
     // --- Windows-path unescape regression tests ---
@@ -2535,7 +2544,7 @@ mod tests {
         // this would silently decode to "D:<TAB>est<FF>oo.py" without
         // the pre-pass. Raw bytes: `D` `:` `\` `t` `e` `s` `t` `\` `f`...
         let input = "{\"file_path\": \"D:\\test\\foo.py\"}";
-        let out = repair_tool_args("read_file", input);
+        let out = repair_tool_args("read", input);
         let v: serde_json::Value =
             serde_json::from_str(&out).expect("should be valid JSON after pre-pass");
         assert_eq!(v["file_path"], "D:\\test\\foo.py");
@@ -2553,7 +2562,7 @@ mod tests {
         // Properly escaped Windows path — pre-pass must not double again.
         // Raw bytes: `D` `:` `\` `\` `w` `o` `r` `k` `\` `\` `a` ...
         let input = r#"{"file_path": "D:\\work\\app.py"}"#;
-        let out = repair_tool_args("read_file", input);
+        let out = repair_tool_args("read", input);
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         assert_eq!(v["file_path"], "D:\\work\\app.py");
     }
@@ -2563,7 +2572,7 @@ mod tests {
         // \\?\D:\... long-path prefix, fully escaped. The leading
         // \\\\?\\ region must survive pre-pass and parse correctly.
         let input = r#"{"file_path": "\\\\?\\D:\\test-wsd\\run.py"}"#;
-        let out = repair_tool_args("read_file", input);
+        let out = repair_tool_args("read", input);
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         assert_eq!(v["file_path"], "\\\\?\\D:\\test-wsd\\run.py");
     }
@@ -2575,7 +2584,7 @@ mod tests {
         // (alpha-then-`:`-then-`\`) but `y` is the tail of a word, not
         // a single-letter drive. The tab MUST be decoded as a tab.
         let input = r#"{"category": "fast\ttab\nnewline"}"#;
-        let out = repair_tool_args("write_file", input);
+        let out = repair_tool_args("write", input);
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         let s = v["category"].as_str().unwrap();
         assert!(s.contains('\t'), "real \\t should remain a tab: {:?}", s);
@@ -2592,7 +2601,7 @@ mod tests {
         // not the tail of a longer word. False-positive would corrupt
         // the intended newline into the two chars `\` + `n`.
         let input = r#"{"label": "category:\nimportant"}"#;
-        let out = repair_tool_args("write_file", input);
+        let out = repair_tool_args("write", input);
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         let s = v["label"].as_str().unwrap();
         assert!(s.contains('\n'), "newline should survive: got {:?}", s);
@@ -2625,7 +2634,7 @@ mod tests {
         // round-trips, otherwise serde decodes `\n` → newline and
         // the path turns into `D:<newline>ew<formfeed>oo.py`.
         let input = "{\"file_path\": \"D:\\new\\foo.py\"}";
-        let out = repair_tool_args("read_file", input);
+        let out = repair_tool_args("read", input);
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         let p = v["file_path"].as_str().unwrap();
         assert_eq!(
@@ -2657,7 +2666,7 @@ mod tests {
     #[test]
     fn repair_tool_args_single_letter_label_before_newline_is_not_path() {
         let input = r#"{"file_path": "/tmp/notify.py", "content": "class A:\n    pass\n"}"#;
-        let out = repair_tool_args("write_file", input);
+        let out = repair_tool_args("write", input);
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         let content = v["content"].as_str().unwrap();
         assert!(
@@ -2688,7 +2697,7 @@ mod tests {
         // paths, so the already-`\\`-escaped path is left alone and the real
         // newlines survive.
         let input = r#"{"file_path":"D:\\jeikcode\\read_excel.py","content":"import openpyxl\nimport os\nexcel_path = r'C:\\Users\\Administrator\\Desktop\\文章.xlsx'\nprint(os.path.exists(excel_path))\n"}"#;
-        let out = repair_tool_args("write_file", input);
+        let out = repair_tool_args("write", input);
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         let content = v["content"].as_str().unwrap();
         assert!(
@@ -2719,7 +2728,7 @@ mod tests {
     fn repair_tool_args_lowercase_drive_letter_recognized() {
         // Lowercase `c:\` is also a valid Windows drive prefix.
         let input = "{\"file_path\": \"c:\\users\\me\\file.txt\"}";
-        let out = repair_tool_args("read_file", input);
+        let out = repair_tool_args("read", input);
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         assert_eq!(v["file_path"], "c:\\users\\me\\file.txt");
     }
@@ -2730,7 +2739,7 @@ mod tests {
         // AND single-backslash Windows path. Pre-pass fixes the path
         // first, then repair_json strips the trailing comma.
         let input = "{\"file_path\": \"D:\\test\\foo.py\",}";
-        let out = repair_tool_args("read_file", input);
+        let out = repair_tool_args("read", input);
         let v: serde_json::Value =
             serde_json::from_str(&out).expect("should recover via repair_json");
         assert_eq!(v["file_path"], "D:\\test\\foo.py");
@@ -2744,7 +2753,7 @@ mod tests {
         // backslash — so valid code/text isn't corrupted. (Models must escape
         // paths they embed in code, e.g. `D:\\test`.)
         let input = "{\"file_path\": \"D:\\test\\foo.py\", \"old_string\": \"x = 'C:\\nfoo'\"}";
-        let out = repair_tool_args("edit_file", input);
+        let out = repair_tool_args("edit", input);
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         // file_path: the lone-backslash path rescued to literal backslashes.
         assert_eq!(v["file_path"], "D:\\test\\foo.py");
@@ -2759,7 +2768,7 @@ mod tests {
         // A properly-escaped path round-trips unchanged; the pre-pass walker still
         // honours `\"` when locating the string close.
         let input = "{\"cmd\": \"run \\\"D:\\\\foo.exe\\\"\"}";
-        let out = repair_tool_args("bash", input);
+        let out = repair_tool_args("run_command", input);
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         assert_eq!(v["cmd"], "run \"D:\\foo.exe\"");
     }
@@ -2768,7 +2777,7 @@ mod tests {
     #[cfg(windows)]
     fn bash_repair_routes_unmistakable_powershell_without_outer_shell() {
         let input = r#"{"command":"Get-Process | Where-Object { $_.Name -eq 'node.exe' }"}"#;
-        let out = repair_and_route_shell_args("bash", input);
+        let out = repair_and_route_shell_args("run_command", input);
         let value: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(value["shell"], "powershell");
         assert_eq!(
@@ -2781,24 +2790,24 @@ mod tests {
     #[cfg(windows)]
     fn bash_repair_does_not_reinterpret_generic_or_explicit_nested_shells() {
         let generic = r#"{"command":"printf '%s\\n' \"$HOME\""}"#;
-        assert_eq!(repair_and_route_shell_args("bash", generic), generic);
+        assert_eq!(repair_and_route_shell_args("run_command", generic), generic);
         let nested =
             r#"{"command":"powershell -Command \"Get-Process | Where-Object { $_.Name }\""}"#;
-        assert_eq!(repair_and_route_shell_args("bash", nested), nested);
+        assert_eq!(repair_and_route_shell_args("run_command", nested), nested);
     }
 
     #[test]
     #[cfg(windows)]
     fn bash_repair_normalizes_known_shell_aliases_and_cmd_field_only() {
         let input = r#"{"cmd":"Get-CimInstance Win32_Process","shell":"pwsh"}"#;
-        let out = repair_and_route_shell_args("bash", input);
+        let out = repair_and_route_shell_args("run_command", input);
         let value: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(value["command"], "Get-CimInstance Win32_Process");
         assert_eq!(value["shell"], "powershell");
         assert!(value.get("cmd").is_none());
 
         let cmd = r#"{"command":"for /f %i in ('where node') do @echo %i"}"#;
-        let out = repair_and_route_shell_args("bash", cmd);
+        let out = repair_and_route_shell_args("run_command", cmd);
         let value: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(value["shell"], "cmd");
     }
@@ -2807,7 +2816,7 @@ mod tests {
     #[cfg(windows)]
     fn bash_repair_preserves_unknown_explicit_shell_and_script_bytes() {
         let input = r#"{"command":"Invoke-StrangeThing --raw '$x'","shell":"custom-shell"}"#;
-        assert_eq!(repair_and_route_shell_args("bash", input), input);
+        assert_eq!(repair_and_route_shell_args("run_command", input), input);
     }
 
     #[test]
@@ -2918,7 +2927,7 @@ mod tests {
         // Raw bytes: `C` `:` `\` `\` `U` `s` `e` `r` `s` `\` `\` `\` `u` `5` `f` `2` `0` …
         // After JSON decode that's `C:\Users\张三\file.txt`.
         let input = r#"{"file_path": "C:\\Users\\张三\\file.txt"}"#;
-        let out = repair_tool_args("read_file", input);
+        let out = repair_tool_args("read", input);
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         assert_eq!(v["file_path"], "C:\\Users\\张三\\file.txt");
         // Negative: bytes after pre-pass MUST NOT contain `\\u` —
@@ -2941,7 +2950,7 @@ mod tests {
     #[test]
     fn pre_escape_mixes_unicode_escape_with_ambiguous_letter() {
         let input = "{\"file_path\": \"D:\\test\\u0041\\foo\"}";
-        let out = repair_tool_args("read_file", input);
+        let out = repair_tool_args("read", input);
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         // \t → literal `\t`; A → "A"; \f → literal `\f`.
         assert_eq!(v["file_path"], "D:\\testA\\foo");
@@ -3041,7 +3050,11 @@ mod tests {
 use async_trait::async_trait;
 use jeikcode_kernel::middleware::{BeforeOutcome, ToolMiddleware};
 use jeikcode_kernel::request::RequestCtx;
-use jeikcode_kernel::tool::{Tool, ToolCall, ToolResult};
+use jeikcode_kernel::tool::{Tool, ToolCall};
+// Referenced only by the `#[cfg(test)]` stubs below (via `use super::*`); importing it
+// unconditionally is dead code in a non-test build.
+#[cfg(test)]
+use jeikcode_kernel::tool::ToolResult;
 use std::sync::Arc;
 
 /// Repairs a tool call's JSON arguments in place before the call executes.
@@ -3082,7 +3095,7 @@ impl RepairToolArgsMiddleware {
         call.arguments = repair_tool_args(tool_name, &call.arguments);
         call.arguments = repair_stringified_structured_fields(&call.arguments, parameters_schema);
         call.arguments = repair_and_route_shell_args(tool_name, &call.arguments);
-        if tool_name.eq_ignore_ascii_case("edit") || tool_name.eq_ignore_ascii_case("edit_file") {
+        if is_edit_tool_name(tool_name) {
             call.arguments = normalize_edit_file_args(&call.arguments);
         }
     }
@@ -3209,11 +3222,8 @@ mod middleware_tests {
         // Common weak-model output: a trailing comma in write_file args, which
         // the kernel's `from_str` rejects outright.
         let mw = RepairToolArgsMiddleware;
-        let mut c = call(
-            "write_file",
-            r#"{"file_path":"game.html","content":"<html>",}"#,
-        );
-        mw.repair_call("write_file", &schema(), &mut c);
+        let mut c = call("write", r#"{"file_path":"game.html","content":"<html>",}"#);
+        mw.repair_call("write", &schema(), &mut c);
         let v: serde_json::Value = serde_json::from_str(&c.arguments)
             .expect("arguments should be valid JSON after repair");
         assert_eq!(v["file_path"], "game.html");
@@ -3223,8 +3233,8 @@ mod middleware_tests {
     fn passes_valid_json_through_unchanged() {
         let mw = RepairToolArgsMiddleware;
         let valid = r#"{"file_path":"a.html","content":"x"}"#;
-        let mut c = call("write_file", valid);
-        mw.repair_call("write_file", &schema(), &mut c);
+        let mut c = call("write", valid);
+        mw.repair_call("write", &schema(), &mut c);
         assert_eq!(c.arguments, valid, "valid JSON must not be altered");
     }
 
@@ -3493,7 +3503,7 @@ mod hardening_tests {
     fn trailing_comma_run_collapses_correctly() {
         // `{"k":[,,,...]}` (a botched list) used to remove one comma per pass → O(N^2).
         let input = format!("{{\"k\":[{}]}}", ",".repeat(50_000));
-        let out = repair_tool_args("write_file", &input);
+        let out = repair_tool_args("write", &input);
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON after repair");
         assert!(
             v["k"].as_array().map(|a| a.is_empty()).unwrap_or(false),
@@ -3513,7 +3523,7 @@ mod hardening_tests {
             s.push_str(&format!("\"k{i}\":\"v\""));
         }
         s.push('}');
-        let out = repair_tool_args("write_file", &s);
+        let out = repair_tool_args("write", &s);
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON after repair");
         assert_eq!(v["k0"], "v");
         assert_eq!(v[format!("k{}", n - 1)], "v");
@@ -3524,7 +3534,7 @@ mod hardening_tests {
         // Past the MAX_REPAIR_BYTES ceiling, repair is skipped and the original is
         // returned verbatim (the tool surfaces its own parse error).
         let big = format!("{{\"content\":\"{}\",}}", "x".repeat(600_000));
-        assert_eq!(repair_tool_args("write_file", &big), big);
+        assert_eq!(repair_tool_args("write", &big), big);
     }
 
     // --- #3: edit_file extractor selection is case-insensitive (canonical name). ---
@@ -3545,6 +3555,60 @@ mod hardening_tests {
         assert_eq!(v["file_path"], "a.py");
     }
 
+    #[test]
+    fn is_edit_tool_name_recognizes_canonical_and_aliases() {
+        for valid in [
+            "edit",
+            "Edit",
+            "EDIT",
+            "edit_file",
+            "Edit_File",
+            "EDIT_FILE",
+            "eDiT_FiLe",
+        ] {
+            assert!(
+                is_edit_tool_name(valid),
+                "is_edit_tool_name must recognize {valid:?}"
+            );
+        }
+        for invalid in [
+            "read",
+            "write",
+            "write_file",
+            "bash",
+            "editor",
+            "editing",
+            "",
+            "edits",
+        ] {
+            assert!(
+                !is_edit_tool_name(invalid),
+                "is_edit_tool_name must reject {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn edit_canonical_name_routes_to_specialized_extractor() {
+        // old_string carries an UNESCAPED double-quote — only the specialized extractor recovers this.
+        // Modern tool calling emits the canonical tool name `edit`, which must route identically to `edit_file`.
+        let input = r#"{"file_path": "a.py", "old_string": "say "hi" now", "new_string": "x"}"#;
+        let canonical = repair_tool_args("edit", input);
+        let legacy = repair_tool_args("edit_file", input);
+        let mixed = repair_tool_args("Edit", input);
+        assert_eq!(
+            canonical, legacy,
+            "canonical 'edit' must route identically to 'edit_file'"
+        );
+        assert_eq!(
+            canonical, mixed,
+            "casing on 'Edit' must route identically to 'edit'"
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&canonical).expect("canonical edit recovered to valid JSON");
+        assert_eq!(v["file_path"], "a.py");
+    }
+
     // --- #2 (key-scoping): valid non-path content with a drive-letter shape is
     //     identity — the Windows-path pass no longer corrupts it. ---
 
@@ -3555,7 +3619,7 @@ mod hardening_tests {
         // separator. Pre-key-scoping this doubled it to literal `\\n`, landing
         // broken code on disk.
         let input = r#"{"content":"print('C:\ndone')"}"#;
-        assert_eq!(repair_tool_args("write_file", input), input);
+        assert_eq!(repair_tool_args("write", input), input);
     }
 
     #[test]

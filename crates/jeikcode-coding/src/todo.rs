@@ -146,6 +146,20 @@ impl LifecycleHooks for TodoHook {
         }
         Some(format_completion_nudge(&todos))
     }
+
+    /// Turn 彻底终结。只有在最终 stop 且整个 agent 回复完全结束的那一刻，
+    /// 检测当前 todolist 是否非空且所有项目全部处于 completed 状态；若是，才统一做完成清空！
+    async fn turn_complete(
+        &self,
+        convo: &Conversation,
+        _reason: &jeikcode_kernel::event::StopReason,
+        _ctx: &TurnCtx,
+    ) {
+        let todos = derive_current_todos(&convo.messages);
+        if !todos.is_empty() && todos.iter().all(|t| t.status == TodoStatus::Completed) {
+            self.sync_live(&[]);
+        }
+    }
 }
 
 #[cfg(test)]

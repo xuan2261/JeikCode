@@ -1,0 +1,24 @@
+# 仓库统一行尾约定：索引与工作区一律 LF。
+# 目的：杜绝「检出 CRLF / 工具写 LF」造成的 mixed 行尾与整片空白 diff 噪音。
+# 注意：本文件会让 core.autocrlf=true 的机器也让位于这里的 eol 规则。
+* text=auto eol=lf
+
+# Windows 原生脚本必须保持 CRLF（批处理/PowerShell 对 LF 敏感）
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制资产：禁止一切文本/EOL 转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.icns binary
+*.ttf binary
+*.woff binary
+*.woff2 binary
+*.wasm binary
+*.pdf binary
+*.zip binary
+*.gz binary

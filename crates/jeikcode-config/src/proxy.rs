@@ -159,11 +159,11 @@ fn set_env_keys(keys: &[&str], value: &Option<String>) {
 }
 
 fn config_path() -> PathBuf {
-    if let Some(home) = env::var("JEIKCODE_HOME").ok().filter(|s| !s.is_empty()) {
-        return PathBuf::from(home).join("config.toml");
-    }
-    let home = crate::util::real_home_dir().unwrap_or_else(|| PathBuf::from("."));
-    home.join(".jeikcode").join("config.toml")
+    // Single source of truth: `config_dir()` handles the env override and the
+    // resolved-once memo; `default_path()` is exactly `<home>/config.toml`.
+    // A local copy here could read a DIFFERENT config file than the rest of
+    // the process.
+    crate::Config::default_path()
 }
 
 fn load_proxy_config_from_disk() -> ProxyConfig {

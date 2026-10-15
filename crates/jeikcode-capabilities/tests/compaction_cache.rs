@@ -22,9 +22,9 @@ fn big_arg(tag: &str) -> String {
     format!("{{\"text\":\"{tag}-{}\"}}", "x".repeat(550))
 }
 
-/// Round 1 of a turn: call echo with a big arg, report HIGH usage (util ≈ 0.9 vs the
-/// 1000-token window) so the recorded `meta.utilization` trips `should_compact` at the
-/// NEXT task boundary.
+/// Round 1 of a turn: call echo with a big arg, report a HIGH prompt count (900) so the
+/// recorded `meta.used_tokens` trips `should_compact` at the NEXT task boundary against the
+/// caller's WATERMARK budget (window − fixed watermark buffer) and threshold.
 fn call_round(id: &str, tag: &str) -> Vec<StreamEvent> {
     vec![
         StreamEvent::ToolCall(ToolCall {
@@ -92,6 +92,9 @@ async fn stub_compaction_keeps_the_wire_prefix_cacheable() {
     //   t2 boundary: 1 completed turn  → nothing older → noop.
     //   t3 boundary: 2 completed turns → turn 1's result becomes old → STUBBED.
     //   t4 boundary: 3 completed turns → turn 2 also stubbed; turn 1 stays FROZEN.
+    // Window 2_000 (watermark budget 1_500) keeps the whole shrunken session BELOW the
+    // watermark, so the mid-turn emergency-overflow ladder (which would also stub the
+    // ACTIVE turn) never interferes — this test is about the task-boundary stub policy.
     let provider = Arc::new(
         RecordingProvider::new(vec![
             call_round("c1", "t1"),
@@ -103,7 +106,7 @@ async fn stub_compaction_keeps_the_wire_prefix_cacheable() {
             call_round("c4", "t4"),
             answer_round("done4"),
         ])
-        .with_ctx_window(1000),
+        .with_ctx_window(2_000),
     );
     let calls = provider.calls();
 
@@ -112,7 +115,7 @@ async fn stub_compaction_keeps_the_wire_prefix_cacheable() {
         .tools(registry().mount(&["echo"]))
         .persona("persona")
         .compaction(Arc::new(StubCompaction::default()))
-        .compact_threshold(0.5) // fresh util ≈ 0.95 each turn > 0.5 → fires every boundary
+        .compact_threshold(0.5) // util ≈ 0.6 (950/1500) each turn > 0.5 → fires every boundary
         .build()
         .spawn();
 
@@ -215,13 +218,14 @@ fn summary_provider() -> Arc<RecordingProvider> {
 }
 
 /// END-TO-END through the REAL kernel loop with the REAL `OverflowCompaction` strategy:
-/// once utilization crosses `AUTO_DRAIN_UTILIZATION` (0.85) the AUTO task-boundary trigger
+/// once utilization crosses `AUTO_DRAIN_UTILIZATION` (0.78) the AUTO task-boundary trigger
 /// ESCALATES from the gentle stub to a drain+LLM-summary — the same plan as a manual
 /// `/compact` — so auto-compaction actually reduces context instead of only folding tool
 /// results. This is the regression lock for "auto-compaction now works without /compact".
 #[tokio::test]
 async fn auto_compaction_escalates_to_summary_at_high_utilization() {
-    // usage prompt 950 vs 1000-token window → util ≈ 0.95 ≥ 0.85 → escalate. 3 turns:
+    // usage prompt 950 vs the 1_000-token window's watermark budget (1_000 − 250 = 750) →
+    // util ≈ 1.27 ≥ 0.78 → escalate. 3 turns:
     //   t2 boundary: only 1 completed turn → nothing older than active → noop (no summary).
     //   t3 boundary: 2 completed turns → turn 1 drainable + high util → DRAIN+SUMMARY.
     let provider = Arc::new(

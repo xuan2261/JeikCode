@@ -41,4 +41,13 @@ pub trait McpClient: Send + Sync {
 
     /// Tear down transport resources owned by this client.
     async fn shutdown(&self);
+
+    /// Synchronous best-effort kill of the spawned process tree.
+    ///
+    /// `Drop` contexts have no runtime to await on, so the leak/deadlock backstop lives
+    /// here: a host that tears its runtime down (tests, one-shot CLI, embedded SDK) cannot
+    /// run the async idle reaper, so the LAST lease owner calls this instead of parking —
+    /// otherwise the child survives AND `Runtime::drop` waits forever on the still-open
+    /// stdout pipe. Default: nothing to kill (in-process / HTTP clients).
+    fn kill_now(&self) {}
 }

@@ -57,7 +57,7 @@ pub fn is_systemd_available() -> bool {
 
 /// Resolves the absolute path to the executable to put into systemd `ExecStart`.
 /// If running from a build target, checks if an installed binary (`/usr/local/bin/jeikcode`
-/// or `/usr/local/bin/atomcode` or `~/.local/bin/jeikcode`) exists.
+/// or `~/.local/bin/jeikcode`) exists.
 pub fn resolve_service_exe() -> PathBuf {
     let current = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("jeikcode"));
 
@@ -79,12 +79,7 @@ pub fn resolve_service_exe() -> PathBuf {
     }
 
     // Otherwise, check for standard install paths
-    for candidate in [
-        "/usr/local/bin/jeikcode",
-        "/usr/local/bin/atomcode",
-        "/usr/bin/jeikcode",
-        "/usr/bin/atomcode",
-    ] {
+    for candidate in ["/usr/local/bin/jeikcode", "/usr/bin/jeikcode"] {
         let p = Path::new(candidate);
         if p.exists() {
             return p.to_path_buf();
@@ -95,10 +90,6 @@ pub fn resolve_service_exe() -> PathBuf {
         let local_jeikcode = home.join(".local/bin/jeikcode");
         if local_jeikcode.exists() {
             return local_jeikcode;
-        }
-        let local_atomcode = home.join(".local/bin/atomcode");
-        if local_atomcode.exists() {
-            return local_atomcode;
         }
     }
 

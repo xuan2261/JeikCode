@@ -260,11 +260,9 @@ fn scan_systemd() -> Vec<HostServiceEntry> {
     if let Ok(read_dir) = std::fs::read_dir(&dir) {
         for entry in read_dir.flatten() {
             let file_name = entry.file_name().to_string_lossy().to_string();
-            // Match jeikcode-*.service or legacy atomcode-*.service (but NOT *-schedule-*.service)
-            let is_service = (file_name.starts_with("jeikcode-")
-                || file_name.starts_with("atomcode-"))
+            // Match jeikcode-*.service (but NOT *-schedule-*.service)
+            let is_service = file_name.starts_with("jeikcode-")
                 && !file_name.starts_with("jeikcode-schedule-")
-                && !file_name.starts_with("atomcode-schedule-")
                 && file_name.ends_with(".service");
             if is_service {
                 let port = parse_port_from_name(&file_name).unwrap_or(0);
@@ -531,10 +529,9 @@ fn scan_launchd() -> Vec<HostServiceEntry> {
         if let Ok(read_dir) = std::fs::read_dir(&launch_agents) {
             for entry in read_dir.flatten() {
                 let file_name = entry.file_name().to_string_lossy().to_string();
-                // Match com.jeikcode-*.plist or legacy com.atomcode-*.plist
-                let is_plist = (file_name.starts_with("com.jeikcode-")
-                    || file_name.starts_with("com.atomcode-"))
-                    && file_name.ends_with(".plist");
+                // Match com.jeikcode-*.plist
+                let is_plist =
+                    file_name.starts_with("com.jeikcode-") && file_name.ends_with(".plist");
                 if is_plist {
                     let port = parse_port_from_name(&file_name).unwrap_or(0);
                     let path = entry.path();
@@ -854,9 +851,9 @@ fn scan_schtasks() -> Vec<HostServiceEntry> {
                 .trim_start_matches('"')
                 .trim_start_matches('\\')
                 .trim();
-            // Match JeikCode-* or legacy AtomCode-* (case-insensitive)
+            // Match JeikCode-* (case-insensitive)
             let lower = task_name.to_lowercase();
-            if lower.starts_with("jeikcode-") || lower.starts_with("atomcode-") {
+            if lower.starts_with("jeikcode-") {
                 let port = parse_port_from_name(task_name).unwrap_or(0);
                 let status = if parts.len() >= 3 {
                     let s = parts[2].trim_end_matches('"').trim().to_lowercase();
@@ -925,7 +922,7 @@ fn scan_run_keys() -> Vec<HostServiceEntry> {
         let mut parts = line.split_whitespace();
         let Some(name) = parts.next() else { continue };
         let lower = name.to_lowercase();
-        if !(lower.starts_with("jeikcode-") || lower.starts_with("atomcode-")) {
+        if !lower.starts_with("jeikcode-") {
             continue;
         }
         let cmd_path = windows_service_dir().join(format!("{name}.cmd"));

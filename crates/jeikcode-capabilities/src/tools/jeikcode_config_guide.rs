@@ -291,15 +291,10 @@ impl Tool for JeikcodeConfigTool {
 }
 
 fn jeikcode_home() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("JEIKCODE_HOME") {
-        let p = p.trim();
-        if !p.is_empty() {
-            return Some(PathBuf::from(p));
-        }
-    }
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(|h| PathBuf::from(h).join(".jeikcode"))
+    // Unified derivation (env → legacy → real home) with the resolved-once memo
+    // and the thread-local test override. A local copy of this rule here would
+    // let the guide tool explain a different home than the one actually in use.
+    Some(jeikcode_config::Config::config_dir())
 }
 
 #[cfg(test)]

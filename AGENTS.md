@@ -22,6 +22,7 @@
 ## 3. Commit & PR Discipline
 
 - **Git Commit Standards**: Follow Conventional Commits (`feat(...)`, `fix(...)`, `refactor(...)`, `docs(...)`, etc.). Provide clear commit bodies describing the final effective state and rationale. Avoid fragmented 1–3 file micro-commits, except during iterative CI fix loops; consolidate repetitive CI fix commits into a single unified commit once green.
+- **Bilingual Commit Bodies**: Commit titles stay English-only. Bodies must be written in two complete passes, in this exact order: (1) the full English version first; (2) a standalone `---` separator line; (3) the full Chinese version. Inside the Chinese section, keep code identifiers, file paths, commands, API/field names, and other technical terms in their original English form at the appropriate places — do not translate them. The co-authorship trailer remains its own final paragraph, separated by a blank line.
 - **Issue & PR Traceability**: When referencing or addressing specific PRs or issues, explicitly state in both the commit title and body what was fixed, added, or changed regarding the target and the resulting outcome.
 - **PR Scope & Quality**:
   - **Single Responsibility**: Each PR must address exactly one category of change. Never bundle unrelated edits.
@@ -32,15 +33,37 @@
 
 ---
 
-## 4. Formatting & Targeted Verification
+## 4. Formatting & Verification (CI-first)
 
 - **Code Formatting**: Run `cargo fmt` on any Rust changes.
-- **Targeted Verification Matrix**:
-  - **Frontend (`webui/`)**: `cd webui && npm run build`.
-  - **Rust (`crates/`)**: `cargo check --lib -p jeikcode-daemon`.
-  - **Static / Lightweight**: Constants, copy, prompts, and minor configs may be committed directly without compilation.
-  - **Targeted Unit Tests**: Run dedicated tests directly (e.g., `node --test webui/src/lib/xxx.test.ts`).
-  - **Missing Toolchains**: When local toolchains are absent, skip execution and explicitly document unverified paths in your response to be verified by GitHub Actions CI.
+
+### CI-first — Builds, tests, and disk usage
+
+- MUST prefer existing GitHub Actions workflows for broad builds/tests,
+  cross-platform validation, and packaging. Do not run them locally by default.
+- MUST verify that CI results match the exact commit SHA and cover the changes;
+  results from an older commit do not validate newer code.
+- Limit local checks to the minimum needed to reproduce a bug, validate unpushed
+  changes, or smoke-test behavior that requires the local environment.
+  Before a heavy local build, MUST explain why CI cannot meet the requirement.
+- MUST NOT repeat local builds/tests for the same scope already validated by CI
+  at the same commit unless there is a concrete reason.
+- MUST NOT commit/push work in progress solely to trigger CI without authorization;
+  respect the authorized scope for commits, pushes, and target branches.
+- When running a built product, prefer downloading the binary/artifact for the
+  required commit and platform; do not download Cargo target directories/caches.
+- If CI is unavailable or lacks required checks, MUST report what remains
+  unverified; do not claim that verification is complete.
+
+### Targeted verification commands
+
+Prefer CI for every command below; run locally only under the CI-first exceptions above.
+
+- **Frontend (`webui/`)**: `cd webui && npm run build`.
+- **Rust (`crates/`)**: `cargo check --lib -p jeikcode-daemon`.
+- **Static / Lightweight**: Constants, copy, prompts, and minor configs may be committed directly without compilation.
+- **Targeted Unit Tests**: Dedicated tests (e.g., `node --test webui/src/lib/xxx.test.ts`).
+- **Missing Toolchains**: When a required toolchain is absent, skip the local run, keep the change minimal, and explicitly report what remains unverified for GitHub Actions CI.
 
 ---
 
@@ -49,7 +72,7 @@
 The release process strictly adheres to [`docs/release-tutorial.md`](./docs/release-tutorial.md):
 
 1. **Version Bump**: Run `npm run bump[:beta|patch|minor|major]` to cascade version numbers repository-wide.
-2. **Changelog**: Document updates at the top of `CHANGELOG.md` following the bilingual template (English section + single line `---` + Chinese section). For stable releases, sync the latest 2 version logs across the 3 README files.
+2. **Changelog**: Document updates at the top of `CHANGELOG.md` following the bilingual template (English section + single line `---` + Chinese section, direct feature and bug fix bullet points without internal technical mechanism paragraphs). The 3 README files maintain a single authoritative reference.
 3. **Commit & Push**: Commit release notes and push to the remote tracking branch (`main` for stable, `beta` for pre-release).
 4. **Trigger Workflow**: Tag and push (`git tag vX.Y.Z && git push origin vX.Y.Z`).
 5. **Delivery Closure**: Run `gh run list --limit 3` to verify the `Build and Release` workflow is `in_progress`. When observing pipeline progress, introduce a 180s delay script between polling intervals to avoid spamming the API.

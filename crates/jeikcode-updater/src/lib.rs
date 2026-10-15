@@ -238,6 +238,125 @@ pub fn current_exe_path() -> Result<PathBuf> {
     std::env::current_exe().context("could not resolve current executable path")
 }
 
+fn same_exe(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+fn looks_like_jeikcode_binary(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    lower == "jeikcode" || lower == "jeikcode.exe"
+}
+
+fn looks_like_desktop_cli_payload(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("cli-bin"))
+}
+
+fn desktop_cli_bin_candidates() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        let local = PathBuf::from(local);
+        dirs.push(local.join("JeikCode Desktop"));
+        dirs.push(local.join("Programs").join("JeikCode Desktop"));
+    }
+    for key in ["ProgramFiles", "ProgramFiles(x86)", "PROGRAMFILES"] {
+        if let Some(pf) = std::env::var_os(key) {
+            dirs.push(PathBuf::from(pf).join("JeikCode Desktop"));
+        }
+    }
+    if let Some(home) = jeikcode_config::util::real_home_dir() {
+        dirs.push(
+            home.join("Applications")
+                .join("JeikCode Desktop.app")
+                .join("Contents")
+                .join("Resources"),
+        );
+        dirs.push(home.join(".local").join("share").join("jeikcode-desktop"));
+    }
+    dirs.push(PathBuf::from(
+        "/Applications/JeikCode Desktop.app/Contents/Resources",
+    ));
+    dirs.push(PathBuf::from("/usr/lib/jeikcode-desktop"));
+    dirs.push(PathBuf::from("/usr/lib/JeikCode Desktop"));
+    dirs.push(PathBuf::from("/opt/JeikCode Desktop"));
+
+    let mut out = Vec::new();
+    for dir in dirs {
+        out.push(dir.join("cli-bin"));
+        out.push(dir.join("resources").join("cli-bin"));
+    }
+    out
+}
+
+/// Every CLI image we should overwrite: the running process, `~/.local/bin`,
+/// PATH copies, and the desktop installer's bundled `cli-bin`. Desktop copies
+/// `cli-bin` into `~/.local/bin` on launch; replacing only one side leaves
+/// either PATH or the next desktop start on the old build.
+pub fn discover_install_exes(running: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut push = |p: PathBuf, allow_payload: bool| {
+        if !(looks_like_jeikcode_binary(&p)
+            || (allow_payload && looks_like_desktop_cli_payload(&p)))
+        {
+            return;
+        }
+        if out.iter().any(|e| same_exe(e, &p)) {
+            return;
+        }
+        if p.exists() || same_exe(&p, running) {
+            out.push(p);
+        }
+    };
+    push(running.to_path_buf(), true);
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            push(dir.join("jeikcode"), false);
+            #[cfg(windows)]
+            push(dir.join("jeikcode.exe"), false);
+        }
+    }
+    if let Some(home) = jeikcode_config::util::real_home_dir() {
+        push(home.join(".local/bin/jeikcode"), false);
+        #[cfg(windows)]
+        push(home.join(".local/bin/jeikcode.exe"), false);
+    }
+    #[cfg(windows)]
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        push(
+            PathBuf::from(local).join("JeikCode").join("jeikcode.exe"),
+            false,
+        );
+    }
+    for candidate in ["/usr/local/bin/jeikcode", "/usr/bin/jeikcode"] {
+        push(PathBuf::from(candidate), false);
+    }
+    if let Some(p) = std::env::var_os("JEIKCODE_DESKTOP_CLI_BIN") {
+        push(PathBuf::from(p), true);
+    }
+    for p in desktop_cli_bin_candidates() {
+        push(p, true);
+    }
+    out
+}
+
+fn file_sha256_hex(path: &Path) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    std::io::copy(&mut file, &mut hasher).context("hashing file")?;
+    Ok(hex_encode(&hasher.finalize()))
+}
+
 /// Sibling path used to stash the previous binary.
 ///
 /// Unix: `jeikcode` → `jeikcode.bak`.
@@ -298,6 +417,437 @@ pub fn ensure_writable(exe: &Path) -> Result<()> {
 /// waiting 30s for a slow mirror is acceptable.
 pub async fn fetch_manifest() -> Result<Manifest> {
     fetch_manifest_from_url(manifest_url()).await
+}
+
+/// Release channel for in-place upgrades. `Stable` is GitHub `releases/latest`
+/// (`--main` / omitting the channel). `Beta` is the highest prerelease tag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpdateChannel {
+    Stable,
+    Beta,
+}
+
+impl UpdateChannel {
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "beta" | "preview" => Self::Beta,
+            _ => Self::Stable,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Beta => "beta",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListedAsset {
+    pub name: String,
+    pub browser_download_url: String,
+}
+
+/// One GitHub (or edge-cache) release row used by version listing.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListedRelease {
+    pub tag_name: String,
+    #[serde(default)]
+    pub prerelease: bool,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub published_at: Option<String>,
+    #[serde(default)]
+    pub assets: Vec<ListedAsset>,
+}
+
+fn tag_is_prerelease(tag: &str, flagged: bool) -> bool {
+    flagged || tag.contains('-')
+}
+
+/// SemVer compare that keeps pre-release ordinals (`7.2.4-beta.5` > `7.2.4-beta.4`).
+/// Stable without a pre-release tag ranks above the same core with a pre tag.
+pub fn version_is_newer(latest: &str, current: &str) -> bool {
+    let parse = |v: &str| -> (Vec<u64>, Option<(String, u64)>) {
+        let clean = v.trim().trim_start_matches('v').trim_start_matches('V');
+        if let Some((main_part, pre_part)) = clean.split_once('-') {
+            let nums: Vec<u64> = main_part
+                .split('.')
+                .filter_map(|s| s.parse::<u64>().ok())
+                .collect();
+            let pre_info = if let Some((tag, num_str)) = pre_part.split_once('.') {
+                Some((tag.to_lowercase(), num_str.parse::<u64>().unwrap_or(0)))
+            } else {
+                Some((pre_part.to_lowercase(), 0))
+            };
+            (nums, pre_info)
+        } else {
+            let nums: Vec<u64> = clean
+                .split('.')
+                .filter_map(|s| s.parse::<u64>().ok())
+                .collect();
+            (nums, None)
+        }
+    };
+    let (latest_nums, latest_pre) = parse(latest);
+    let (current_nums, current_pre) = parse(current);
+    let max_len = latest_nums.len().max(current_nums.len());
+    for i in 0..max_len {
+        let l = latest_nums.get(i).copied().unwrap_or(0);
+        let c = current_nums.get(i).copied().unwrap_or(0);
+        if l > c {
+            return true;
+        }
+        if l < c {
+            return false;
+        }
+    }
+    match (latest_pre, current_pre) {
+        (None, Some(_)) => true,
+        (Some(_), None) => false,
+        (Some((l_tag, l_num)), Some((c_tag, c_num))) => {
+            if l_tag != c_tag {
+                l_tag > c_tag
+            } else {
+                l_num > c_num
+            }
+        }
+        (None, None) => false,
+    }
+}
+
+fn next_page_url(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let raw = headers.get(reqwest::header::LINK)?.to_str().ok()?;
+    for part in raw.split(',') {
+        let part = part.trim();
+        if !part.contains("rel=\"next\"") {
+            continue;
+        }
+        let start = part.find('<')? + 1;
+        let end = part.find('>')?;
+        if start < end {
+            return Some(part[start..end].to_string());
+        }
+    }
+    None
+}
+
+fn notes_missing(body: &Option<String>) -> bool {
+    body.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true)
+}
+
+fn merge_listed_releases(into: &mut Vec<ListedRelease>, extra: Vec<ListedRelease>) {
+    for rel in extra {
+        if rel.tag_name.trim().is_empty() {
+            continue;
+        }
+        if let Some(existing) = into.iter_mut().find(|r| r.tag_name == rel.tag_name) {
+            if notes_missing(&existing.body) && !notes_missing(&rel.body) {
+                existing.body = rel.body;
+            }
+            if existing.published_at.is_none() {
+                existing.published_at = rel.published_at;
+            }
+            if existing.assets.is_empty() {
+                existing.assets = rel.assets;
+            }
+            existing.prerelease = existing.prerelease || rel.prerelease;
+        } else {
+            into.push(rel);
+        }
+    }
+}
+
+async fn fetch_release_pages(
+    client: &reqwest::Client,
+    first_url: &str,
+) -> Result<Vec<ListedRelease>> {
+    let mut url = first_url.to_string();
+    let mut all = Vec::new();
+    for _ in 0..20 {
+        let resp = client
+            .get(&url)
+            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        if !resp.status().is_success() {
+            if all.is_empty() {
+                return Err(anyhow!(
+                    "listing releases from {url} returned HTTP {}",
+                    resp.status()
+                ));
+            }
+            break;
+        }
+        let next = next_page_url(resp.headers());
+        let page = resp
+            .json::<Vec<ListedRelease>>()
+            .await
+            .context("parsing releases page")?;
+        if page.is_empty() {
+            break;
+        }
+        all.extend(page);
+        match next {
+            Some(next_url) => url = next_url,
+            None => break,
+        }
+    }
+    Ok(all)
+}
+
+/// Releases from the edge cache at `jeikcode.top/api/releases`.
+///
+/// GitHub's REST API is used when the edge returns nothing, or when it
+/// returns tags whose announcement `body` is still empty. A payload that
+/// already includes notes does not call GitHub.
+pub async fn list_releases() -> Result<Vec<ListedRelease>> {
+    let client = apply_proxy_policy(reqwest::Client::builder())
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent(JEIKCODE_USER_AGENT)
+        .build()?;
+    let mut all = Vec::new();
+    let primary = std::env::var("JEIKCODE_RELEASES_API_URL")
+        .ok()
+        .filter(|u| !u.trim().is_empty())
+        .unwrap_or_else(|| "https://jeikcode.top/api/releases".to_string());
+    if let Ok(resp) = client.get(&primary).send().await {
+        if resp.status().is_success() {
+            if let Ok(list) = resp.json::<Vec<ListedRelease>>().await {
+                merge_listed_releases(&mut all, list);
+            }
+        }
+    }
+    let edge_has_notes = all.iter().any(|r| !notes_missing(&r.body));
+    if all.is_empty() || !edge_has_notes {
+        let gh = "https://api.github.com/repos/jeikl/JeikCode/releases?per_page=100";
+        if let Ok(pages) = fetch_release_pages(&client, gh).await {
+            merge_listed_releases(&mut all, pages);
+        }
+    }
+    if all.is_empty() {
+        return Err(anyhow!("no releases found"));
+    }
+    Ok(all)
+}
+
+/// Channel releases, newest first. Stable drops prereleases; beta keeps them.
+pub fn filter_channel_releases(
+    releases: &[ListedRelease],
+    channel: UpdateChannel,
+) -> Vec<ListedRelease> {
+    let mut matched: Vec<ListedRelease> = releases
+        .iter()
+        .filter(|r| !r.tag_name.trim().is_empty())
+        .filter(|r| match channel {
+            UpdateChannel::Stable => !tag_is_prerelease(&r.tag_name, r.prerelease),
+            UpdateChannel::Beta => tag_is_prerelease(&r.tag_name, r.prerelease),
+        })
+        .cloned()
+        .collect();
+    matched.sort_by(|a, b| {
+        if version_is_newer(&a.tag_name, &b.tag_name) {
+            std::cmp::Ordering::Less
+        } else if version_is_newer(&b.tag_name, &a.tag_name) {
+            std::cmp::Ordering::Greater
+        } else {
+            a.tag_name.cmp(&b.tag_name)
+        }
+    });
+    matched.dedup_by(|a, b| a.tag_name == b.tag_name);
+    matched
+}
+
+/// `7.2.4` and `v7.2.4` both become `v7.2.4`.
+pub fn normalize_version_tag(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let bare = trimmed
+        .strip_prefix('v')
+        .or_else(|| trimmed.strip_prefix('V'))
+        .unwrap_or(trimmed);
+    format!("v{bare}")
+}
+
+/// Stable tags have no prerelease suffix. Anything with `-` is beta.
+pub fn channel_for_tag(tag: &str) -> UpdateChannel {
+    if tag_is_prerelease(tag, false) {
+        UpdateChannel::Beta
+    } else {
+        UpdateChannel::Stable
+    }
+}
+
+/// `latest.json` published next to one tag's binaries.
+pub async fn fetch_manifest_for_tag(version: &str) -> Result<Manifest> {
+    let tag = normalize_version_tag(version);
+    if tag == "v" {
+        return Err(anyhow!("missing version"));
+    }
+    let url = format!(
+        "{}/{tag}/latest.json",
+        download_base().trim_end_matches('/')
+    );
+    fetch_manifest_from_url(&url).await
+}
+
+/// Latest `latest.json` for the chosen channel. Stable uses GitHub
+/// `releases/latest`; beta picks the highest prerelease tag and loads that
+/// tag's `latest.json` (prereleases are never `/releases/latest`).
+pub async fn fetch_manifest_for_channel(channel: UpdateChannel) -> Result<Manifest> {
+    match channel {
+        UpdateChannel::Stable => fetch_manifest().await,
+        UpdateChannel::Beta => {
+            let tags = list_releases().await?;
+            let matched = filter_channel_releases(&tags, UpdateChannel::Beta);
+            let tag = matched
+                .first()
+                .map(|r| r.tag_name.clone())
+                .ok_or_else(|| anyhow!("no beta (prerelease) tag found"))?;
+            fetch_manifest_for_tag(&tag).await
+        }
+    }
+}
+
+/// Same as [`run_upgrade`] but reads the stable or beta manifest.
+pub async fn run_upgrade_for_channel(
+    channel: UpdateChannel,
+    current_version: String,
+    force: bool,
+    tx: mpsc::UnboundedSender<UpgradeEvent>,
+) -> Result<UpgradeSummary> {
+    if is_package_managed() {
+        return Err(anyhow!(PACKAGE_MANAGED));
+    }
+    let manifest = fetch_manifest_for_channel(channel).await?;
+    run_upgrade_with_manifest(manifest, current_version, force, tx).await
+}
+
+/// Child waits for this parent pid to exit before binding the listen port.
+pub const RESTART_WAIT_PID_ENV: &str = "JEIKCODE_RESTART_WAIT_PID";
+
+fn pid_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        unsafe { kill(pid as i32, 0) == 0 }
+    }
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
+            fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+            fn GetExitCodeProcess(handle: *mut std::ffi::c_void, code: *mut u32) -> i32;
+        }
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        const STILL_ACTIVE: u32 = 259;
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return false;
+            }
+            let mut code = 0u32;
+            let ok = GetExitCodeProcess(handle, &mut code);
+            CloseHandle(handle);
+            ok != 0 && code == STILL_ACTIVE
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Call at process start, before binding any port. The successor started by
+/// [`restart_replaced_process`] waits here until the old process has exited
+/// and released the listen socket.
+pub fn wait_for_predecessor_if_requested() {
+    let Ok(raw) = std::env::var(RESTART_WAIT_PID_ENV) else {
+        return;
+    };
+    let Ok(pid) = raw.parse::<u32>() else {
+        return;
+    };
+    std::env::remove_var(RESTART_WAIT_PID_ENV);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        if !pid_is_alive(pid) {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+#[cfg(unix)]
+fn supervised_by_service_manager() -> bool {
+    std::env::var_os("INVOCATION_ID").is_some()
+        || std::env::var_os("LAUNCH_JOBNAME").is_some()
+        || std::env::var_os("XPC_SERVICE_NAME").is_some()
+}
+
+/// After an in-place swap, start the new binary with the current argv, then
+/// exit this process so the listen port is released.
+///
+/// Spawn a detached successor that waits for this pid (`RESTART_WAIT_PID_ENV`)
+/// before binding. Do not use `cmd.exe`: the helper is killed when this
+/// process exits. Under systemd/launchd, `exec` keeps the supervised pid.
+///
+/// If the successor cannot be started, returns `Err` and the caller MUST keep
+/// serving so a remote browser is not left with a dead port.
+pub fn restart_replaced_process(exe: &Path) -> Result<std::convert::Infallible> {
+    // The binary on disk is already the selected release. A staged
+    // pending.json must not replace it again on the next start.
+    std::env::set_var("JEIKCODE_SKIP_PENDING_UPGRADE", "1");
+    #[cfg(unix)]
+    if supervised_by_service_manager() {
+        return re_exec_self(Some(exe));
+    }
+
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(&args)
+        .env(RESTART_WAIT_PID_ENV, std::process::id().to_string())
+        .env("JEIKCODE_SKIP_PENDING_UPGRADE", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        extern "C" {
+            fn setsid() -> i32;
+        }
+        unsafe {
+            cmd.pre_exec(|| {
+                let _ = setsid();
+                Ok(())
+            });
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB);
+    }
+
+    cmd.spawn()
+        .with_context(|| format!("spawning replacement binary {}", exe.display()))?;
+    std::process::exit(0);
 }
 
 /// Fetch and parse `Manifest` from a specific manifest URL.
@@ -623,31 +1173,6 @@ fn copy_across_devices(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Keep `jeikcode` and `atomcode` as the same binary. After replacing one,
-/// atomically replace the sibling name in the same directory (best-effort).
-/// Uses `atomic_copy_replace` so that if the sibling alias is currently
-/// running as a background service/process, it won't fail with ETXTBSY.
-fn sync_cli_alias(exe: &Path) {
-    let Some(stem) = exe.file_stem().and_then(|s| s.to_str()) else {
-        return;
-    };
-    let other = if stem.eq_ignore_ascii_case("atomcode") {
-        "jeikcode"
-    } else if stem.eq_ignore_ascii_case("jeikcode") {
-        "atomcode"
-    } else {
-        return;
-    };
-    let Some(dir) = exe.parent() else {
-        return;
-    };
-    let mut dest = dir.join(other);
-    if let Some(ext) = exe.extension() {
-        dest.set_extension(ext);
-    }
-    let _ = atomic_copy_replace(exe, &dest);
-}
-
 fn replace_binary(new_bin: &Path, exe: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -738,12 +1263,15 @@ pub async fn run_upgrade_with_manifest(
     })?;
     let exe = current_exe_path()?;
     ensure_writable(&exe)?;
+    // Drop a leftover auto-update stage so `__sync_config` / the next
+    // launch cannot paste an older package over this install.
+    clear_pending_pointer();
 
     let _ = tx.send(UpgradeEvent::ManifestFetched {
         version: manifest.version.clone(),
     });
 
-    if !force && !is_newer(&manifest.version, current_version) {
+    if !force && !version_is_newer(&manifest.version, current_version) {
         return Err(anyhow!(
             "{}: already on {} (latest is {}). Pass --force to reinstall.",
             ALREADY_LATEST,
@@ -765,7 +1293,34 @@ pub async fn run_upgrade_with_manifest(
 
     let _ = tx.send(UpgradeEvent::Replacing);
     replace_binary(&download, &exe)?;
-    sync_cli_alias(&exe);
+    let expected_sha = entry.sha256.as_str();
+    let got = file_sha256_hex(&exe)?;
+    if !got.eq_ignore_ascii_case(expected_sha) {
+        return Err(anyhow!(
+            "replaced {} but sha256 is {got}, expected {expected_sha}",
+            exe.display()
+        ));
+    }
+    for extra in discover_install_exes(&exe)
+        .into_iter()
+        .filter(|p| !same_exe(p, &exe))
+    {
+        if ensure_writable(&extra).is_err() {
+            eprintln!(
+                "Note: skipped extra install copy {} (not writable). PATH may still hit the old binary.",
+                extra.display()
+            );
+            continue;
+        }
+        if let Err(e) = atomic_copy_replace(&exe, &extra) {
+            eprintln!(
+                "Note: could not update extra install copy {}: {e}",
+                extra.display()
+            );
+            continue;
+        }
+        eprintln!("    also updated {}", extra.display());
+    }
 
     // Manual `/upgrade` just installed whatever the current manifest
     // advertises. Any staged upgrade sitting in `staged_dir()` is now
@@ -779,7 +1334,7 @@ pub async fn run_upgrade_with_manifest(
             let p = e.path();
             if p.file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("jeikcode-") || n.starts_with("atomcode-"))
+                .is_some_and(|n| n.starts_with("jeikcode-"))
             {
                 let _ = std::fs::remove_file(&p);
             }
@@ -827,6 +1382,9 @@ pub async fn run_upgrade(
     force: bool,
     tx: mpsc::UnboundedSender<UpgradeEvent>,
 ) -> Result<UpgradeSummary> {
+    if is_package_managed() {
+        return Err(anyhow!(PACKAGE_MANAGED));
+    }
     let manifest = fetch_manifest().await?;
     run_upgrade_with_manifest(manifest, current_version, force, tx).await
 }
@@ -977,7 +1535,7 @@ fn write_pending(pending: &PendingUpgrade) -> Result<()> {
     std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))
 }
 
-fn clear_pending_pointer() {
+pub fn clear_pending_pointer() {
     let _ = std::fs::remove_file(pending_json_path());
 }
 
@@ -1152,7 +1710,6 @@ pub fn apply_pending_upgrade() -> Result<Option<AppliedUpgrade>> {
     let exe = current_exe_path()?;
     ensure_writable(&exe)?;
     replace_binary(&pending.staged_path, &exe)?;
-    sync_cli_alias(&exe);
 
     // Success — pointer is done, file moved into place by replace_binary.
     clear_pending_pointer();
@@ -1467,6 +2024,95 @@ mod tests {
     }
 
     #[test]
+    fn version_is_newer_keeps_beta_ordinals() {
+        assert!(version_is_newer("v7.2.4-beta.5", "v7.2.4-beta.4"));
+        assert!(!version_is_newer("v7.2.4-beta.4", "v7.2.4-beta.5"));
+        assert!(version_is_newer("v7.2.4", "v7.2.4-beta.5"));
+        assert!(!version_is_newer("v7.2.4-beta.5", "v7.2.4"));
+        assert!(version_is_newer("v7.2.4-beta.1", "v7.2.3"));
+    }
+
+    fn sample_release(tag: &str, prerelease: bool) -> ListedRelease {
+        ListedRelease {
+            tag_name: tag.to_string(),
+            prerelease,
+            body: None,
+            published_at: None,
+            assets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn filter_channel_releases_sorts_newest_first() {
+        let releases = vec![
+            sample_release("v7.2.4-beta.4", true),
+            sample_release("v7.2.3", false),
+            sample_release("v7.2.4-beta.9", true),
+            sample_release("v7.2.4", false),
+            sample_release("v7.2.4-beta.9", true),
+        ];
+        let beta = filter_channel_releases(&releases, UpdateChannel::Beta);
+        assert_eq!(
+            beta.iter().map(|r| r.tag_name.as_str()).collect::<Vec<_>>(),
+            vec!["v7.2.4-beta.9", "v7.2.4-beta.4"]
+        );
+        let stable = filter_channel_releases(&releases, UpdateChannel::Stable);
+        assert_eq!(
+            stable
+                .iter()
+                .map(|r| r.tag_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["v7.2.4", "v7.2.3"]
+        );
+    }
+
+    #[test]
+    fn normalize_version_tag_adds_v_prefix() {
+        assert_eq!(normalize_version_tag("7.2.4"), "v7.2.4");
+        assert_eq!(normalize_version_tag("v7.2.4-beta.9"), "v7.2.4-beta.9");
+        assert_eq!(normalize_version_tag(" V7.2.4 "), "v7.2.4");
+        assert_eq!(channel_for_tag("v7.2.4"), UpdateChannel::Stable);
+        assert_eq!(channel_for_tag("v7.2.4-beta.9"), UpdateChannel::Beta);
+    }
+
+    #[test]
+    fn next_page_url_reads_rel_next() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::LINK,
+            reqwest::header::HeaderValue::from_static(
+                "<https://api.github.com/repos/jeikl/JeikCode/releases?per_page=100&page=2>; rel=\"next\", <https://api.github.com/repos/jeikl/JeikCode/releases?per_page=100&page=4>; rel=\"last\"",
+            ),
+        );
+        assert_eq!(
+            next_page_url(&headers).as_deref(),
+            Some("https://api.github.com/repos/jeikl/JeikCode/releases?per_page=100&page=2")
+        );
+    }
+
+    #[test]
+    fn looks_like_jeikcode_binary_accepts_product_name() {
+        assert!(looks_like_jeikcode_binary(Path::new("jeikcode")));
+        assert!(looks_like_jeikcode_binary(Path::new("jeikcode.exe")));
+        assert!(!looks_like_jeikcode_binary(Path::new("jeikcode.cmd")));
+        assert!(!looks_like_jeikcode_binary(Path::new("other.exe")));
+        assert!(looks_like_desktop_cli_payload(Path::new("cli-bin")));
+        assert!(looks_like_desktop_cli_payload(Path::new(
+            "C:/app/resources/cli-bin"
+        )));
+        assert!(!looks_like_desktop_cli_payload(Path::new("jeikcode.exe")));
+    }
+
+    #[test]
+    fn discover_install_exes_includes_running_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let running = tmp.path().join("jeikcode");
+        std::fs::write(&running, b"x").unwrap();
+        let found = discover_install_exes(&running);
+        assert!(found.iter().any(|p| same_exe(p, &running)));
+    }
+
+    #[test]
     fn manifest_parses_minimal_shape() {
         let json = r#"{
             "version": "v4.19.0",
@@ -1714,23 +2360,6 @@ mod tests {
 
         assert_eq!(std::fs::read(&exe).unwrap(), b"OLD");
         assert_eq!(std::fs::read(&bak).unwrap(), b"NEW");
-    }
-
-    #[test]
-    fn sync_cli_alias_synchronizes_bidirectionally() {
-        let tmp = tempfile::tempdir().unwrap();
-        let jeikcode = tmp.path().join("jeikcode");
-        let atomcode = tmp.path().join("atomcode");
-
-        // When upgrading jeikcode, atomcode alias should be created/synced
-        std::fs::write(&jeikcode, b"VERSION_NEW").unwrap();
-        sync_cli_alias(&jeikcode);
-        assert_eq!(std::fs::read(&atomcode).unwrap(), b"VERSION_NEW");
-
-        // When upgrading atomcode, jeikcode alias should be created/synced
-        std::fs::write(&atomcode, b"VERSION_NEXT").unwrap();
-        sync_cli_alias(&atomcode);
-        assert_eq!(std::fs::read(&jeikcode).unwrap(), b"VERSION_NEXT");
     }
 
     #[test]

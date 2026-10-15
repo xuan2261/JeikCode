@@ -183,7 +183,7 @@ fn collect_skill_files(root: &Path, dir: &Path, out: &mut Vec<String>, limit: us
 }
 
 /// Format a skill directory for the base-dir note (see `bundled_resource_note`). On
-/// Windows, convert `\` → `/` so the path works uniformly across read_file/Python/Git
+/// Windows, convert `\` → `/` so the path works uniformly across read/Python/Git
 /// Bash (a raw backslash path breaks when bash treats `\U`/`\s` as escapes). Windows
 /// separators are always `\` and filenames can't contain `\`, so the replace is lossless.
 /// On Unix, `\` is a legal filename char, so leave it. Note-text only — never used for IO.
@@ -799,12 +799,12 @@ mod tests {
 
     #[test]
     fn frontmatter_parse() {
-        let (fm, body) = parse_frontmatter("---\nname: my-skill\ndescription: \"does X\"\nallowed-tools: read_file, bash\n---\nbody here\n");
+        let (fm, body) = parse_frontmatter("---\nname: my-skill\ndescription: \"does X\"\nallowed-tools: read, run_command\n---\nbody here\n");
         assert_eq!(fm.name.as_deref(), Some("my-skill"));
         assert_eq!(fm.description, "does X");
         assert_eq!(
             fm.allowed_tools,
-            vec!["read_file".to_string(), "bash".to_string()]
+            vec!["read".to_string(), "run_command".to_string()]
         );
         assert_eq!(body.trim(), "body here");
     }
@@ -890,14 +890,14 @@ mod tests {
     #[test]
     fn frontmatter_single_quotes_and_space_tools() {
         let (fm, _) = parse_frontmatter(
-            "---\nname: 'my-skill'\nallowed-tools: read_file bash grep\n---\nbody\n",
+            "---\nname: 'my-skill'\nallowed-tools: read run_command grep\n---\nbody\n",
         );
         assert_eq!(fm.name.as_deref(), Some("my-skill"));
         assert_eq!(
             fm.allowed_tools,
             vec![
-                "read_file".to_string(),
-                "bash".to_string(),
+                "read".to_string(),
+                "run_command".to_string(),
                 "grep".to_string()
             ]
         );

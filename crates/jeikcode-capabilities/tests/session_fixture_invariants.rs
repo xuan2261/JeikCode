@@ -149,7 +149,7 @@ fn assert_no_shell_workaround_calls(fixture_name: &str) {
     let args_list = collect_tool_call_args(&ev);
 
     // Shell-based edit bypasses — if these appear the agent worked around
-    // edit_file. The framework warns against them (edit.rs failure message
+    // `edit`. The framework warns against them (`edit` failure message
     // + bash.rs workspace-change detection). In a CLEAN fixture these
     // should be absent; their presence would suggest either regression or
     // the fixture itself isn't clean and shouldn't be used as a reference.

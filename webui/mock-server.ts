@@ -40,6 +40,15 @@ function readJsonBody(req: { on: (ev: string, cb: (c?: Buffer) => void) => void 
 export function mockApiPlugin(): Plugin {
   const sessionQueues = new Map<string, any[]>();
   const runningChats = new Set<string>();
+  const sidebarHidden = new Set<string>(['proj_fetch']);
+  const sidebarPinned: Array<{
+    hash: string;
+    name: string;
+    working_dir: string;
+    session_count: number;
+    created_at: number;
+    last_updated: number;
+  }> = [];
   const mockSessions: MockSession[] = [
     {
       id: 'sess_input_anomaly',
@@ -321,6 +330,46 @@ export function mockApiPlugin(): Plugin {
               { name: 'web-search', status: 'running', tools: 2 },
             ],
           });
+        }
+
+        const sidebarView = () => ({ hidden: [...sidebarHidden], pinned: sidebarPinned });
+
+        if (pathname === '/projects/sidebar') {
+          return sendJson(sidebarView());
+        }
+        if (pathname === '/projects/sidebar/hide') {
+          void readJsonBody(req).then((body) => {
+            if (typeof body.hash === 'string' && body.hash) sidebarHidden.add(body.hash);
+            sendJson(sidebarView());
+          });
+          return;
+        }
+        if (pathname === '/projects/sidebar/show') {
+          void readJsonBody(req).then((body) => {
+            const path = typeof body.path === 'string' ? body.path : '';
+            const name = path.split(/[\\/]/).filter(Boolean).pop() || path;
+            const hash = `pin_${name || 'dir'}`;
+            sidebarHidden.delete(hash);
+            if (!sidebarPinned.some((p) => p.hash === hash)) {
+              sidebarPinned.push({
+                hash,
+                name,
+                working_dir: path,
+                session_count: 0,
+                created_at: mockNow(),
+                last_updated: mockNow(),
+              });
+            }
+            sendJson(sidebarPinned.find((p) => p.hash === hash));
+          });
+          return;
+        }
+        if (pathname === '/projects/sidebar/reveal') {
+          void readJsonBody(req).then((body) => {
+            if (typeof body.hash === 'string' && body.hash) sidebarHidden.delete(body.hash);
+            sendJson(sidebarView());
+          });
+          return;
         }
 
         // Projects

@@ -5,11 +5,17 @@
 //! after the last lease drops once the sliding idle window from the last
 //! `call_tool` expires, reaped when the session is deleted, and reaped with the
 //! JeikCode process on host exit.
+//!
+//! PARKING IS HOST-DEPENDENT: park-on-idle needs the async reaper to actually run. A host
+//! that tears its runtime down (tests / one-shot CLI / embedded SDK) dies before the first
+//! TTL sweep, so its last lease owner tears the session's transports down SYNCHRONOUSLY
+//! instead — parking there would leak the process tree and deadlock `Runtime::drop` on the
+//! still-open stdout pipes. See `SessionMcpLease`'s `Drop`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use tokio::sync::{Mutex, RwLock};
@@ -32,6 +38,9 @@ struct SessionMcpEntry {
 struct SessionMcpGeneration {
     registry: Arc<McpRegistry>,
     owners: AtomicUsize,
+    /// Back-reference for the LAST lease's `Drop`: it must consult the pool's reaper state
+    /// (and retire the parked entry) WITHOUT an async runtime.
+    pool: Weak<SessionMcpPool>,
 }
 
 /// Process-wide pool of isolated `scope=session` registries.
@@ -42,6 +51,10 @@ struct SessionMcpGeneration {
 pub struct SessionMcpPool {
     entries: RwLock<HashMap<SessionMcpKey, SessionMcpEntry>>,
     lifecycle: Mutex<()>,
+    /// Set once the async idle reaper has ACTUALLY parked something — proof that this host
+    /// keeps a runtime alive long enough for the TTL sweep. Until then, the last-lease drop
+    /// tears the session down synchronously instead of parking (see `SessionMcpLease`).
+    reaper_proven: Arc<AtomicBool>,
 }
 
 static GLOBAL_SESSION_MCP_POOL: OnceLock<Arc<SessionMcpPool>> = OnceLock::new();
@@ -51,6 +64,7 @@ impl SessionMcpPool {
         Self {
             entries: RwLock::new(HashMap::new()),
             lifecycle: Mutex::new(()),
+            reaper_proven: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -71,9 +85,11 @@ impl SessionMcpPool {
     /// registries (never spawned, or already parked) are no-ops.
     /// `ttl` is a sliding window from the last `call_tool`; catalog probes,
     /// `tools/list`, and connect do not refresh it.
-    pub async fn reap_idle(&self, ttl: Duration) {
+    /// Returns how many registries were ACTUALLY parked — `0` means the reaper had nothing
+    /// to reclaim, which is how [`SessionMcpPool::reaper_proven`] stays honest.
+    pub async fn reap_idle(&self, ttl: Duration) -> usize {
         if ttl.is_zero() {
-            return;
+            return 0;
         }
         let _lifecycle = self.lifecycle.lock().await;
         let registries: Vec<_> = {
@@ -84,9 +100,13 @@ impl SessionMcpPool {
                 .map(|entry| entry.generation.registry.clone())
                 .collect()
         };
+        let mut parked = 0usize;
         for registry in registries {
-            registry.park_if_idle(ttl).await;
+            if registry.park_if_idle(ttl).await {
+                parked += 1;
+            }
         }
+        parked
     }
 
     /// Acquire one owner lease. Concurrent prepares for the same session share
@@ -120,6 +140,7 @@ impl SessionMcpPool {
                 let generation = Arc::new(SessionMcpGeneration {
                     registry,
                     owners: AtomicUsize::new(1),
+                    pool: Arc::downgrade(self),
                 });
                 entries.insert(
                     key.clone(),
@@ -218,6 +239,17 @@ impl SessionMcpPool {
         }
     }
 
+    /// Synchronous twin of [`Self::retire_key`] for `Drop` contexts (no runtime to await
+    /// on): drops the parked entry so its registry/transports can go. Best-effort — a
+    /// contended lock is fine, because the caller already issued the synchronous child kill
+    /// and the reaper (or process exit) finishes the job.
+    fn retire_key_now(&self, key: &SessionMcpKey) -> bool {
+        match self.entries.try_write() {
+            Ok(mut entries) => entries.remove(key).is_some(),
+            Err(_) => false,
+        }
+    }
+
     /// Refresh the shared schema cache without killing unchanged live processes.
     pub async fn invalidate_project(&self, project_dir: &Path) {
         super::schema_cache::refresh_session_mcp_schema(project_dir).await;
@@ -284,16 +316,26 @@ fn spawn_idle_reaper(pool: Arc<SessionMcpPool>) {
             if ttl_secs == 0 {
                 continue;
             }
-            pool.reap_idle(Duration::from_secs(ttl_secs)).await;
+            if pool.reap_idle(Duration::from_secs(ttl_secs)).await > 0 {
+                // The reaper demonstrably works in THIS host ⇒ park-on-idle warm reuse is
+                // safe here (the TTL sweep will reclaim parked sessions).
+                pool.reaper_proven.store(true, Ordering::Release);
+            }
         }
     });
 }
 
 /// RAII owner for a session registry. Provider-only reassembly reuses the same
 /// CodingParts and therefore the same lease; overlapping handoffs are ref-counted.
-/// Dropping the last lease does **not** immediately kill the session process;
-/// [`SessionMcpPool::reap_idle`] parks it after `[mcp.session] idle_ttl_secs`
-/// of no `call_tool` (sliding window), and only once `owners == 0`.
+///
+/// Dropping the last lease PARKS the session process for warm reuse ONLY when this host's
+/// idle reaper has demonstrably run at least once (`SessionMcpPool::reaper_proven`) — the
+/// only case in which the TTL sweep can actually reclaim it, and only once `owners == 0`.
+/// In a host that tears its runtime down (tests / one-shot CLI / embedded SDK) the reaper
+/// task dies with the runtime and never runs, so leaving the process parked would leak the
+/// whole npx/cmd/node tree AND deadlock `Runtime::drop` forever on the still-open stdout
+/// pipes. That case instead tears the session's transports down synchronously (no runtime
+/// needed) and retires the parked entry.
 pub struct SessionMcpLease {
     key: Option<SessionMcpKey>,
     generation: Arc<SessionMcpGeneration>,
@@ -307,10 +349,34 @@ impl SessionMcpLease {
 
 impl Drop for SessionMcpLease {
     fn drop(&mut self) {
-        let Some(_key) = self.key.take() else {
+        let Some(key) = self.key.take() else {
             return;
         };
-        self.generation.owners.fetch_sub(1, Ordering::AcqRel);
+        if self.generation.owners.fetch_sub(1, Ordering::AcqRel) != 1 {
+            // Another owner (a concurrent CodingParts clone) still holds this session.
+            return;
+        }
+        // LAST owner: the session is being switched away / torn down.
+        let pool = self.generation.pool.upgrade();
+        let host_has_reaper = pool
+            .as_ref()
+            .is_some_and(|pool| pool.reaper_proven.load(Ordering::Acquire));
+        if host_has_reaper {
+            // Long-lived host: park for warm reuse; the TTL sweep reclaims it later.
+            return;
+        }
+        // No usable async reaper here: kill the children NOW (synchronously — we are inside
+        // `Drop`). This closes their stdout pipes, unblocking any reader still parked on
+        // them, and stops the process tree from leaking past this host.
+        self.generation.registry.kill_all_children_now();
+        // The session registry only knows its OWN clients. A session-less assembly (e.g.
+        // `SessionMode::Disabled`, or the schema probe) spawns through the project pool /
+        // probe path, so drain the process-global list too — that is the only way to reap a
+        // child this lease never owned. Superset of the call above; both are idempotent.
+        super::kill_all_mcp_children_now();
+        if let Some(pool) = pool {
+            pool.retire_key_now(&key);
+        }
     }
 }
 
@@ -334,6 +400,9 @@ mod tests {
     #[tokio::test]
     async fn leases_share_within_a_session_and_isolate_other_sessions() {
         let pool = Arc::new(SessionMcpPool::new());
+        // Long-lived-host semantics: a proven idle reaper is what keeps parked entries
+        // around after the last lease drops (the assertion at the end relies on that).
+        pool.reaper_proven.store(true, Ordering::Release);
         let project = tempfile::tempdir().unwrap();
         let first = pool.acquire(project.path(), "a").await;
         let second = pool.acquire(project.path(), "a").await;
@@ -356,6 +425,9 @@ mod tests {
     #[tokio::test]
     async fn last_lease_drop_reuses_the_same_generation() {
         let pool = Arc::new(SessionMcpPool::new());
+        // Warm reuse after the last lease drop is a LONG-LIVED-host behavior (see
+        // `SessionMcpLease::drop`); a host without a working reaper retires instead.
+        pool.reaper_proven.store(true, Ordering::Release);
         let project = tempfile::tempdir().unwrap();
         let first = pool.acquire(project.path(), "a").await;
         let old = first.registry();
@@ -401,5 +473,45 @@ mod tests {
         pool.reap_idle(Duration::from_millis(1)).await;
         assert_eq!(pool.owner_count(project.path(), "a").await, 1);
         drop(lease);
+    }
+
+    /// SHORT-LIVED host (no working idle reaper — tests, one-shot CLI, embedded SDK): the
+    /// LAST lease drop must retire the session entry and kill its transports synchronously.
+    /// Parking here is what leaked the MCP process tree AND deadlocked `Runtime::drop` on
+    /// the still-open stdout pipes (the `tests/full_assembly.rs` hang).
+    #[tokio::test]
+    async fn last_lease_drop_on_a_short_lived_host_retires_the_entry() {
+        let pool = Arc::new(SessionMcpPool::new());
+        let project = tempfile::tempdir().unwrap();
+        let lease = pool.acquire(project.path(), "s").await;
+        assert!(pool.cached_registry(project.path(), "s").await.is_some());
+
+        drop(lease);
+
+        assert!(
+            pool.cached_registry(project.path(), "s").await.is_none(),
+            "the last owner's drop must retire the entry when no reaper can run"
+        );
+    }
+
+    /// A non-owner drop must NOT tear anything down: concurrent CodingParts clones share the
+    /// same lease, so the session survives until the LAST owner goes away.
+    #[tokio::test]
+    async fn earlier_owner_drop_keeps_the_session_alive() {
+        let pool = Arc::new(SessionMcpPool::new());
+        let project = tempfile::tempdir().unwrap();
+        let first = pool.acquire(project.path(), "s").await;
+        let second = pool.acquire(project.path(), "s").await;
+
+        drop(first);
+        assert!(
+            pool.cached_registry(project.path(), "s").await.is_some(),
+            "a concurrent owner still holds the session"
+        );
+        drop(second);
+        assert!(
+            pool.cached_registry(project.path(), "s").await.is_none(),
+            "the last owner retires it"
+        );
     }
 }

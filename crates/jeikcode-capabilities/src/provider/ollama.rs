@@ -53,6 +53,7 @@ pub struct OllamaConfig {
     pub think: bool,
     pub idle_timeout: Duration,
     pub connect_timeout: Duration,
+    pub open_timeout: Duration,
     pub retry: RetryPolicy,
     /// User-Agent sent on every request. `None` ⇒ [`super::DEFAULT_USER_AGENT`]; the
     /// driver injects `jeikcode/<version>` for gateway attribution.
@@ -71,8 +72,9 @@ impl OllamaConfig {
             context_window: 8_192,
             max_tokens: None,
             think: false,
-            idle_timeout: Duration::from_secs(120),
-            connect_timeout: Duration::from_secs(30),
+            idle_timeout: jeikcode_kernel::timeouts::TimeoutPolicy::production().idle_watchdog(),
+            connect_timeout: jeikcode_kernel::timeouts::TimeoutPolicy::production().connect,
+            open_timeout: jeikcode_kernel::timeouts::TimeoutPolicy::production().open,
             retry: RetryPolicy::default(),
             user_agent: None,
             skip_tls_verify: false,
@@ -152,6 +154,7 @@ impl LlmProvider for OllamaProvider {
         // Snapshot the session id once; reused across the open and any mid-stream reopen.
         let session_id = self.session_id.get().cloned().unwrap_or_default();
         let idle = self.cfg.idle_timeout;
+        let open_timeout = self.cfg.open_timeout;
         let rate_limit_retry_owner = options.rate_limit_retry_owner;
         let resp = open_stream(
             &client,
@@ -161,6 +164,7 @@ impl LlmProvider for OllamaProvider {
             &session_id,
             &policy,
             rate_limit_retry_owner,
+            open_timeout,
         )
         .await?;
 
@@ -212,7 +216,7 @@ impl LlmProvider for OllamaProvider {
                                 // Brief, esc-interruptible backoff before reopening so an
                                 // immediate retry does not slam a gateway resetting under load.
                                 tokio::time::sleep(retry::compute_backoff(stream_attempt, &policy)).await;
-                                if let Ok(fresh) = open_stream(&client, &url, &body, &api_key, &session_id, &policy, rate_limit_retry_owner).await {
+                                if let Ok(fresh) = open_stream(&client, &url, &body, &api_key, &session_id, &policy, rate_limit_retry_owner, open_timeout).await {
                                     stream_attempt += 1;
                                     resp = fresh;
                                     continue 'reopen;
@@ -273,6 +277,7 @@ async fn open_stream(
     session_id: &str,
     policy: &RetryPolicy,
     rate_limit_retry_owner: jeikcode_kernel::provider::RateLimitRetryOwner,
+    open_timeout: Duration,
 ) -> Result<reqwest::Response, ProviderError> {
     let mut attempt = 1u32;
     loop {
@@ -285,8 +290,25 @@ async fn open_stream(
             req = req.header("x-jeikcode-session-id", session_id);
             req = req.header("x-session-id", session_id);
         }
-        match req.send().await {
-            Ok(resp) => {
+        match super::retry::send_with_ttfb(req, open_timeout).await {
+            super::retry::OpenSend::Timeout => {
+                if attempt < policy.max_attempts {
+                    tokio::time::sleep(retry::compute_backoff(attempt, policy)).await;
+                    attempt += 1;
+                    continue;
+                }
+                return Err(super::retry::ttfb_timeout_error(open_timeout));
+            }
+            super::retry::OpenSend::Transport(e) => {
+                if retry::is_retryable_reqwest_error(&e) && attempt < policy.max_attempts {
+                    let wait = retry::compute_backoff(attempt, policy);
+                    tokio::time::sleep(wait).await;
+                    attempt += 1;
+                    continue;
+                }
+                return Err(open_error(e));
+            }
+            super::retry::OpenSend::Response(resp) => {
                 let code = resp.status().as_u16();
                 if !resp.status().is_success() {
                     if retry::should_retry_open_status(code, rate_limit_retry_owner)
@@ -317,15 +339,6 @@ async fn open_stream(
                     });
                 }
                 return Ok(resp);
-            }
-            Err(e) => {
-                if retry::is_retryable_reqwest_error(&e) && attempt < policy.max_attempts {
-                    let wait = retry::compute_backoff(attempt, policy);
-                    tokio::time::sleep(wait).await;
-                    attempt += 1;
-                    continue;
-                }
-                return Err(open_error(e));
             }
         }
     }
@@ -1131,10 +1144,6 @@ mod tests {
         assert!(
             head.contains("x-session-id: sess-ollama"),
             "gateway cache-affinity header must be forwarded: {head}"
-        );
-        assert!(
-            !head.contains("x-atomcode-session-id"),
-            "legacy atomcode session header must not be sent: {head}"
         );
         assert!(
             head.contains("user-agent: jeikcode/9.9.9"),

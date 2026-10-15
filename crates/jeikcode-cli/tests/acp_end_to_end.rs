@@ -67,7 +67,7 @@ async fn initialize_new_prompt_streams_and_stops() {
     // Isolate global config (memory/hooks/MCP) so `prepare` is fast & hermetic:
     // an empty JEIKCODE_HOME means no global memory.md, no hooks.json, no MCP.
     let home = tempfile::tempdir().expect("home tempdir");
-    std::env::set_var("JEIKCODE_HOME", home.path());
+    let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
     // A clean working dir with no `.mcp.json` → no MCP servers spawned.
     let cwd = tempfile::tempdir().expect("cwd tempdir");
 
@@ -191,7 +191,7 @@ async fn initialize_new_prompt_streams_and_stops() {
 #[serial_test::serial]
 async fn error_turn_does_not_poison_next_prompt_on_same_session() {
     let home = tempfile::tempdir().expect("home tempdir");
-    std::env::set_var("JEIKCODE_HOME", home.path());
+    let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
     let cwd = tempfile::tempdir().expect("cwd tempdir");
 
     // Turn 1: a mid-stream provider error (non-retryable). Turn 2: a normal stop.

@@ -33,13 +33,7 @@ pub fn project_plugins_root(
     working_dir: &std::path::Path,
     scope: &InstallScope,
 ) -> Option<PathBuf> {
-    let base = if working_dir.join(".jeikcode").exists() {
-        ".jeikcode/plugins"
-    } else if working_dir.join(".atomcode").exists() {
-        ".atomcode/plugins"
-    } else {
-        ".jeikcode/plugins"
-    };
+    let base = ".jeikcode/plugins";
     match scope {
         InstallScope::Project => Some(working_dir.join(base)),
         InstallScope::Local => Some(working_dir.join(base).join("local")),

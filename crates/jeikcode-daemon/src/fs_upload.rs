@@ -3,7 +3,7 @@
 //! Images stay on the chat `images` field (base64). Non-image files are streamed
 //! to disk and referenced in the user message as absolute paths. `.jeikcode_store/`
 //! is added to `.gitignore` when that file exists, or created when the cwd is a
-//! git repo; `read`/`grep`/`glob`/`list_directory` still see the directory.
+//! git repo; `read`/`grep`/`glob` still see the directory.
 //!
 //! The WebUI only calls this when the user **sends** — drag/paste keep a local
 //! `File` handle so the user can remove attachments before anything hits disk.

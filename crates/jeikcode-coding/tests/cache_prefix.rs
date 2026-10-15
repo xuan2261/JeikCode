@@ -25,7 +25,7 @@ fn _isolate_jeikcode_home() {
 
 fn cfg(working_dir: &std::path::Path) -> CodingAgentConfig {
     let mut c = CodingAgentConfig::new("k", "http://unused", "test-model", working_dir);
-    c.stream_timeout = Duration::from_secs(5);
+    c.timeouts = c.timeouts.with_content_liveness(Duration::from_secs(5));
     c.request_timeout = Some(Duration::from_secs(5));
     c
 }
@@ -115,7 +115,7 @@ async fn drive(handle: &mut jeikcode_kernel::agent::AgentHandle, text: &str) {
 async fn full_assembly_wire_prefix_is_cacheable_across_turns() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
-    std::env::set_var("JEIKCODE_HOME", home.path());
+    let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
     // A memory the MemoryHook injects into the frozen user prefix — the span that must
     // then stay FROZEN across every subsequent round/turn.
     std::fs::write(home.path().join("memory.md"), "- the user prefers tabs\n").unwrap();
@@ -216,7 +216,7 @@ async fn full_assembly_wire_prefix_is_cacheable_across_turns() {
 async fn tool_block_and_system_are_deterministic_across_independent_assemblies() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
-    std::env::set_var("JEIKCODE_HOME", home.path());
+    let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
     std::fs::write(home.path().join("memory.md"), "- prefers tabs\n").unwrap();
     let cfg = cfg(project.path());
     let opts = || PrepareOptions {

@@ -12,7 +12,7 @@ export type Theme = 'light' | 'dark' | 'system';
 /** Which settings dialog to open from the sidebar settings menu. */
 export type SettingsSection = 'theme' | 'language' | 'model';
 
-type TParams = Record<string, string | number>;
+export type TParams = Record<string, string | number>;
 
 interface SettingsCtx {
   theme: Theme;
@@ -20,6 +20,7 @@ interface SettingsCtx {
   lang: Lang;
   setLang: (l: Lang) => Promise<void>;
   t: (key: MsgKey, params?: TParams) => string;
+  githubLogo: boolean;
 }
 
 const Ctx = createContext<SettingsCtx | null>(null);
@@ -82,6 +83,7 @@ export function normalizeServerLang(value: string | undefined): Lang | null {
 export function SettingsProvider({ children }: { children: ComponentChildren }) {
   const [theme, setThemeState] = useState<Theme>(readTheme);
   const [lang, setLangState] = useState<Lang>(readLang);
+  const [githubLogo, setGithubLogo] = useState<boolean>(true);
 
   const selectionVersion = useRef(0);
   const pendingSave = useRef(Promise.resolve());
@@ -95,10 +97,27 @@ export function SettingsProvider({ children }: { children: ComponentChildren }) 
         if (cancelled || version !== selectionVersion.current) return;
         const next = normalizeServerLang(cfg.language);
         if (next) setLangState(next);
+        if (typeof cfg.github_logo === 'boolean') {
+          setGithubLogo(cfg.github_logo);
+        }
       })
       .catch(() => {});
+
+    const handleReload = () => {
+      getConfig().then((cfg) => {
+        if (typeof cfg.github_logo === 'boolean') {
+          setGithubLogo(cfg.github_logo);
+        }
+      }).catch(() => {});
+    };
+    if (typeof window !== 'undefined') {
+      window.addEventListener('jeikcode:config-reloaded', handleReload);
+    }
     return () => {
       cancelled = true;
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('jeikcode:config-reloaded', handleReload);
+      }
     };
   }, []);
 
@@ -145,7 +164,7 @@ export function SettingsProvider({ children }: { children: ComponentChildren }) 
 
   return (
     <Ctx.Provider
-      value={{ theme, setTheme: setThemeState, lang, setLang, t }}
+      value={{ theme, setTheme: setThemeState, lang, setLang, t, githubLogo }}
     >
       {children}
     </Ctx.Provider>
@@ -160,5 +179,20 @@ export function useSettings(): SettingsCtx {
 
 /** Convenience hook when a component only needs the translator. */
 export function useT(): SettingsCtx['t'] {
-  return useSettings().t;
+  const c = useContext(Ctx);
+  if (!c) {
+    // 优雅兜底降级：当组件在独立 DOM 挂载点（如 Markdown 中的 Mermaid 渲染孤岛）脱离 Provider 时，安全使用当前配置的语言
+    const fallbackLang = readLang();
+    return (key: MsgKey, params?: TParams): string => {
+      const table = messages[fallbackLang] ?? messages.en;
+      let s = table[key] ?? messages.en[key] ?? key;
+      if (params) {
+        for (const k of Object.keys(params)) {
+          s = s.split(`{${k}}`).join(String(params[k]));
+        }
+      }
+      return s;
+    };
+  }
+  return c.t;
 }

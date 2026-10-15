@@ -15,26 +15,12 @@ use std::path::PathBuf;
 /// two stacks would then read/write parallel trees. Setting `$JEIKCODE_HOME`
 /// (checked first, byte-identical to production) keeps them aligned.
 pub(crate) fn config_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("JEIKCODE_HOME") {
-        if !p.is_empty() {
-            return PathBuf::from(p);
-        }
-    }
-    if let Ok(p) = std::env::var("ATOMCODE_HOME") {
-        if !p.is_empty() {
-            return PathBuf::from(p);
-        }
-    }
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    let jeik_dir = home.join(".jeikcode");
-    if jeik_dir.exists() {
-        return jeik_dir;
-    }
-    let legacy_dir = home.join(".atomcode");
-    if legacy_dir.exists() {
-        return legacy_dir;
-    }
-    jeik_dir
+    // SINGLE SOURCE OF TRUTH: delegate to the config crate. This used to be a
+    // byte-for-byte copy of `Config::resolve_config_dir` — two implementations
+    // that could drift, and whose divergence would silently split the sessions
+    // root from the config root. Delegating also makes the resolved-once memo
+    // and the test-only home override apply to both at the same time.
+    jeikcode_config::Config::config_dir()
 }
 
 // NO unit test here ON PURPOSE: testing this means mutating the process-global

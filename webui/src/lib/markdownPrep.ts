@@ -12,6 +12,7 @@ export interface FenceState {
   marker: '`' | '~';
   length: number;
   lang?: string;
+  quotePrefix?: string;
   matchingCloseIdx?: number;
 }
 
@@ -56,14 +57,33 @@ function stripLineBreak(line: string): string {
   return line.replace(/[\r\n]+$/, '');
 }
 
+function parseFenceLeading(raw: string): { index: number; quotePrefix: string; indent: number } {
+  let idx = 0;
+  let indent = 0;
+  let quotePrefix = '';
+  while (idx < raw.length) {
+    const ch = raw[idx];
+    if (ch === ' ' || ch === '\t') {
+      indent += 1;
+      idx += 1;
+    } else if (ch === '>') {
+      quotePrefix = raw.slice(0, idx + 1);
+      idx += 1;
+      indent = 0;
+      while (idx < raw.length && (raw[idx] === ' ' || raw[idx] === '\t')) {
+        quotePrefix += raw[idx];
+        idx += 1;
+      }
+    } else {
+      break;
+    }
+  }
+  return { index: idx, quotePrefix, indent };
+}
+
 export function fenceOpen(line: string): FenceState | null {
   const raw = stripLineBreak(line);
-  let index = 0;
-  let indent = 0;
-  while (index < raw.length && (raw[index] === ' ' || raw[index] === '\t')) {
-    indent += 1;
-    index += 1;
-  }
+  const { index, quotePrefix, indent } = parseFenceLeading(raw);
   // 容错列表项内的嵌套代码块（多级缩进常达到 4-8 空格）
   if (indent > 8) return null;
 
@@ -78,17 +98,12 @@ export function fenceOpen(line: string): FenceState | null {
   const info = raw.slice(markerEnd).trim();
   if (marker === '`' && info.includes('`')) return null;
   const lang = info.split(/\s+/)[0]?.toLowerCase() ?? '';
-  return { marker, length, lang };
+  return { marker, length, lang, quotePrefix };
 }
 
 export function fenceClose(line: string, state: FenceState): boolean {
   const raw = stripLineBreak(line);
-  let index = 0;
-  let indent = 0;
-  while (index < raw.length && (raw[index] === ' ' || raw[index] === '\t')) {
-    indent += 1;
-    index += 1;
-  }
+  const { index, indent } = parseFenceLeading(raw);
   if (indent > 8) return false;
 
   let markerEnd = index;
@@ -180,11 +195,13 @@ export function promoteNestedCodeFences(raw: string): string {
         continue;
       }
 
-      // 检查纯闭合围栏
-      const trimmed = line.trim();
-      let mEnd = 0;
-      while (mEnd < trimmed.length && trimmed[mEnd] === open.marker) mEnd += 1;
-      const isPureClose = mEnd >= 3 && mEnd === trimmed.length;
+      // 检查纯闭合围栏（支持可选引用前缀）
+      const rawLine = stripLineBreak(line);
+      const lead = parseFenceLeading(rawLine);
+      let mEnd = lead.index;
+      while (mEnd < rawLine.length && rawLine[mEnd] === open.marker) mEnd += 1;
+      const curMarkerLen = mEnd - lead.index;
+      const isPureClose = curMarkerLen >= 3 && rawLine.slice(mEnd).trim() === '';
 
       if (isPureClose) {
         if (depth > 1) {
@@ -350,13 +367,21 @@ export function isStructuralTerminator(line: string, currentFence: FenceState): 
     return true;
   }
 
-  // 4. 对于以 # 作为注释的语言，普通注释绝对不能当作 ATX 标题中断代码块
-  if (HASH_COMMENT_LANGS.has(lang)) {
-    return false;
-  }
-
-  // 5. 其他非 # 注释语言，若遇到明确的外部顶层大纲标题（如 # 标题、#### 2. 标题）且前面未闭合
-  if (/^#{1,6}\s+\S+/.test(trimmed)) {
+  // 4. 对于以 # 作为注释的语言，普通注释绝不能当作 ATX 标题中断代码块
+  // ★ 优化：但是如果出现明确的外部大纲结构（例如中文大纲章节标题：`### 第二步`、`### 1. `、`### 总结` 等），
+  // 即使在 bash/python 中，它也绝不是脚本代码注释，必须自愈闭合代码块！
+  const headingMatch = trimmed.match(/^#{1,6}\s+(.+)$/);
+  if (headingMatch) {
+    const headingText = headingMatch[1].trim();
+    if (HASH_COMMENT_LANGS.has(lang)) {
+      const isDocumentHeading =
+        /^(?:第[一二三四五六七八九十0-9]+[步章节部分点项]|步骤\s*\d+|[一二三四五六七八九十]+[、.：:]|\d+[、.：:]\s*[\u4e00-\u9fa5]|为什么|如何|总结|结论|注意事项|核心结论)/.test(headingText) ||
+        (/[\u4e00-\u9fa5]/.test(headingText) && /[？?！!：:（）()]/.test(headingText));
+      if (isDocumentHeading) {
+        return true;
+      }
+      return false;
+    }
     return true;
   }
 
@@ -684,15 +709,25 @@ export function preprocessMarkdown(raw: string): string {
       line = line.replace(/^(?: {4}|\t)/, '');
     }
 
-    // ★ 智能拆解与前置文本/列表项粘连的围栏开启标记（如 `- **代码现状**：```rust` 或 `示例：```ts`）：
-    // CommonMark 规范要求代码块围栏必须独占一行，若与列表项前缀或冒号粘连，marked 无法将其视作代码块开启；
-    // 进而导致随后的正常闭合 ``` 被反向误判为开启，将其后的全部列表与正文吞噬为灰色代码框！
+    // ★ 智能拆解与前置文本/标题/列表项粘连的围栏开启标记（如 `二、中文对照版本```markdown`、`- **代码现状**：```rust` 或 `示例：```ts`）：
+    // CommonMark 规范要求代码块围栏必须独占一行，若与前置文本、标题或列表项粘连，marked 无法将其视作代码块开启；
+    // 进而导致代码块容器失效，内部内容直接被外泄渲染为大号标题和普通正文，或导致闭合 ``` 反向误判吞噬后续文本！
     // 自动将其拆解为独立两行（前置文本行 + 纯净代码块开启行）。
     if (!inFence) {
-      const gluedFence = line.match(/^(\s*(?:[-*+]|\d+\.|\S.*?[：:])\s*)((?:```|~~~)[a-zA-Z0-9_-]*\s*)$/);
-      if (gluedFence && gluedFence[1].trim()) {
-        lines.splice(i, 1, gluedFence[1], gluedFence[2]);
-        line = lines[i];
+      const gluedFence = line.match(/^(\s*[^`~].*?)\s*((?:```|~~~)[a-zA-Z0-9_-]*\s*)$/);
+      if (
+        gluedFence &&
+        gluedFence[1].trim() &&
+        !gluedFence[1].includes('```') &&
+        !gluedFence[1].includes('~~~')
+      ) {
+        // ★ 核心防御：若前置部分纯粹是 blockquote 引用标记（如 `>`、`> `、`>> ` 等），
+        // 它本就是引用块内的代码块开启标记（如 `> ```bash`），绝对不能将其误拆为单独的引用行和顶格代码块！
+        const nonQuoteLead = gluedFence[1].replace(/[>\s]/g, '');
+        if (nonQuoteLead.length > 0) {
+          lines.splice(i, 1, gluedFence[1], gluedFence[2]);
+          line = lines[i];
+        }
       }
     }
 
@@ -711,9 +746,12 @@ export function preprocessMarkdown(raw: string): string {
             result[result.length - 1] = prev + ' ';
           }
         }
-        // ★ 核心修复：闭合围栏必须规范化为顶格纯净闭合标记，消除前置 4+ 空格缩进！
-        // 杜绝 CommonMark 规范因缩进 >= 4 空格而拒绝将其当成闭合标记，导致代码块持续吞噬正文！
-        const cleanClose = inFence.marker.repeat(inFence.length);
+        // ★ 核心修复：闭合围栏规范化处理
+        // 若代码块开启于 blockquote 内部（带 quotePrefix），闭合行也应规范输出带 quotePrefix 的闭合，
+        // 确保 marked 将整个代码块完整包在 blockquote 内部；
+        // 若代码块开启于顶格（无 quotePrefix），则规范化为纯净顶格闭合，消除模型可能误加的 `>` 前缀！
+        const quotePrefix = inFence.quotePrefix ?? '';
+        const cleanClose = `${quotePrefix}${inFence.marker.repeat(inFence.length)}`;
         inFence = null;
         result.push(cleanClose);
         continue;
@@ -740,13 +778,14 @@ export function preprocessMarkdown(raw: string): string {
         if (!prevBlank()) result.push('');
         inTable = false;
       }
-      // 开启围栏也规范化消除多余的前置缩进，确保 marked 100% 识别
+      // 开启围栏也规范化，保留引用前缀并消除多余的前置缩进，确保 marked 100% 识别
+      const quotePrefix = opening.quotePrefix ?? '';
       const markerIdx = line.indexOf(opening.marker);
       const matchIdx = findMatchingFenceClose(lines, i + 1, opening);
       const isUnclosedMermaid = matchIdx === -1 && opening.lang?.toLowerCase() === 'mermaid';
       const cleanOpen = isUnclosedMermaid
-        ? `${opening.marker.repeat(opening.length)}mermaid-streaming`
-        : `${opening.marker.repeat(opening.length)}${line.slice(markerIdx + opening.length)}`;
+        ? `${quotePrefix}${opening.marker.repeat(opening.length)}mermaid-streaming`
+        : `${quotePrefix}${opening.marker.repeat(opening.length)}${line.slice(markerIdx + opening.length)}`;
       result.push(cleanOpen);
       inFence = { ...opening, matchingCloseIdx: matchIdx };
       continue;

@@ -28,13 +28,7 @@ pub struct UninstallManifest {
 
 pub fn uninstall_manifest() -> UninstallManifest {
     UninstallManifest {
-        credential_files: &[
-            "auth.toml",
-            "mcp.json",
-            "config.toml",
-            "JEIKCODE.md",
-            "ATOMCODE.md",
-        ],
+        credential_files: &["auth.toml", "mcp.json", "config.toml", "JEIKCODE.md"],
         state_files: &[
             "history",
             "input_history.txt",
@@ -96,12 +90,9 @@ pub fn windows_install_dir_candidates() -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Some(p) = std::env::var_os("JEIKCODE_PREFIX") {
         out.push(PathBuf::from(p));
-    } else if let Some(p) = std::env::var_os("ATOMCODE_PREFIX") {
-        out.push(PathBuf::from(p));
     }
     if let Some(p) = std::env::var_os("LOCALAPPDATA") {
-        out.push(PathBuf::from(p.clone()).join("JeikCode"));
-        out.push(PathBuf::from(p).join("AtomCode"));
+        out.push(PathBuf::from(p).join("JeikCode"));
     }
     out
 }
@@ -114,21 +105,18 @@ mod tests {
     #[test]
     #[serial]
     fn jeikcode_dir_follows_home() {
-        // `jeikcode_dir()` is exactly the resolved config root = JEIKCODE_HOME.
-        // (The unset→`~/.jeikcode` fallback lives in core and is covered by
-        // `Config::resolve_config_dir` tests; here we just verify delegation.)
-        // JEIKCODE_HOME is always set in tests (by the test-support ctor, or by a
-        // sibling test), so assert `jeikcode_dir()` tracks it.
-        let home = std::env::var("JEIKCODE_HOME").expect("JEIKCODE_HOME set in tests");
-        assert_eq!(jeikcode_dir(), std::path::PathBuf::from(home));
+        // `jeikcode_dir()` is exactly the resolved config root. With the thread-local
+        // home override the derivation must follow it (no process env involved).
+        let dir = tempfile::tempdir().unwrap();
+        let _home = jeikcode_config::test_util::IsolatedHome::at(dir.path());
+        assert_eq!(jeikcode_dir(), dir.path());
     }
 
     #[test]
     #[serial]
     fn jeikcode_home_env_wins() {
-        // Under unified semantics, JEIKCODE_HOME IS the data root.
-        // The legacy JEIKCODE_HOME_OVERRIDE variable is gone.
-        std::env::set_var("JEIKCODE_HOME", "/tmp/override");
+        // Unified semantics: the resolved home IS the data root.
+        let _home = jeikcode_config::test_util::IsolatedHome::at("/tmp/override");
         assert_eq!(jeikcode_dir(), std::path::PathBuf::from("/tmp/override"));
     }
 

@@ -661,7 +661,7 @@ pub(crate) async fn run_command(
         _ => {
             return Json(CommandResult::Error {
                 message: "working_dir required".into(),
-            })
+            });
         }
     };
     let result = match req.command.as_str() {

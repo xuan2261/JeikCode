@@ -279,3 +279,316 @@ async fn run_command_preserves_redirection_and_chaining() {
         "redirected content must match; got {content:?}"
     );
 }
+
+/// Regression for the reported failure `read: path does not exist: $TMPDIR/pr42.diff`:
+/// a `$VAR` inside a tool PARAMETER must resolve to a real absolute path — and an
+/// UNDEFINED name must stay literal (relative to the working dir) so a typo can never
+/// escape the workspace.
+#[tokio::test]
+async fn env_vars_in_tool_params_resolve_to_real_paths() {
+    use jeikcode_kernel::tool::{ProgressSink, Tool};
+    use tokio_util::sync::CancellationToken;
+
+    let working_dir = tempfile::tempdir().unwrap();
+    // Lives OUTSIDE the working dir, reachable ONLY through the expanded variable — the
+    // exact shape that used to become a relative path and 404.
+    let probe =
+        jeikcode_capabilities::special_dirs::temp_dir().join("jeik-env-expansion-probe.txt");
+    std::fs::write(&probe, "env-expansion-ok").unwrap();
+
+    let mut reg = ToolRegistry::new();
+    register_coding_tools(&mut reg);
+    let mounted = reg.mount(&["read"]);
+    let read = mounted.get("read").expect("read tool registered");
+
+    let ctx = jeikcode_kernel::tool::ToolContext {
+        working_dir: working_dir.path().to_path_buf(),
+        cancel: CancellationToken::new(),
+        progress: ProgressSink::noop(),
+        requester: None,
+    };
+
+    let out = read
+        .execute(r#"{"path":"$TMPDIR/jeik-env-expansion-probe.txt"}"#, &ctx)
+        .await;
+    assert!(!out.is_error, "`$TMPDIR/...` must resolve: {}", out.content);
+    assert!(out.content.contains("env-expansion-ok"), "{}", out.content);
+
+    // The quoted form — copied verbatim from the prompt's environment facts.
+    let out = read
+        .execute(
+            r#"{"path":"\"$TMPDIR/jeik-env-expansion-probe.txt\""}"#,
+            &ctx,
+        )
+        .await;
+    assert!(!out.is_error, "quoted form must resolve: {}", out.content);
+
+    // An UNDEFINED variable stays verbatim → relative under the working dir (fail-closed:
+    // it must NOT silently become the absolute `/x`).
+    let out = read
+        .execute(r#"{"path":"$JEIKCODE_UNSET_DIR/probe.txt"}"#, &ctx)
+        .await;
+    assert!(
+        out.is_error,
+        "unset names must not resolve: {}",
+        out.content
+    );
+    assert!(
+        out.content.contains("$JEIKCODE_UNSET_DIR"),
+        "the literal token must stay visible in the error: {}",
+        out.content
+    );
+
+    let _ = std::fs::remove_file(&probe);
+}
+
+/// The REPORTED bug, on the new code, through the REAL tool: a native tool's localized
+/// (GBK) line must not drag the UTF-8 lines around it into the legacy decoder.
+#[cfg(windows)]
+#[tokio::test]
+async fn native_gbk_line_does_not_mangle_utf8_output() {
+    use jeikcode_kernel::tool::{ProgressSink, Tool};
+    use tokio_util::sync::CancellationToken;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut reg = ToolRegistry::new();
+    register_coding_tools(&mut reg);
+    let mounted = reg.mount(&["run_command"]);
+    let bash = mounted.get("run_command").expect("run_command registered");
+    let ctx = jeikcode_kernel::tool::ToolContext {
+        working_dir: dir.path().to_path_buf(),
+        cancel: CancellationToken::new(),
+        progress: ProgressSink::noop(),
+        requester: None,
+    };
+
+    // `taskkill` prints a localized GBK error line on zh-CN Windows; the surrounding
+    // Chinese comes from bash (UTF-8). Before the fix the whole span was GBK-decoded.
+    let out = bash
+        .execute(
+            r#"{"command":"echo 中文行一; taskkill /F /PID 999999; echo 中文行二","summary":"encoding probe"}"#,
+            &ctx,
+        )
+        .await;
+    assert!(!out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("中文行一"),
+        "UTF-8 line before the legacy line must survive: {:?}",
+        out.content
+    );
+    assert!(
+        out.content.contains("中文行二"),
+        "UTF-8 line after the legacy line must survive: {:?}",
+        out.content
+    );
+    assert!(
+        out.content.contains("999999"),
+        "the native line is still rendered: {:?}",
+        out.content
+    );
+}
+
+/// The temp fix, seen from inside a real tool shell.
+///
+/// MSYS rewrites `TMPDIR`/`TMP`/`TEMP` BY NAME when a native parent (the daemon) starts a
+/// bash child, so whatever we export arrives as the MSYS view (`/tmp`). The `BASH_ENV` rc
+/// re-exports the native values from INSIDE the shell — this test pins both halves: the
+/// shell's own `$TMPDIR` is native, and a NATIVE program resolves it to the real directory.
+#[cfg(windows)]
+#[tokio::test]
+async fn shell_temp_dir_is_the_same_real_directory_as_the_native_temp() {
+    use jeikcode_kernel::tool::{ProgressSink, Tool};
+    use tokio_util::sync::CancellationToken;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut reg = ToolRegistry::new();
+    register_coding_tools(&mut reg);
+    let mounted = reg.mount(&["run_command"]);
+    let bash = mounted.get("run_command").expect("run_command registered");
+    let ctx = jeikcode_kernel::tool::ToolContext {
+        working_dir: dir.path().to_path_buf(),
+        cancel: CancellationToken::new(),
+        progress: ProgressSink::noop(),
+        requester: None,
+    };
+
+    let out = bash
+        .execute(
+            r#"{"command":"printf 'TMP=%s\\n' \"$TMPDIR\"; printf 'real=%s\\n' \"$(cygpath -w \"$TMPDIR\")\"; powershell -NoProfile -Command 'if (Test-Path -LiteralPath $env:TMPDIR) { \"TMPDIR_NATIVE_OK\" } else { \"TMPDIR_NATIVE_BAD\" }'; printf x > \"$TMPDIR/jeik-tmp-probe\"; ls -1 \"$TMPDIR/jeik-tmp-probe\"","summary":"temp probe"}"#,
+            &ctx,
+        )
+        .await;
+    assert!(!out.is_error, "{}", out.content);
+    // The shell's view (`TMP=/tmp`) and the native dir must resolve to the SAME place:
+    // `cygpath -w` on the view must equal the normalized native temp dir.
+    let real_line = out
+        .content
+        .lines()
+        .find(|l| l.starts_with("real="))
+        .unwrap_or_default();
+    let expected = jeikcode_capabilities::special_dirs::temp_dir();
+    // Trailing separators differ between the OS API and `cygpath`; compare the paths.
+    let expected_display = expected
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string();
+    assert!(
+        real_line.replace('\\', "/").to_ascii_lowercase().contains(&expected_display.to_ascii_lowercase()),
+        "`cygpath -w \"$TMPDIR\"` must equal the native temp dir {expected_display:?}: {real_line:?}"
+    );
+    // After the re-export the shell's OWN `$TMPDIR` is native — no MSYS view to convert.
+    let tmp_line = out
+        .content
+        .lines()
+        .find(|l| l.starts_with("TMP="))
+        .unwrap_or_default();
+    assert!(
+        !tmp_line.contains("TMP=/"),
+        "`$TMPDIR` must be native in the shell: {tmp_line:?}"
+    );
+    assert!(
+        out.content.contains("TMPDIR_NATIVE_OK"),
+        "a native program must resolve the shell's `$TMPDIR`: {:?}",
+        out.content
+    );
+    // The same variable is usable for a real write+read round trip.
+    assert!(
+        out.content.contains("jeik-tmp-probe"),
+        "writing through $TMPDIR must work: {:?}",
+        out.content
+    );
+    let _ = std::fs::remove_file(
+        jeikcode_capabilities::special_dirs::temp_dir().join("jeik-tmp-probe"),
+    );
+}
+
+/// The background report on the new code: the WORKLOAD's two real ids, the stop recipe,
+/// and a verified kill through that exact recipe.
+#[cfg(windows)]
+#[tokio::test]
+async fn background_report_carries_actionable_pids_and_the_recipe_kills() {
+    use jeikcode_kernel::tool::{ProgressSink, Tool};
+    use tokio_util::sync::CancellationToken;
+
+    fn running(pid: u32) -> bool {
+        let out = std::process::Command::new("tasklist")
+            .args(["/FO", "CSV", "/NH"])
+            .output()
+            .expect("tasklist");
+        String::from_utf8_lossy(&out.stdout).contains(&format!("\"{pid}\""))
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut reg = ToolRegistry::new();
+    register_coding_tools(&mut reg);
+    let mounted = reg.mount(&["run_command"]);
+    let bash = mounted.get("run_command").expect("run_command registered");
+    let ctx = jeikcode_kernel::tool::ToolContext {
+        working_dir: dir.path().to_path_buf(),
+        cancel: CancellationToken::new(),
+        progress: ProgressSink::noop(),
+        requester: None,
+    };
+
+    let out = bash
+        .execute(
+            r#"{"command":"sleep 30","background":true,"settle_secs":2,"summary":"background probe"}"#,
+            &ctx,
+        )
+        .await;
+    assert!(!out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("WinPID"),
+        "the report must name the id kind: {:?}",
+        out.content
+    );
+    // The workload leaf (`sleep.exe`) is attributed, so the report offers BOTH ids.
+    assert!(
+        out.content.contains("sleep"),
+        "the workload process must be attributed: {:?}",
+        out.content
+    );
+    let wrapper: u32 = out
+        .content
+        .split("taskkill /F /T /PID ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|pid| {
+            pid.trim_end_matches(['`', ')', ','].as_slice())
+                .parse()
+                .ok()
+        })
+        .unwrap_or_else(|| panic!("no taskkill recipe in: {:?}", out.content));
+    assert!(
+        running(wrapper),
+        "the wrapper shell must be alive: {wrapper}"
+    );
+
+    // Execute the printed recipe verbatim (single slashes — conversion is disabled).
+    let status = std::process::Command::new("taskkill")
+        .args(["/F", "/T", "/PID", &wrapper.to_string()])
+        .status()
+        .expect("taskkill");
+    assert!(status.success(), "taskkill /F /T must succeed");
+    for _ in 0..10 {
+        if !running(wrapper) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert!(
+        !running(wrapper),
+        "the printed recipe must actually stop the task (wrapper {wrapper})"
+    );
+}
+
+/// The shell-side temp fix: `$TMPDIR_WIN` must reach a NATIVE program as a usable native
+/// path — the channel behind `--directory "$TMPDIR/x"` (python/node), because MSYS
+/// rewrites the plain `$TMPDIR` into its POSIX view for every child shell.
+#[cfg(windows)]
+#[tokio::test]
+async fn native_temp_handle_is_usable_by_a_native_program() {
+    use jeikcode_kernel::tool::{ProgressSink, Tool};
+    use tokio_util::sync::CancellationToken;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut reg = ToolRegistry::new();
+    register_coding_tools(&mut reg);
+    let mounted = reg.mount(&["run_command"]);
+    let bash = mounted.get("run_command").expect("run_command registered");
+    let ctx = jeikcode_kernel::tool::ToolContext {
+        working_dir: dir.path().to_path_buf(),
+        cancel: CancellationToken::new(),
+        progress: ProgressSink::noop(),
+        requester: None,
+    };
+
+    // (a) the handle is a NATIVE path inside the shell, and (b) a native program
+    // (PowerShell) resolves that very handle to an existing directory.
+    let out = bash
+        .execute(
+            r#"{"command":"printf 'WIN=%s\\n' \"$TMPDIR_WIN\"; powershell -NoProfile -Command 'if (Test-Path -LiteralPath $env:TMPDIR_WIN) { \"TMPDIR_WIN_OK\" } else { \"TMPDIR_WIN_BAD\" }'","summary":"native handle probe"}"#,
+            &ctx,
+        )
+        .await;
+    assert!(!out.is_error, "{}", out.content);
+    let win_line = out
+        .content
+        .lines()
+        .find(|l| l.starts_with("WIN="))
+        .unwrap_or_default();
+    assert!(
+        !win_line.contains("WIN=/"),
+        "`$TMPDIR_WIN` must be a native path in the shell: {win_line:?}"
+    );
+    assert!(
+        win_line.contains(":/"),
+        "must carry a drive letter: {win_line:?}"
+    );
+    assert!(
+        out.content.contains("TMPDIR_WIN_OK"),
+        "a native program must resolve `$TMPDIR_WIN` to a real directory: {:?}",
+        out.content
+    );
+}

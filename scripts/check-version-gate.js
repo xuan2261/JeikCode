@@ -85,8 +85,12 @@ async function fetchPreviousGitHubRelease(currentTag) {
         try {
           const list = JSON.parse(body);
           if (Array.isArray(list)) {
+            const isTargetPrerelease = Boolean(parseSemVer(currentTag).pre);
             for (const r of list) {
-              if (r.tag_name && compareSemVer(r.tag_name, currentTag) !== 0) {
+              if (!r.tag_name) continue;
+              // 正式版（Stable Release）的基准版本仅与上一个正式版比较，避免被临时 Pre-release 干扰阻塞
+              if (!isTargetPrerelease && r.prerelease) continue;
+              if (compareSemVer(r.tag_name, currentTag) !== 0) {
                 return resolve(r.tag_name);
               }
             }

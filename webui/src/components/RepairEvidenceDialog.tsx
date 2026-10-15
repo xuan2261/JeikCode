@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import {
-  exportRepairPacket, getRepairCapability, getRepairInfo, getRepairPreview, pickNativeDirectory,
+  exportRepairPacket, getRepairCapability, getRepairInfo, getRepairPreview,
 } from '../api';
-import { isLoopbackHost, stripExtendedPathPrefix } from '../lib/displayPath';
+import { stripExtendedPathPrefix } from '../lib/displayPath';
 import {
   isAbsoluteRepairPath, makeRepairExportRequest, REPAIR_PACKET_FILES, repairPacketSummary,
 } from '../lib/repairEvidence';
@@ -29,7 +29,9 @@ export function RepairEvidenceDialog({ initialSource, onClose, restoreFocusTo }:
   const [capability, setCapability] = useState<RepairCapability | null>(null);
   const [capabilityError, setCapabilityError] = useState('');
   const [availabilityAttempt, setAvailabilityAttempt] = useState(0);
-  const [sourceInput, setSourceInput] = useState(initialSource);
+  // The initial cwd is host-provided; normalize it for display once. Never
+  // run that display normalization on text the user subsequently types.
+  const [sourceInput, setSourceInput] = useState(stripExtendedPathPrefix(initialSource));
   const [runInput, setRunInput] = useState('');
   const [outputInput, setOutputInput] = useState('');
   const [info, setInfo] = useState<RepairInfoResponse | null>(null);
@@ -37,7 +39,7 @@ export function RepairEvidenceDialog({ initialSource, onClose, restoreFocusTo }:
   const [preview, setPreview] = useState<RepairPreviewResponse | null>(null);
   const [acceptedDigest, setAcceptedDigest] = useState<string | null>(null);
   const [exported, setExported] = useState<RepairExportResponse | null>(null);
-  const [busy, setBusy] = useState<'info' | 'preview' | 'export' | 'native' | null>(null);
+  const [busy, setBusy] = useState<'info' | 'preview' | 'export' | null>(null);
   const [error, setError] = useState('');
   const [pickerTarget, setPickerTarget] = useState<'source' | 'run' | null>(null);
   const [showEscaped, setShowEscaped] = useState(false);
@@ -51,7 +53,7 @@ export function RepairEvidenceDialog({ initialSource, onClose, restoreFocusTo }:
     () => preview && showEscaped ? JSON.stringify(preview.packet, null, 2) : '',
     [preview, showEscaped],
   );
-  const cleanPath = (path: string) => stripExtendedPathPrefix(path.trim());
+  const cleanPath = (path: string) => path.trim();
 
   useEffect(() => {
     let active = true;
@@ -122,25 +124,6 @@ export function RepairEvidenceDialog({ initialSource, onClose, restoreFocusTo }:
       if (!currentRequest(sequence)) return;
       setInfo(result);
       setInspectedAt(new Date().toLocaleString());
-    } catch (cause: unknown) {
-      if (currentRequest(sequence)) setError(cause instanceof Error ? cause.message : String(cause));
-    } finally {
-      if (currentRequest(sequence)) setBusy(null);
-    }
-  }
-
-  async function chooseNativeSource() {
-    if (!available || !isLoopbackHost(window.location.hostname)) return;
-    clearReview();
-    setInfo(null);
-    setInspectedAt('');
-    const sequence = ++requestSequence.current;
-    setBusy('native');
-    try {
-      const result = await pickNativeDirectory();
-      if (!currentRequest(sequence)) return;
-      if (!result.canceled && result.path) changeSource(result.path);
-      else setError(t('repair.nativeCanceled'));
     } catch (cause: unknown) {
       if (currentRequest(sequence)) setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
@@ -265,14 +248,11 @@ export function RepairEvidenceDialog({ initialSource, onClose, restoreFocusTo }:
               aria-describedby="repair-source-hint" />
             <p class="field-hint" id="repair-source-hint">{t('repair.sourceHint')}</p>
             <div class="repair-actions">
-              <button type="button" class="btn" disabled={!available || exporting}
+              <button type="button" class="btn" disabled={!available || exporting ||
+                  !isAbsoluteRepairPath(cleanPath(sourceInput))}
                 onClick={() => { clearReview(); setPickerTarget('source'); }}>
                 {t('repair.browse')}
               </button>
-              {isLoopbackHost(window.location.hostname) && (
-                <button type="button" class="btn" disabled={!available || !!busy}
-                  onClick={chooseNativeSource}>{t('repair.nativePicker')}</button>
-              )}
               <button type="button" class="btn btn-primary"
                 disabled={!available || !!busy || !isAbsoluteRepairPath(cleanPath(sourceInput))}
                 onClick={inspectSource}>

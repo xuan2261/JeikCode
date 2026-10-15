@@ -345,7 +345,7 @@ impl LiveViewHub {
         let status = control.status();
         match status.phase {
             RuntimePhase::InTurn | RuntimePhase::WaitingApproval | RuntimePhase::Reconfiguring => {
-                return Err(HubError::ActiveTurn)
+                return Err(HubError::ActiveTurn);
             }
             RuntimePhase::ShuttingDown | RuntimePhase::Stopped | RuntimePhase::Failed => {
                 return Err(HubError::RuntimeUnavailable);
@@ -1634,6 +1634,31 @@ impl LiveViewHub {
             let _ = reg.push_view_event(&session_id, view);
         }
         state.next_cursor += 1;
+        // 跨实例失效：审批/提问请求与决策、以及会话活动变化，都推给全局总线。
+        // （文本/工具等高频事件不推：它们由各实例已持有的会话内信道/快照负责。）
+        match &event {
+            LiveViewEvent::Runtime(CodingRuntimeEvent::Request(_)) => {
+                crate::publish_global(crate::GlobalWireEvent::ReviewAsked {
+                    session_id: session_id.clone(),
+                });
+            }
+            LiveViewEvent::RequestResolved { request_id, .. } => {
+                crate::publish_global(crate::GlobalWireEvent::ReviewResolved {
+                    session_id: session_id.clone(),
+                    approval_id: None,
+                    request_id: Some(*request_id),
+                });
+            }
+            LiveViewEvent::InputAccepted { .. } | LiveViewEvent::Steered { .. } => {
+                crate::publish_global(crate::GlobalWireEvent::Activity {
+                    session_id: session_id.clone(),
+                    running: true,
+                    terminal: None,
+                    status: None,
+                });
+            }
+            _ => {}
+        }
         let observation = LiveObservation {
             binding_id,
             generation,
@@ -1753,6 +1778,7 @@ mod tests {
         let folded = vec![jeikcode_kernel::event::SteeredInput {
             text: runtime_input.text,
             images: runtime_input.images,
+            message_id: None,
         }];
 
         assert_eq!(

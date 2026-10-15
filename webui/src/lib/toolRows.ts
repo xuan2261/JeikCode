@@ -33,9 +33,9 @@ export interface ToolRow {
  *  non-fatal advisory notice (e.g. "conversation compacted"). Arrival order is
  *  preserved so the text→tool→notice interleaving matches the TUI. */
 export type MsgPart =
-  | { kind: 'text'; text: string }
+  | { kind: 'text'; text: string; id?: string }
   /** Model reasoning / thinking stream — rendered as a collapsible block. */
-  | { kind: 'reasoning'; text: string }
+  | { kind: 'reasoning'; text: string; id?: string }
   | { kind: 'tool'; tool: ToolRow }
   | { kind: 'notice'; text: string }
   | { kind: 'rate_limited'; text: string }
@@ -129,7 +129,20 @@ export function appendToolOutput(
   }
   if (idx < 0) return parts;
   const tp = parts[idx] as { kind: 'tool'; tool: ToolRow };
-  let output = (tp.tool.output ?? '') + chunk;
+  const normalizedChunk = chunk.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const prevOut = tp.tool.output ?? '';
+  let sep = '';
+  if (
+    prevOut &&
+    !prevOut.endsWith('\n') &&
+    !normalizedChunk.startsWith('\n') &&
+    (normalizedChunk.includes('\n') ||
+      /[.:!?;…\]）】]$/.test(prevOut.trim()) ||
+      /^[\p{Script=Han}\[A-Z]/u.test(normalizedChunk.trim()))
+  ) {
+    sep = '\n';
+  }
+  let output = prevOut + sep + normalizedChunk;
   if (output.length > MAX_LIVE_TOOL_OUTPUT) {
     output = output.slice(output.length - MAX_LIVE_TOOL_OUTPUT);
   }
@@ -148,16 +161,23 @@ export function appendToolOutput(
   return next;
 }
 
-/** Append a reasoning delta to the last reasoning part, or start a new one. */
-export function appendReasoningPart(parts: MsgPart[], delta: string): MsgPart[] {
+/** Append a reasoning delta to the last reasoning part, or start a new one.
+ *  `id` 是线协议里的 part 身份：建新部件时立即盖章，后续重放/重连才能按 part
+ *  定向合并（没有身份就只能靠文本启发式，会在刷新时把整段思考重打一遍）。 */
+export function appendReasoningPart(parts: MsgPart[], delta: string, id?: string): MsgPart[] {
   if (!delta) return parts;
   const tail = parts[parts.length - 1];
+  // 核心铁律：若末尾已经是思考部件，一律无缝合并进这同一个思考部件，严禁连续出现两个思考部件！
   if (tail && tail.kind === 'reasoning') {
     const next = parts.slice();
-    next[next.length - 1] = { kind: 'reasoning', text: tail.text + delta };
+    next[next.length - 1] = {
+      kind: 'reasoning',
+      text: tail.text + delta,
+      id: tail.id ?? id,
+    };
     return next;
   }
-  return [...parts, { kind: 'reasoning', text: delta }];
+  return [...parts, { kind: 'reasoning', text: delta, ...(id ? { id } : {}) }];
 }
 
 export function toolResultStatus(

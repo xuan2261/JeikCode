@@ -47,8 +47,35 @@ pub fn isolate_home() {
         if std::env::var_os("JEIKCODE_HOME").is_some() {
             return; // explicit override (real run, or a test that set its own) wins
         }
-        let dir = std::env::temp_dir().join(format!("jeikcode-test-home-{}", std::process::id()));
+        let dir = normalized_temp_dir().join(format!("jeikcode-test-home-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         std::env::set_var("JEIKCODE_HOME", &dir);
     });
+}
+
+/// Temp root with POSIX-tainted values normalized away.
+///
+/// A Git-Bash-started test process can carry `TMPDIR=/tmp`, which makes
+/// `std::env::temp_dir()` return a path that is NOT the OS temp root on Windows
+/// (test homes then land under `<drive>:\tmp`). Production normalizes the temp
+/// env once via the capabilities-side `special_dirs`; the kernel cannot depend on
+/// that crate (it sits above the kernel), so this is the minimal equivalent for
+/// the test seam. If a shared low-level temp helper ever exists, replace this copy.
+fn normalized_temp_dir() -> std::path::PathBuf {
+    let dir = std::env::temp_dir();
+    #[cfg(windows)]
+    {
+        if dir.to_string_lossy().starts_with('/') {
+            if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+                return std::path::PathBuf::from(local).join("Temp");
+            }
+            if let Some(profile) = std::env::var_os("USERPROFILE") {
+                return std::path::PathBuf::from(profile)
+                    .join("AppData")
+                    .join("Local")
+                    .join("Temp");
+            }
+        }
+    }
+    dir
 }

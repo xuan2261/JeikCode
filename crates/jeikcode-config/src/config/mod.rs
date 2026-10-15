@@ -7,7 +7,6 @@ pub mod provider_preset;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -58,10 +57,22 @@ pub fn platform_rules() -> &'static str {
 #[serde(default)]
 pub struct CodingConfig {
     pub max_rounds: u32,
-    /// Liveness: max wall-clock seconds to wait for the FIRST model token of a
-    /// round (high latency / silent hidden reasoning). `0` disables the arm.
-    /// Env `JEIKCODE_FIRST_TOKEN_TIMEOUT_SECS` overrides. Default 60.
-    pub first_token_timeout_secs: u64,
+    /// TCP/TLS connect budget. Env `JEIKCODE_CONNECT_TIMEOUT_SECS`. Default 10.
+    pub connect_timeout_secs: u64,
+    /// Wait for HTTP response headers (TTFB). Env `JEIKCODE_OPEN_TIMEOUT_SECS`.
+    /// Default 180. Does not cap a streaming body.
+    pub open_timeout_secs: u64,
+    /// First business token (thinking / text / tool). `0` disables the arm.
+    /// Env `JEIKCODE_TTFT_SECS` / `JEIKCODE_FIRST_TOKEN_TIMEOUT_SECS`.
+    /// TOML alias `first_token_timeout_secs`. Default 180.
+    #[serde(alias = "first_token_timeout_secs")]
+    pub ttft_secs: u64,
+    /// After thinking, wait for the first text/tool token.
+    /// Env `JEIKCODE_TRANSITION_SECS`. Default 180.
+    pub transition_secs: u64,
+    /// Sliding window between adjacent business tokens.
+    /// Env `JEIKCODE_STREAMING_SECS` / `JEIKCODE_STREAM_TIMEOUT_SECS`. Default 120.
+    pub streaming_sliding_secs: u64,
     /// How many times the round is re-issued after a first-token timeout.
     /// Env `JEIKCODE_FIRST_TOKEN_RETRIES` overrides. Default 3.
     pub first_token_timeout_retries: u32,
@@ -377,19 +388,31 @@ impl ToolTimeoutsConfig {
     }
 }
 
-/// `[tools.tool_output]` — where oversized tool results are folded into a
-/// head+tail preview and spilled to an artifact (recoverable via fetch_output).
+/// `[tools.tool_output]` — where oversized tool results are compressed into a
+/// head+tail preview plus an artifact handle (the full text stays on disk and
+/// is recoverable via fetch_output). Tools listed in `no_fold_tools` (or
+/// declaring `never_truncate_result()`) bypass this entirely.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ToolOutputConfig {
-    /// Fold threshold in bytes. Results larger than this are replaced by a
-    /// preview. `None` (or missing) → the built-in default
-    /// (`THRESHOLD_BYTES`, 64 KiB). `0` disables folding entirely.
+    /// Compression threshold in bytes. Results larger than this are replaced by
+    /// a head/tail preview plus an `artifact_id` handle. `None` (or missing) →
+    /// the built-in default (64 KiB). `0` disables compression entirely.
     #[serde(
         default = "default_tool_output_max_bytes",
         skip_serializing_if = "Option::is_none"
     )]
     pub max_bytes: Option<usize>,
+    /// Terminal (shell) compression threshold in bytes — the earlier line for
+    /// console streams (`run_command` / `bash`). The effective line for terminal
+    /// tools is `min(max_bytes, terminal_max_bytes)`. `None` (or missing) → the
+    /// built-in default (24 KiB). `0` drops the terminal early line (terminal
+    /// tools then follow `max_bytes`).
+    #[serde(
+        default = "default_tool_output_terminal_max_bytes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub terminal_max_bytes: Option<usize>,
     /// Tool names whose output must reach the model verbatim (never folded),
     /// regardless of size. Batch whitelist: list any built-in tool name
     /// (see `.jeikcode/builtin-tools.txt` for the full catalog) and its
@@ -404,6 +427,10 @@ pub struct ToolOutputConfig {
 
 fn default_tool_output_max_bytes() -> Option<usize> {
     Some(65536)
+}
+
+fn default_tool_output_terminal_max_bytes() -> Option<usize> {
+    Some(24576)
 }
 
 fn default_no_fold_tools() -> Vec<String> {
@@ -421,6 +448,7 @@ impl Default for ToolOutputConfig {
     fn default() -> Self {
         Self {
             max_bytes: Some(65536),
+            terminal_max_bytes: Some(24576),
             no_fold_tools: default_no_fold_tools(),
         }
     }
@@ -429,7 +457,11 @@ impl Default for CodingConfig {
     fn default() -> Self {
         Self {
             max_rounds: 200,
-            first_token_timeout_secs: 60,
+            connect_timeout_secs: 10,
+            open_timeout_secs: 180,
+            ttft_secs: 180,
+            transition_secs: 180,
+            streaming_sliding_secs: 120,
             first_token_timeout_retries: 3,
         }
     }
@@ -642,6 +674,13 @@ pub struct Config {
     /// to restore the legacy undo-on-cancel behaviour.
     #[serde(default = "default_true")]
     pub keep_interrupted_context: bool,
+    /// Whether to display the GitHub repository logo in the UI.
+    /// Defaults to `true` (on/show). Set `github_logo = "off"` or `false` to hide it.
+    #[serde(
+        default = "default_true",
+        deserialize_with = "deserialize_lenient_bool"
+    )]
+    pub github_logo: bool,
     /// Offline deployment switch (intranet / air-gapped). Default off = online build unchanged.
     #[serde(default)]
     pub offline_mode: offline::OfflineMode,
@@ -924,6 +963,7 @@ impl Default for Config {
             plugin: PluginConfig::default(),
             web_search: WebSearchConfig::default(),
             keep_interrupted_context: true,
+            github_logo: true,
             offline_mode: offline::OfflineMode::default(),
             offline_note: None,
             quarantined_providers: std::collections::BTreeMap::new(),
@@ -1428,6 +1468,41 @@ pub struct NetworkConfig {
 fn default_true() -> bool {
     true
 }
+
+fn deserialize_lenient_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct LenientBoolVisitor;
+    impl<'de> serde::de::Visitor<'de> for LenientBoolVisitor {
+        type Value = bool;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a boolean or switch (true/false, on/off, yes/no)")
+        }
+        fn visit_bool<E>(self, v: bool) -> Result<bool, E> {
+            Ok(v)
+        }
+        fn visit_i64<E>(self, v: i64) -> Result<bool, E> {
+            Ok(v != 0)
+        }
+        fn visit_u64<E>(self, v: u64) -> Result<bool, E> {
+            Ok(v != 0)
+        }
+        fn visit_str<E>(self, v: &str) -> Result<bool, E>
+        where
+            E: serde::de::Error,
+        {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "off" | "false" | "0" | "disable" | "disabled" | "no" | "none" | "hide" => {
+                    Ok(false)
+                }
+                "on" | "true" | "1" | "enable" | "enabled" | "yes" | "show" => Ok(true),
+                other => Err(E::custom(format!("invalid switch value: {other}"))),
+            }
+        }
+    }
+    deserializer.deserialize_any(LenientBoolVisitor)
+}
 fn default_false() -> bool {
     false
 }
@@ -1906,39 +1981,38 @@ impl Config {
 
     /// Resolve the config dir. Pure function for testability —
     /// `config_dir()` is a thin wrapper that injects real env + real home.
-    fn resolve_config_dir(
-        env_jeikcode_home: Option<String>,
-        env_atomcode_home: Option<String>,
-        home: Option<PathBuf>,
-    ) -> PathBuf {
+    fn resolve_config_dir(env_jeikcode_home: Option<String>, home: Option<PathBuf>) -> PathBuf {
         if let Some(p) = env_jeikcode_home.filter(|s| !s.is_empty()) {
             return PathBuf::from(p);
         }
-        if let Some(p) = env_atomcode_home.filter(|s| !s.is_empty()) {
-            return PathBuf::from(p);
-        }
         let home_dir = home.unwrap_or_else(|| PathBuf::from("."));
-        let jeik_dir = home_dir.join(".jeikcode");
-        if jeik_dir.exists() {
-            return jeik_dir;
-        }
-        let legacy_dir = home_dir.join(".atomcode");
-        if legacy_dir.exists() {
-            return legacy_dir;
-        }
-        jeik_dir
+        home_dir.join(".jeikcode")
     }
 
     pub fn config_dir() -> PathBuf {
-        Self::resolve_config_dir(
-            std::env::var("JEIKCODE_HOME")
-                .ok()
-                .filter(|s| !s.is_empty()),
-            std::env::var("ATOMCODE_HOME")
-                .ok()
-                .filter(|s| !s.is_empty()),
-            crate::util::real_home_dir(),
-        )
+        // Test-only isolation seam. Checked BEFORE the memo below (and never
+        // memoized): a guard gives THIS thread a private home. Always compiled —
+        // integration tests link the crate's own lib build, which never sees the
+        // dev-dependency's `test-util` feature, so a gated check would silently do
+        // nothing there. Production never installs an override.
+        if let Some(home) = crate::test_util::overridden_home() {
+            return home;
+        }
+        // Resolved ONCE: the home root must not change mid-process, otherwise a
+        // write and a read of the same logical path can land in two different
+        // buckets (the parallel-test flake). Runtime code is forbidden from writing
+        // the path env vars (see the daemon env guard).
+        static RESOLVED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        RESOLVED
+            .get_or_init(|| {
+                Self::resolve_config_dir(
+                    std::env::var("JEIKCODE_HOME")
+                        .ok()
+                        .filter(|s| !s.is_empty()),
+                    crate::util::real_home_dir(),
+                )
+            })
+            .clone()
     }
 
     pub fn default_path() -> PathBuf {
@@ -2393,28 +2467,20 @@ model = "missing-type"
     fn test_resolve_config_dir_uses_env_when_set() {
         let result = Config::resolve_config_dir(
             Some("/tmp/custom-jeikcode-home".to_string()),
-            None,
             Some(PathBuf::from("/Users/foo")),
         );
         assert_eq!(result, PathBuf::from("/tmp/custom-jeikcode-home"));
-
-        let result_legacy = Config::resolve_config_dir(
-            None,
-            Some("/tmp/custom-jeikcode-home".to_string()),
-            Some(PathBuf::from("/Users/foo")),
-        );
-        assert_eq!(result_legacy, PathBuf::from("/tmp/custom-jeikcode-home"));
     }
 
     #[test]
     fn test_resolve_config_dir_falls_back_to_home() {
-        let result = Config::resolve_config_dir(None, None, Some(PathBuf::from("/Users/foo")));
+        let result = Config::resolve_config_dir(None, Some(PathBuf::from("/Users/foo")));
         assert_eq!(result, PathBuf::from("/Users/foo/.jeikcode"));
     }
 
     #[test]
     fn test_resolve_config_dir_falls_back_to_dot_when_no_home() {
-        let result = Config::resolve_config_dir(None, None, None);
+        let result = Config::resolve_config_dir(None, None);
         assert_eq!(result, PathBuf::from("./.jeikcode"));
     }
 
@@ -2577,6 +2643,7 @@ model = "missing-type"
             plugin: Default::default(),
             web_search: Default::default(),
             keep_interrupted_context: false,
+            github_logo: true,
             offline_mode: Default::default(),
             offline_note: None,
             quarantined_providers: std::collections::BTreeMap::new(),
@@ -2841,6 +2908,20 @@ model = "missing-type"
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.language, None);
+    }
+
+    #[test]
+    fn coding_timeouts_accept_legacy_first_token_alias() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [coding]
+            first_token_timeout_secs = 60
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.coding.ttft_secs, 60);
+        assert_eq!(cfg.coding.streaming_sliding_secs, 120);
+        assert_eq!(cfg.coding.connect_timeout_secs, 10);
     }
 
     #[test]
@@ -3650,20 +3731,23 @@ context_window = 131072
 
     #[test]
     fn tool_output_config_defaults_and_parses() {
-        // Absent section → fork defaults (64 KiB + explore/search whitelist).
+        // Absent section → fork defaults (64 KiB + 24 KiB terminal + whitelist).
         let defaulted: Config = toml::from_str("").unwrap();
         assert_eq!(defaulted.tools.tool_output.max_bytes, Some(65536));
+        assert_eq!(defaulted.tools.tool_output.terminal_max_bytes, Some(24576));
         assert_eq!(
             defaulted.tools.tool_output.no_fold_tools,
             default_no_fold_tools()
         );
 
-        // Explicit value round-trips.
+        // Explicit values round-trip (both thresholds are configurable).
         let configured: Config =
-            toml::from_str("[tools.tool_output]\nmax_bytes = 131072\n").unwrap();
+            toml::from_str("[tools.tool_output]\nmax_bytes = 131072\nterminal_max_bytes = 32768\n")
+                .unwrap();
         assert_eq!(configured.tools.tool_output.max_bytes, Some(131072));
+        assert_eq!(configured.tools.tool_output.terminal_max_bytes, Some(32768));
 
-        // 0 explicitly disables folding (distinct from absent).
+        // 0 explicitly disables compression (distinct from absent).
         let zero: Config = toml::from_str("[tools.tool_output]\nmax_bytes = 0\n").unwrap();
         assert_eq!(zero.tools.tool_output.max_bytes, Some(0));
     }

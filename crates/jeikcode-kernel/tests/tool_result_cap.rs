@@ -85,8 +85,10 @@ async fn drive_and_collect_results(max_cap: Option<usize>, huge_size: usize) -> 
         .run_to_completion("go", AutoRespond::AllowAll)
         .await;
 
-    // Cross-check: what the model saw next round (the stored Tool message) must
-    // ALSO be capped — assert via the recorded provider calls.
+    // Cross-check: what the model saw next round (the stored Tool message) is
+    // the capped result VERBATIM. Compression of oversized results is the
+    // artifact middleware's job at execution time; with no middleware mounted
+    // in this test the kernel must not rewrite the text on the wire either.
     let recorded = calls.lock().unwrap();
     // The 2nd recorded call (round 2) carries the stored tool-result message.
     if let Some((messages, _, _)) = recorded.get(1) {
@@ -94,13 +96,10 @@ async fn drive_and_collect_results(max_cap: Option<usize>, huge_size: usize) -> 
             .iter()
             .find(|m| matches!(m.role, jeikcode_kernel::message::Role::Tool))
             .expect("a tool-result message must be in the round-2 history");
-        // What the model sees is pruned for wire if oversized (>24KB), whereas outcome.tool_results preserves full output.
         if let Some(first) = outcome.tool_results.first() {
-            let expected_wire_text =
-                jeikcode_kernel::message::adaptive_prune_tool_output_for_llm(&first.content, false);
             assert_eq!(
-                tool_msg.text, expected_wire_text,
-                "the model-visible tool result must match the wire-pruned result"
+                tool_msg.text, first.content,
+                "the model-visible tool result must be the stored result verbatim"
             );
         }
     }

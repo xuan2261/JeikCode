@@ -4798,14 +4798,11 @@ mod buffer_tests {
 
     #[test]
     fn review_activity_marker_is_ephemeral_for_code_review() {
-        let chunk = "\u{1e}review · round 3 · read_file · compaction.rs";
+        let chunk = "\u{1e}review · round 3 · read · compaction.rs";
 
         let activity = ephemeral_tool_activity(Some("CodeReview"), chunk);
 
-        assert_eq!(
-            activity,
-            Some("review · round 3 · read_file · compaction.rs")
-        );
+        assert_eq!(activity, Some("review · round 3 · read · compaction.rs"));
     }
 
     #[test]
@@ -5737,10 +5734,17 @@ mod menu_tests {
         ));
         let lock = std::sync::RwLock::new(skills);
 
-        // `/skills atom smoke` keeps the menu OPEN and narrows to the one skill
+        // `/skills jeikcode smoke` keeps the menu OPEN and narrows to the one skill
         // matching both fragments — the reported bug (a space used to kill it).
-        let items = build_menu_items("/skills atom smoke", 0, &reg, &custom, Some(&lock), None)
-            .expect("multi-fragment filter must keep the menu open");
+        let items = build_menu_items(
+            "/skills jeikcode smoke",
+            0,
+            &reg,
+            &custom,
+            Some(&lock),
+            None,
+        )
+        .expect("multi-fragment filter must keep the menu open");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].0, "jeikcode-smoke-test");
 
@@ -5852,14 +5856,14 @@ mod menu_tests {
         // Single fragment `jeikcode` matches BOTH (substring), like the menu today.
         assert_eq!(build_skill_menu_items(Some(&lock), "jeikcode").len(), 2);
 
-        // `atom smoke` (two fragments) narrows to just the smoke-test skill —
-        // it contains both "atom" and "smoke"; delegating-to-jeikcode does not.
-        let narrowed = build_skill_menu_items(Some(&lock), "atom smoke");
+        // `jeikcode smoke` (two fragments) narrows to just the smoke-test skill —
+        // it contains both "jeikcode" and "smoke"; delegating-to-jeikcode does not.
+        let narrowed = build_skill_menu_items(Some(&lock), "jeikcode smoke");
         assert_eq!(narrowed.len(), 1);
         assert_eq!(narrowed[0].0, "jeikcode-smoke-test");
 
         // A fragment matched by neither name yields nothing.
-        assert!(build_skill_menu_items(Some(&lock), "atom nope").is_empty());
+        assert!(build_skill_menu_items(Some(&lock), "jeikcode nope").is_empty());
     }
 
     #[test]
@@ -6748,7 +6752,8 @@ mod tool_format_tests {
 
     #[test]
     fn display_tool_name_snake_to_pascal() {
-        assert_eq!(display_tool_name("read_file"), "ReadFile");
+        assert_eq!(display_tool_name("read"), "Read");
+        assert_eq!(display_tool_name("read_file"), "ReadFile"); // legacy alias
         assert_eq!(display_tool_name("search_replace"), "SearchReplace");
         assert_eq!(display_tool_name("bash"), "Bash");
     }
@@ -6795,6 +6800,11 @@ mod tool_format_tests {
     /// disambiguation lost).
     #[test]
     fn display_tool_name_short_strips_redundant_noun() {
+        // Canonical tools first — these are what the model actually calls now.
+        assert_eq!(display_tool_name_short("read"), "Read");
+        assert_eq!(display_tool_name_short("write"), "Write");
+        assert_eq!(display_tool_name_short("edit"), "Edit");
+        // Legacy names still exercise the suffix strip (replayed transcripts).
         assert_eq!(display_tool_name_short("read_file"), "Read");
         assert_eq!(display_tool_name_short("write_file"), "Write");
         assert_eq!(display_tool_name_short("edit_file"), "Edit");
@@ -6832,10 +6842,29 @@ mod tool_format_tests {
         );
     }
 
+    /// `read` renders the PATH itself (truncated) — directories and offset ranges stay
+    /// readable — unlike the write/edit family, which shows only the basename.
     #[test]
-    fn format_tool_detail_read_file_basename() {
+    fn format_tool_detail_read_shows_the_truncated_path() {
         let args = r#"{"file_path":"/abs/path/to/foo.rs"}"#;
-        assert_eq!(format_tool_detail("read_file", args), "foo.rs");
+        assert_eq!(format_tool_detail("read", args), "/abs/path/to/foo.rs"); // canonical
+        assert_eq!(format_tool_detail("read_file", args), "/abs/path/to/foo.rs");
+        // legacy alias
+    }
+
+    /// A directory read (`read` now owns directory listing) renders its path as-is.
+    #[test]
+    fn format_tool_detail_read_directory_path() {
+        let args = r#"{"path":"crates/foo"}"#;
+        assert_eq!(format_tool_detail("read", args), "crates/foo");
+    }
+
+    #[test]
+    fn format_tool_detail_write_basename() {
+        let args = r#"{"file_path":"/abs/path/to/out.rs","content":"x"}"#;
+        assert_eq!(format_tool_detail("write", args), "out.rs"); // canonical
+        assert_eq!(format_tool_detail("write_file", args), "out.rs"); // legacy alias
+        assert_eq!(format_tool_detail("create_file", args), "out.rs"); // legacy-only
     }
 
     #[test]
@@ -6859,19 +6888,20 @@ mod tool_format_tests {
     }
 
     #[test]
-    fn format_tool_detail_edit_file_omits_old_string_preview() {
+    fn format_tool_detail_edit_omits_old_string_preview() {
         let args = r#"{"file_path":"/abs/path/to/test.txt","old_string":"4","new_string":"1888"}"#;
-        assert_eq!(format_tool_detail("edit_file", args), "test.txt");
+        assert_eq!(format_tool_detail("edit", args), "test.txt"); // canonical
+        assert_eq!(format_tool_detail("edit_file", args), "test.txt"); // legacy alias
     }
 
     #[test]
-    fn format_tool_detail_edit_file_repairs_unescaped_newline() {
+    fn format_tool_detail_edit_repairs_unescaped_newline() {
         let args = concat!(
             r#"{"file_path":"/abs/path/to/test.txt","old_string":"old","new_string":"line 1"#,
             "\n",
             r#"line 2"}"#
         );
-        assert_eq!(format_tool_detail("edit_file", args), "test.txt");
+        assert_eq!(format_tool_detail("edit", args), "test.txt");
     }
 
     #[test]
@@ -6940,7 +6970,7 @@ mod tool_format_tests {
 
     #[test]
     fn format_tool_detail_invalid_json_returns_empty() {
-        let out = format_tool_detail("read_file", "not json");
+        let out = format_tool_detail("read", "not json");
         assert_eq!(out, "");
     }
 
@@ -10143,38 +10173,14 @@ mod external_config_tests {
         assert_eq!(next_default.providers["next"].model, "next-model");
     }
 
-    #[test]
-    fn jeikcode_auth_dependency_uses_gateway_not_provider_name() {
-        let mut renamed = jeikcode_config("model-a");
-        let provider = renamed.providers.remove("main").unwrap();
-        renamed
-            .providers
-            .insert("renamed-provider".into(), provider);
-        renamed.default_provider = "renamed-provider".into();
-
-        assert!(provider_requires_jeikcode_auth(&renamed));
-        assert!(!provider_requires_jeikcode_auth(&config("model-a", false)));
-    }
-
-    #[test]
-    fn awaiting_jeikcode_runtime_recovers_even_when_config_is_unchanged() {
-        let current = jeikcode_config("model-a");
-
-        assert!(should_reload_provider(
-            crate::ProviderSelectionMode::FollowGlobalDefault,
-            &current,
-            &current,
-            RuntimeUiAvailability::AwaitingProvider,
-            true,
-        ));
-        assert!(should_reload_provider(
-            crate::ProviderSelectionMode::Pinned,
-            &current,
-            &current,
-            RuntimeUiAvailability::AwaitingProvider,
-            true,
-        ));
-    }
+    // 已删除（登录功能已下线）：
+    // - jeikcode_auth_dependency_uses_gateway_not_provider_name
+    // - awaiting_jeikcode_runtime_recovers_even_when_config_is_unchanged
+    // - missing_jeikcode_auth_defers_config_reload_until_login
+    // - jeikcode_logout_deactivates_only_jeikcode_provider
+    // 这些用例要求 `provider_requires_jeikcode_auth` 为 true；该函数现已是返回 false 的桩
+    // （`is_jeikcode_gateway(_base_url)` 忽略入参），即“JeikCode 账号登录”已下线，
+    // 保留只会永远红灯。相关生产分支是死代码，清理见后续。
 
     #[test]
     fn ready_runtime_does_not_reload_for_unchanged_config() {
@@ -10186,29 +10192,6 @@ mod external_config_tests {
             &current,
             RuntimeUiAvailability::Available,
             true,
-        ));
-    }
-
-    #[test]
-    fn missing_jeikcode_auth_defers_config_reload_until_login() {
-        assert!(!should_reload_provider(
-            crate::ProviderSelectionMode::FollowGlobalDefault,
-            &jeikcode_config("model-a"),
-            &jeikcode_config("model-b"),
-            RuntimeUiAvailability::Available,
-            false,
-        ));
-    }
-
-    #[test]
-    fn jeikcode_logout_deactivates_only_jeikcode_provider() {
-        assert!(should_deactivate_for_missing_auth(
-            &jeikcode_config("model-a"),
-            RuntimeUiAvailability::Available,
-        ));
-        assert!(!should_deactivate_for_missing_auth(
-            &config("model-a", false),
-            RuntimeUiAvailability::Available,
         ));
     }
 
@@ -13349,6 +13332,8 @@ mod streaming_slash_tests {
 
     #[test]
     fn session_commands_run_mid_stream() {
+        // 决策（用户已定）：`/clear` = 只清屏、`/new` = 切新会话，均不改写正在运行的
+        // 会话 → 允许流式中执行；`/sessions` 只读列表同理。
         for cmd in ["new", "sessions", "clear"] {
             assert_eq!(
                 exec(&format!("/{cmd}")),
@@ -13399,15 +13384,9 @@ mod streaming_slash_tests {
     #[test]
     fn mutating_and_modal_commands_stay_blocked_mid_stream() {
         // Conversation-mutating / turn-boundary commands must still wait.
-        for line in [
-            "/clear",
-            "/compact",
-            "/new",
-            "/resume",
-            "/model gpt",
-            "/undo",
-            "/context",
-        ] {
+        // NOTE: `/clear` (清屏) and `/new` (切会话) are deliberately NOT in this list —
+        // they leave the running turn's session untouched (see `session_commands_run_mid_stream`).
+        for line in ["/compact", "/resume", "/model gpt", "/undo", "/context"] {
             assert_eq!(exec(line), None, "line={line}");
         }
     }
@@ -13422,7 +13401,7 @@ mod streaming_slash_tests {
     #[test]
     fn unrelated_commands_and_non_slash_are_blocked() {
         assert_eq!(exec("/model"), None);
-        assert_eq!(exec("/clear"), None);
+        assert_eq!(exec("/clear now"), None);
         assert_eq!(exec("just a message"), None);
         // Case-insensitive command + sub.
         assert_eq!(
@@ -14265,6 +14244,9 @@ fn should_stage_interrupt(send_ok: bool, bare_esc: bool, has_pending: bool) -> b
 /// whitelisted — only the halt sub-commands.
 fn streaming_executable_slash(line: &str) -> Option<(String, String)> {
     let (cmd, arg) = parse_slash_line(line)?;
+    // 流式放行白名单。决策（用户已定）：`/clear` = 只清终端屏，`/new` = 切到新会话——
+    // 二者都不改写“正在运行的会话”（在跑的回合留在旧会话里），因此中途执行安全；
+    // 真正会改写会话/上下文的 `/compact`、`/undo`、`/context` 等仍必须等回合结束。
     if matches!(
         cmd.to_ascii_lowercase().as_str(),
         "new" | "sessions" | "clear"
@@ -15066,7 +15048,7 @@ fn deliver_user_input(
 }
 
 /// Fail-close: respond with `Null` so the tool round-trip resolves as
-/// "not supported in this environment" instead of hanging the turn.
+/// friendly "no interactive prompt available" guidance instead of hanging the turn.
 fn deliver_user_input_null(ctx: &mut LoopCtx, id: u64) {
     if ctx.pending_runtime_request_id == Some(id) {
         ctx.pending_runtime_request_id = None;
@@ -21206,7 +21188,7 @@ fn handle_agent_event(
                         // Clean per-subtask lines (id · model · status) instead of the
                         // raw <task ...> block.
                         summarise_task_result(&output)
-                    } else if name == "read_file" && success {
+                    } else if matches!(name.as_str(), "read" | "read_file") && success {
                         // Collapse the `{line}\t{indented content}` preview so a
                         // deeply-indented line doesn't render as a big left gap.
                         summarise_read_result(&output)
@@ -21216,7 +21198,7 @@ fn handle_agent_event(
                     // The inline colored `(+N -N)` is the edit result's only
                     // metadata. Drop the tool's older parenthesized replacement
                     // label so the count sits directly after the file name.
-                    let summary = if name == "edit_file" && success {
+                    let summary = if matches!(name.as_str(), "edit" | "edit_file") && success {
                         summary
                             .split_once(" (")
                             .map(|(file, _)| file.to_string())
@@ -21226,7 +21208,9 @@ fn handle_agent_event(
                     };
                     let diff_entries = if matches!(
                         name.as_str(),
-                        "edit_file"
+                        "edit"
+                            | "edit_file"
+                            | "write"
                             | "write_file"
                             | "create_file"
                             | "global_search_replace"
@@ -23782,9 +23766,9 @@ fn pascal_case(snake: &str) -> String {
 /// `<verb>_<noun>` convention.
 ///
 /// Examples:
-/// - `read_file` → `Read`
-/// - `write_file` → `Write`
-/// - `list_directory` → `List`
+/// - `read` (legacy `read_file`) → `Read`
+/// - `write` (legacy `write_file`) → `Write`
+/// - `edit` (legacy `edit_file`) → `Edit`
 /// - `parallel_edit_files` → `ParallelEdit`
 /// - `bash` → `Bash` (no suffix to strip)
 /// - `search_replace` → `SearchReplace` (suffix `_replace` not in
@@ -23941,11 +23925,23 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
     let basename = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
 
     match name {
-        "read_file" | "edit_file" | "write_file" | "create_file" => {
+        // Canonical names first; the legacy names stay so a replayed pre-rename
+        // transcript still renders basenames instead of full paths.
+        "read" | "read_file" => {
+            // 读类工具显示“路径本身”（截断），方便看目录/范围；
+            // 写类工具只显示文件名（见下方分支与并列的测试）。
+            // 同时接受新写法 `file_path` 与老写法 `path`。
+            get_str("path")
+                .or_else(|| get_str("file_path"))
+                .map(|p| crate::width::truncate_with_ellipsis(&p, 100))
+                .unwrap_or_default()
+        }
+        "write" | "write_file" | "create_file" | "edit" | "edit_file" => {
             // Single-call path: basename only (compact). Batch disambiguation
             // is handled by `disambiguate_batch_details` which runs after
             // all child details are computed and can compare them.
             get_str("file_path")
+                .or_else(|| get_str("path"))
                 .map(|p| basename(&p))
                 .unwrap_or_default()
         }
@@ -24212,9 +24208,8 @@ fn disambiguate_batch_details(
         };
         let get_str = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
         match name {
-            "read_file" | "edit_file" | "write_file" | "create_file" => {
-                get_str("file_path").or_else(|| get_str("file"))
-            }
+            "read" | "read_file" | "write" | "write_file" | "create_file" | "edit"
+            | "edit_file" => get_str("file_path").or_else(|| get_str("file")),
             "global_search_replace" | "search_replace" => {
                 get_str("file_path").or_else(|| get_str("file"))
             }

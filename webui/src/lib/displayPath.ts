@@ -90,6 +90,20 @@ export function fsBreadcrumbs(raw: string): FsCrumb[] {
   return crumbs;
 }
 
+/** Only a successfully loaded, local-only directory may produce clickable
+ * repair breadcrumbs. A rejected raw Windows verbatim/UNC input must not be
+ * normalized into a new navigation request by the ordinary display helper.
+ * The normal cwd picker keeps its existing display behavior.
+ */
+export function fsBreadcrumbsForPicker(
+  browsePath: string,
+  loadedPath: string,
+  selectionOnly: boolean,
+): FsCrumb[] {
+  if (selectionOnly && !loadedPath) return [];
+  return fsBreadcrumbs(selectionOnly ? loadedPath : browsePath);
+}
+
 /** Append one directory name without gluing a `/?/` or mixed separator on. */
 export function joinFsChild(baseRaw: string, name: string): string {
   const stripped = stripExtendedPathPrefix(baseRaw);

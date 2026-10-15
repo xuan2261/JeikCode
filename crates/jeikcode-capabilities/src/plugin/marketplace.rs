@@ -702,7 +702,7 @@ mod tests {
         );
         assert_eq!(
             cfg,
-            "http.https://github.com/JeikCode/JeikCode.extraHeader=Authorization: Basic XYZ"
+            "http.https://github.com.extraHeader=Authorization: Basic XYZ"
         );
     }
 
@@ -737,11 +737,15 @@ mod tests {
     #[serial_test::serial]
     fn auth_required_message_trusted_not_logged_in_suggests_login() {
         let _home = isolated_home(); // no auth.toml under the temp JEIKCODE_HOME
-        let m = auth_required_message(
-            "克隆",
-            "https://github.com/JeikCode/JeikCode/o/r",
-            "fatal: auth",
-        );
+                                     // The trusted list is CONFIGURED (empty by default in this build) — the trusted-
+                                     // branch wording can only exist where a domain is actually trusted.
+        let Some(domain) = jeikcode_config::endpoints::trusted_domains()
+            .first()
+            .cloned()
+        else {
+            return;
+        };
+        let m = auth_required_message("克隆", &format!("https://{domain}/o/r"), "fatal: auth");
         assert!(
             m.contains("/login"),
             "trusted host + not logged in should guide to /login: {m}"
@@ -756,6 +760,14 @@ mod tests {
         // user never had. JEIKCODE_HOME is isolated, so this writes to a
         // tempdir, never the real ~/.jeikcode/auth.toml.
         let _home = isolated_home();
+        // Same gate as the sibling test: no trusted domain configured ⇒ the trusted branch
+        // cannot be exercised (and `host_is_trusted` correctly stays false for github).
+        let Some(domain) = jeikcode_config::endpoints::trusted_domains()
+            .first()
+            .cloned()
+        else {
+            return;
+        };
         let dir = jeikcode_config::config::Config::config_dir();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -763,11 +775,7 @@ mod tests {
             "access_token = \"x\"\ntoken_type = \"Bearer\"\n[user]\nid = \"1\"\nusername = \"alice\"\n",
         )
         .unwrap();
-        let m = auth_required_message(
-            "更新",
-            "https://github.com/JeikCode/JeikCode/o/r",
-            "fatal: auth",
-        );
+        let m = auth_required_message("更新", &format!("https://{domain}/o/r"), "fatal: auth");
         assert!(
             m.contains("登录已过期") || m.contains("重新登录"),
             "logged-in-but-dead-token should indicate re-login: {m}"

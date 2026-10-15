@@ -197,14 +197,19 @@ mod trusted_host_tests {
 
     #[test]
     fn trusted_hosts_and_subdomains() {
-        assert!(host_is_trusted("https://github.com/JeikCode/JeikCode/o/r"));
-        assert!(host_is_trusted("https://github.com/JeikCode/JeikCode/o/r"));
-        assert!(host_is_trusted(
-            "https://www.github.com/JeikCode/JeikCode/o/r"
-        ));
-        assert!(host_is_trusted(
-            "https://x.github.com/JeikCode/JeikCode/o/r.git"
-        ));
+        // The trusted list is CONFIGURED (the built-in default is empty in this build and
+        // `JEIKCODE_TRUSTED_HOSTS` is read exactly once into a OnceLock), so NEVER assume a
+        // specific host here: probe whatever the live list holds, and otherwise lock the
+        // untrusted-by-default behavior. The subdomain RULE itself belongs to
+        // `endpoints::host_matches_domain`'s own unit tests.
+        match jeikcode_config::endpoints::trusted_domains().first() {
+            Some(domain) => {
+                assert!(host_is_trusted(&format!("https://{domain}/o/r")));
+                assert!(host_is_trusted(&format!("https://www.{domain}/o/r")));
+                assert!(!host_is_trusted(&format!("https://not{domain}/o/r")));
+            }
+            None => assert!(!host_is_trusted("https://github.com/JeikCode/JeikCode/o/r")),
+        }
     }
 
     #[test]
@@ -219,9 +224,12 @@ mod trusted_host_tests {
 
     #[test]
     fn scheme_host_prefix_strips_path() {
+        // Host-only scoping (see the fn's doc): the injected credential header must be
+        // scoped to `scheme://host`, so a path-ful URL must NOT carry its path into git's
+        // per-URL config key.
         assert_eq!(
             scheme_host_prefix("https://github.com/JeikCode/JeikCode/owner/repo.git").as_deref(),
-            Some("https://github.com/JeikCode/JeikCode")
+            Some("https://github.com")
         );
         assert_eq!(
             scheme_host_prefix("git@github.com/JeikCode/JeikCode:o/r"),

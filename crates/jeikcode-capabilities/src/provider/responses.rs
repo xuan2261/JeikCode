@@ -72,9 +72,9 @@ impl ResponsesConfig {
             model: model.into(),
             context_window: 128_000,
             max_tokens: None,
-            idle_timeout: Duration::from_secs(300),
-            connect_timeout: Duration::from_secs(10),
-            open_timeout: Duration::from_secs(30),
+            idle_timeout: jeikcode_kernel::timeouts::TimeoutPolicy::production().idle_watchdog(),
+            connect_timeout: jeikcode_kernel::timeouts::TimeoutPolicy::production().connect,
+            open_timeout: jeikcode_kernel::timeouts::TimeoutPolicy::production().open,
             retry: RetryPolicy::default(),
             request_signer: None,
             user_agent: None,
@@ -277,23 +277,17 @@ async fn open_responses_stream(
             req = req.header("x-jeikcode-session-id", session_id);
             req = req.header("x-session-id", session_id);
         }
-        let sent = match tokio::time::timeout(open_timeout, req.send()).await {
-            Ok(r) => r,
-            Err(_) => {
+        let sent = match retry::send_with_ttfb(req, open_timeout).await {
+            retry::OpenSend::Timeout => {
                 if attempt < policy.max_attempts {
                     tokio::time::sleep(retry::compute_backoff(attempt, policy)).await;
                     attempt += 1;
                     continue;
                 }
-                return Err(ProviderError {
-                    retryable: true,
-                    message: format!(
-                        "open failed: 等待首字节超过 {}s(网关无响应)",
-                        open_timeout.as_secs()
-                    ),
-                    ..Default::default()
-                });
+                return Err(retry::ttfb_timeout_error(open_timeout));
             }
+            retry::OpenSend::Transport(e) => Err(e),
+            retry::OpenSend::Response(resp) => Ok(resp),
         };
         match sent {
             Ok(resp) if resp.status().is_success() => return Ok(resp),

@@ -43,6 +43,7 @@ pub struct GeminiConfig {
     pub reasoning_policy: Option<ReasoningPolicy>,
     pub idle_timeout: Duration,
     pub connect_timeout: Duration,
+    pub open_timeout: Duration,
     pub retry: RetryPolicy,
     pub user_agent: Option<String>,
     pub skip_tls_verify: bool,
@@ -66,8 +67,9 @@ impl GeminiConfig {
             thinking_budget: None,
             reasoning_model: None,
             reasoning_policy: None,
-            idle_timeout: Duration::from_secs(120),
-            connect_timeout: Duration::from_secs(30),
+            idle_timeout: jeikcode_kernel::timeouts::TimeoutPolicy::production().idle_watchdog(),
+            connect_timeout: jeikcode_kernel::timeouts::TimeoutPolicy::production().connect,
+            open_timeout: jeikcode_kernel::timeouts::TimeoutPolicy::production().open,
             retry: RetryPolicy::default(),
             user_agent: None,
             skip_tls_verify: false,
@@ -139,6 +141,7 @@ impl LlmProvider for GeminiProvider {
         let body = build_request_body(&self.cfg, messages, tools, options, self.policy);
         super::wire_dump_request(&self.cfg.model, &body);
         let idle = self.cfg.idle_timeout;
+        let open_timeout = self.cfg.open_timeout;
         let policy = self.cfg.retry.clone();
         let client = self.client.clone();
         let url = self.url.clone();
@@ -158,6 +161,7 @@ impl LlmProvider for GeminiProvider {
                 &session_id,
                 &policy,
                 rate_limit_retry_owner,
+                open_timeout,
             ).await {
                 Ok(r) => r,
                 Err(e) => {
@@ -210,6 +214,7 @@ impl LlmProvider for GeminiProvider {
                                     &session_id,
                                     &policy,
                                     rate_limit_retry_owner,
+                                    open_timeout,
                                 ).await {
                                     stream_attempt += 1;
                                     resp = fresh;
@@ -268,6 +273,7 @@ async fn open_stream(
     session_id: &str,
     policy: &RetryPolicy,
     rate_limit_retry_owner: jeikcode_kernel::provider::RateLimitRetryOwner,
+    open_timeout: Duration,
 ) -> Result<reqwest::Response, ProviderError> {
     let mut attempt = 1u32;
     loop {
@@ -282,8 +288,28 @@ async fn open_stream(
             req = req.header("x-jeikcode-session-id", session_id);
             req = req.header("x-session-id", session_id);
         }
-        match req.send().await {
-            Ok(resp) => {
+        match super::retry::send_with_ttfb(req, open_timeout).await {
+            super::retry::OpenSend::Timeout => {
+                if attempt < policy.max_attempts {
+                    tokio::time::sleep(retry::compute_backoff(attempt, policy)).await;
+                    attempt += 1;
+                    continue;
+                }
+                return Err(super::retry::ttfb_timeout_error(open_timeout));
+            }
+            super::retry::OpenSend::Transport(e) => {
+                if retry::is_retryable_reqwest_error(&e) && attempt < policy.max_attempts {
+                    tokio::time::sleep(retry::compute_backoff(attempt, policy)).await;
+                    attempt += 1;
+                    continue;
+                }
+                return Err(ProviderError {
+                    retryable: retry::is_retryable_reqwest_error(&e),
+                    message: format!("gemini request failed: {}", retry::err_chain(&e)),
+                    ..Default::default()
+                });
+            }
+            super::retry::OpenSend::Response(resp) => {
                 let code = resp.status().as_u16();
                 if !resp.status().is_success() {
                     if retry::should_retry_open_status(code, rate_limit_retry_owner)
@@ -308,18 +334,6 @@ async fn open_stream(
                     });
                 }
                 return Ok(resp);
-            }
-            Err(e) => {
-                if retry::is_retryable_reqwest_error(&e) && attempt < policy.max_attempts {
-                    tokio::time::sleep(retry::compute_backoff(attempt, policy)).await;
-                    attempt += 1;
-                    continue;
-                }
-                return Err(ProviderError {
-                    retryable: retry::is_retryable_reqwest_error(&e),
-                    message: format!("gemini request failed: {}", retry::err_chain(&e)),
-                    ..Default::default()
-                });
             }
         }
     }
@@ -1050,7 +1064,7 @@ mod tests {
             "ok",
             vec![ToolCall {
                 id: "c1".into(),
-                name: "read_file".into(),
+                name: "read".into(),
                 arguments: r#"{"path":"a.rs"}"#.into(),
             }],
         );
@@ -1067,7 +1081,7 @@ mod tests {
             Message::tool_result("c1", r#"{"ok":true}"#, false),
         ];
         let tools = vec![ToolDef {
-            name: "read_file".into(),
+            name: "read".into(),
             description: "read".into(),
             parameters: json!({"type":"object"}),
         }];
@@ -1089,17 +1103,17 @@ mod tests {
         assert_eq!(contents[1]["parts"][1]["text"], json!("ok"));
         assert_eq!(
             contents[1]["parts"][2]["functionCall"]["name"],
-            json!("read_file")
+            json!("read")
         );
         assert_eq!(contents[1]["parts"][2]["thoughtSignature"], json!("sig-1"));
         assert_eq!(contents[2]["role"], json!("user"));
         assert_eq!(
             contents[2]["parts"][0]["functionResponse"]["name"],
-            json!("read_file")
+            json!("read")
         );
         assert_eq!(
             body["tools"][0]["functionDeclarations"][0]["name"],
-            json!("read_file")
+            json!("read")
         );
     }
 

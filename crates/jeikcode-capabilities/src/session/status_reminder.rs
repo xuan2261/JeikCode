@@ -26,7 +26,9 @@ use jeikcode_kernel::message::{Conversation, Role};
 use std::sync::Arc;
 
 #[cfg(feature = "tools")]
-use crate::tools::bash_runtime::{legacy_bash_runtime_state, BashRuntimeState};
+use crate::tools::bash_runtime::{
+    legacy_bash_runtime_state, ActiveBackgroundTask, BashRuntimeState,
+};
 
 /// Injects a `<system-reminder>` status tail from round 2 of each turn onward.
 pub struct StatusReminderHook {
@@ -134,12 +136,20 @@ fn append_background_task_lines(runtime: &BashRuntimeState, lines: &mut Vec<Stri
                 .exit_code
                 .map(|c| format!("exit code {c}"))
                 .unwrap_or_else(|| "terminated".to_string());
+            // NOT "CRASHED": the status is the WRAPPER shell's own report, so an external
+            // stop (taskkill / Stop-Process / job teardown) lands here too — the old
+            // wording asserted a crash and pushed models into chasing phantom bugs.
             lines.push(format!(
-                "- Background command `{}` CRASHED with {}!",
-                a.command, exit_info
+                "- Background command `{}` (pid {}) exited: {exit_info}. \
+                 The status is the wrapper shell's own report, so it also covers an external \
+                 stop — ignore this alert if it was stopped deliberately; otherwise inspect its \
+                 log (path from the start message).",
+                a.command, a.pid
             ));
             if !a.error_tail.is_empty() {
-                lines.push("  Recent error output:".to_string());
+                // "Recent output", NOT "error output": the tail mixes stdout and stderr, and
+                // the old label made a healthy startup line look like the cause of a crash.
+                lines.push("  Recent output:".to_string());
                 for l in a.error_tail.lines() {
                     lines.push(format!("    {l}"));
                 }
@@ -151,12 +161,25 @@ fn append_background_task_lines(runtime: &BashRuntimeState, lines: &mut Vec<Stri
     if !tasks.is_empty() {
         lines.push("[Active Background Tasks]".to_string());
         for t in tasks {
-            lines.push(format!(
-                "- cmd: `{}` | status: running | uptime: {}s",
-                t.command, t.uptime_secs
-            ));
+            lines.push(active_task_line(&t));
         }
     }
+}
+
+/// One `[Active Background Tasks]` row: what runs, the wrapper shell's own pid, and the
+/// stop recipe that covers the WHOLE tree (`stop_hint`). The start message carries the
+/// workload's own WinPID + Git-Bash pid (see `bash.rs::render_background_pid_block`) —
+/// this row stays compact because the tree kill is always sufficient.
+#[cfg(feature = "tools")]
+fn active_task_line(t: &ActiveBackgroundTask) -> String {
+    let pid_label = if cfg!(windows) { "WinPID" } else { "pid" };
+    format!(
+        "- cmd: `{}` | {pid_label}: {} | status: running | uptime: {}s | stop: {}",
+        t.command,
+        t.pid,
+        t.uptime_secs,
+        crate::tools::bash_runtime::stop_hint(t.pid)
+    )
 }
 
 impl Default for StatusReminderHook {
@@ -338,6 +361,24 @@ mod tests {
         assert_eq!(convo.messages[0].text, first);
     }
 
+    #[test]
+    #[cfg(feature = "tools")]
+    fn active_task_line_carries_pid_and_stop_recipe() {
+        // Regression: the row used to show only cmd/status/uptime, so the model had to
+        // GUESS how to stop the task — and guessed wrong on Windows (MSYS `kill` cannot
+        // see the wrapper's Windows pid). The row now carries the pid and the recipe.
+        let line = active_task_line(&crate::tools::bash_runtime::ActiveBackgroundTask {
+            pid: 4242,
+            command: "python -m http.server 8899".into(),
+            uptime_secs: 933,
+        });
+        assert!(line.contains(": 4242"), "{line}");
+        assert!(
+            line.contains("taskkill /F /T /PID 4242") || line.contains("kill -TERM -4242"),
+            "{line}"
+        );
+    }
+
     #[tokio::test]
     async fn turn_start_appends_date_to_query_bottom() {
         let hook = StatusReminderHook::new();
@@ -370,7 +411,7 @@ mod tests {
 
         let runtime = BashRuntimeState::new();
         runtime.push_background_alert(BackgroundAlert {
-            bashid: "b-test01".into(),
+            pid: 5173,
             command: "npm run dev".into(),
             exit_code: Some(1),
             error_tail: "Error: Port 5173 is already in use".into(),
@@ -398,7 +439,7 @@ mod tests {
         a.set_live_long_keywords(vec!["ninja".into()]);
         b.set_live_long_keywords(vec!["webpack".into()]);
         a.push_background_alert(crate::tools::bash_runtime::BackgroundAlert {
-            bashid: "a-task".into(),
+            pid: 1001,
             command: "ninja -C build".into(),
             exit_code: Some(1),
             error_tail: "a-only".into(),

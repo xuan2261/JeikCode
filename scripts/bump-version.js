@@ -149,9 +149,11 @@ function bumpAllFiles(newVersion) {
 
   // 8. docs-site/.vitepress/theme/HeroImageWithVersion.vue
   if (updateFile(path.join(root, 'docs-site', '.vitepress', 'theme', 'HeroImageWithVersion.vue'), text => {
-    return text
-      .replace(/const version = ref\('v.*?'\)/, `const version = ref('v${newVersion}')`)
-      .replace(/const version = 'v.*?'/, `const version = 'v${newVersion}'`);
+    if (newVersion.includes('-')) {
+      return text.replace(/const betaVersion = ref\('v.*?'\)/, `const betaVersion = ref('v${newVersion}')`);
+    } else {
+      return text.replace(/const stableVersion = ref\('v.*?'\)/, `const stableVersion = ref('v${newVersion}')`);
+    }
   })) updatedFiles.push('docs-site/.vitepress/theme/HeroImageWithVersion.vue');
 
   // 9. docs-site/package.json
@@ -241,13 +243,15 @@ function main() {
 
   const isPrerelease = nextVersion.includes('-');
   console.log(`\n📌 Next steps for ${isPrerelease ? 'Prerelease (Beta)' : 'Stable Release'}:`);
-  console.log(`   git commit -am "chore(release): bump version to ${nextTag}"`);
-  console.log(`   git tag ${nextTag}`);
+  console.log(`   1. Update CHANGELOG.md following the standard template (English + --- + Chinese).`);
+  console.log(`      ⚠️  Notice: Do NOT copy changelog history into README files! READMEs maintain a single permanent reference.`);
+  console.log(`   2. git commit -am "chore(release): bump version to ${nextTag}"`);
+  console.log(`   3. git tag ${nextTag}`);
   if (isPrerelease) {
-    console.log(`   git push origin ${nextTag}`);
-    console.log(`   (Or push to beta branch: git push origin beta)`);
+    console.log(`   4. git push origin ${nextTag}`);
+    console.log(`      (Or push to beta branch: git push origin beta)`);
   } else {
-    console.log(`   git push origin main ${nextTag}`);
+    console.log(`   4. git push origin main ${nextTag}`);
   }
   console.log('');
 }

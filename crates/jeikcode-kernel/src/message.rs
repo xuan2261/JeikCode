@@ -234,6 +234,12 @@ pub struct Message {
     /// prefix. `0` = unknown (older snapshots). ADDITIVE: `#[serde(default)]`.
     #[serde(default)]
     pub created_at_ms: u64,
+    /// Stable per-message identity for cache/disk/wire alignment. SIDECAR: never
+    /// rendered into the LLM prefix. ADDITIVE: `#[serde(default)]` so older
+    /// snapshots/JSONL deserialize with `None`; [`Conversation::push`] assigns one
+    /// (`m-<uuid>`) when absent so a stored message carries its identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 }
 
 impl Message {
@@ -251,6 +257,7 @@ impl Message {
             images: vec![],
             reasoning_blocks: vec![],
             created_at_ms: 0,
+            id: None,
         }
     }
     pub fn user(text: impl Into<String>) -> Self {
@@ -267,6 +274,7 @@ impl Message {
             images: vec![],
             reasoning_blocks: vec![],
             created_at_ms: 0,
+            id: None,
         }
     }
     pub fn assistant(text: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
@@ -283,6 +291,7 @@ impl Message {
             images: vec![],
             reasoning_blocks: vec![],
             created_at_ms: 0,
+            id: None,
         }
     }
     /// A tool RESULT. `is_error` is now STORED (a real adapter must echo it to the
@@ -305,6 +314,7 @@ impl Message {
             images: vec![],
             reasoning_blocks: vec![],
             created_at_ms: 0,
+            id: None,
         }
     }
     /// A KERNEL-INJECTED synthetic `Role::User` message (compaction cold summary or
@@ -328,6 +338,7 @@ impl Message {
             images: vec![],
             reasoning_blocks: vec![],
             created_at_ms: 0,
+            id: None,
         }
     }
     /// A user message carrying inline `images` (multimodal input). Identical to
@@ -346,10 +357,11 @@ impl Message {
             images,
             reasoning_blocks: vec![],
             created_at_ms: 0,
+            id: None,
         }
     }
     /// A KERNEL-INJECTED `Role::User` message carrying `images` — used by the agent
-    /// loop to surface images a TOOL produced (e.g. `read_file` on a picture) to the
+    /// loop to surface images a TOOL produced (e.g. `read` on a picture) to the
     /// model, since a provider only serializes images on a user message, never a tool
     /// message. `synthetic = true` so `sacred_floor` skips it when locating the real
     /// task prompt (same rationale as [`Message::synthetic_user`]).
@@ -367,6 +379,7 @@ impl Message {
             images,
             reasoning_blocks: vec![],
             created_at_ms: 0,
+            id: None,
         }
     }
 
@@ -411,6 +424,13 @@ fn wall_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Stable message identity `m-<uuid>`. Assigned at the single append seam
+/// ([`Conversation::push`]) so persisted, cached, and wire views agree on the
+/// same handle. SIDECAR: never rendered into the LLM prefix.
+pub fn new_message_id() -> String {
+    format!("m-{}", uuid::Uuid::new_v4().simple())
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Conversation {
     pub messages: Vec<Message>,
@@ -425,84 +445,6 @@ pub struct Conversation {
     pub cache_epoch: u64,
 }
 
-/// Adaptively prunes an oversized tool output for LLM context assembly.
-/// Keeps full verbatim content in persistent disk storage and WebUI presentation,
-/// while providing an error-focused (or success-compact) bounded context to the LLM.
-pub fn adaptive_prune_tool_output_for_llm(output: &str, is_error: bool) -> String {
-    const WIRE_FOLD_THRESHOLD: usize = 24 * 1024;
-    if output.len() <= WIRE_FOLD_THRESHOLD {
-        return output.to_string();
-    }
-
-    if output.contains("[jeikcode: output truncated") || output.contains("fetch_output(") {
-        return output.to_string();
-    }
-
-    let is_failure = is_error || {
-        if let Some(pos) = output.rfind("[exit code ") {
-            let after = &output[pos + 11..];
-            if let Some(end) = after.find(']') {
-                if let Ok(code) = after[..end].trim().parse::<i32>() {
-                    code != 0
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        } else {
-            false
-        }
-    };
-
-    let total = output.len();
-    if is_failure {
-        let head_len = 3000.min(total);
-        let tail_len = 16000.min(total.saturating_sub(head_len));
-
-        let head_end = head_char_boundary(output, head_len);
-        let tail_start = tail_char_boundary(output, tail_len);
-        let head = &output[..head_end];
-        let tail = &output[tail_start..];
-
-        format!(
-            "{head}\n\n[jeikcode: output condensed for LLM context (failure diagnostics focused) — {total} bytes total, showing first {} + last {} bytes. Full output stored in session history.]\n\n{tail}",
-            head.len(),
-            tail.len()
-        )
-    } else {
-        let head_len = 1500.min(total);
-        let tail_len = 2000.min(total.saturating_sub(head_len));
-
-        let head_end = head_char_boundary(output, head_len);
-        let tail_start = tail_char_boundary(output, tail_len);
-        let head = &output[..head_end];
-        let tail = &output[tail_start..];
-
-        format!(
-            "{head}\n\n[jeikcode: output condensed for LLM context (success output condensed) — {total} bytes total, showing first {} + last {} bytes. Full output stored in session history.]\n\n{tail}",
-            head.len(),
-            tail.len()
-        )
-    }
-}
-
-fn head_char_boundary(s: &str, n: usize) -> usize {
-    let mut i = n.min(s.len());
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
-}
-
-fn tail_char_boundary(s: &str, n: usize) -> usize {
-    let mut i = s.len().saturating_sub(n);
-    while i < s.len() && !s.is_char_boundary(i) {
-        i += 1;
-    }
-    i
-}
-
 impl Conversation {
     pub fn new() -> Self {
         Self::default()
@@ -514,6 +456,12 @@ impl Conversation {
         if m.created_at_ms == 0 && matches!(m.role, Role::User | Role::Assistant) && !m.synthetic {
             m.created_at_ms = wall_now_ms();
         }
+        // Stable identity: assign at the single append seam so a stored message
+        // always carries one (cache/disk/wire alignment). Absent only for messages
+        // constructed before this field existed (deserialized with `id = None`).
+        if m.id.is_none() {
+            m.id = Some(new_message_id());
+        }
         self.messages.push(m);
     }
 
@@ -521,28 +469,17 @@ impl Conversation {
     /// so WebUI/TUI can replay the yellow notice, but they are not a user or
     /// assistant turn the model should continue from.
     ///
-    /// NOTE: Full verbatim output is preserved on disk and in WebUI/TUI session state.
-    /// When assembling history for the LLM wire request, oversized tool results
-    /// are adaptively pruned in-memory to prevent context bloat.
+    /// NOTE: No compression happens here. Oversized tool results were already
+    /// rewritten at EXECUTION time by the artifact middleware (capabilities):
+    /// head/tail preview + `fetch_output` artifact handle. The stored message —
+    /// and therefore this wire view — already carries that compressed text, so
+    /// the kernel must not rewrite it a second time.
     pub fn model_history(&self) -> Vec<Message> {
-        let mut history: Vec<Message> = self
-            .messages
+        self.messages
             .iter()
             .filter(|message| !message.is_display_only())
             .cloned()
-            .collect();
-        Self::prune_messages_for_wire(&mut history);
-        history
-    }
-
-    /// Prune oversized tool output messages in-memory before sending to the LLM.
-    /// Preserves full disk history and WebUI presentation while focusing LLM attention.
-    pub fn prune_messages_for_wire(messages: &mut [Message]) {
-        for m in messages.iter_mut() {
-            if m.role == Role::Tool && m.text.len() > 24 * 1024 {
-                m.text = adaptive_prune_tool_output_for_llm(&m.text, m.is_error);
-            }
-        }
+            .collect()
     }
 
     /// For any assistant message whose `tool_calls` lack a matching tool-result
@@ -1215,6 +1152,12 @@ pub enum CompactTrigger {
 pub struct CompactionView<'a> {
     pub messages: &'a [Message],
     pub trigger: CompactTrigger,
+    /// The INPUT budget this pressure math is sized against — the model window minus the
+    /// fixed output watermark buffer (`window − min(20K, window/4)`), NOT the raw model
+    /// window. The declared output budget (`[models.X] max_tokens`) deliberately has NO term
+    /// here: it is a capability declaration + the protocol max budget only, so it can never
+    /// shrink the usable context. `recent_keep_budget` / drain marks / auto-escalation all
+    /// derive from it.
     pub ctx_window: u32,
     pub used_tokens: u32,
     pub utilization: f32,
@@ -1392,7 +1335,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_adaptive_prune_wire_messages_preserves_convo_full_text() {
+    fn model_history_keeps_tool_results_verbatim() {
         let mut c = Conversation::new();
         c.push(Message::user("run build"));
         c.push(Message::assistant("running", vec![]));
@@ -1402,26 +1345,14 @@ mod tests {
             "Build started\n{}\n[exit code 0]\nFinished dev in 50s",
             "Compiling foo v0.1.0\n".repeat(1500)
         );
-        let orig_len = big_success_output.len();
-        assert!(orig_len > 30 * 1024);
-
+        assert!(big_success_output.len() > 30 * 1024);
         c.push(Message::tool_result("call-1", &big_success_output, false));
 
-        // 1. 验证 convo 内部的 messages 依然 100% 保留全量数据（供磁盘和 WebUI 使用）
-        assert_eq!(c.messages[2].text.len(), orig_len);
-
-        // 2. 验证面向 LLM 的 model_history 被自动精准裁剪
+        // 压缩是 artifact middleware（执行时）的职责：wire 视图不得二次改写存储文本。
+        // 存储与 wire 都逐字节等于原始结果。
+        assert_eq!(c.messages[2].text, big_success_output);
         let wire_messages = c.model_history();
-        let wire_tool_text = &wire_messages[2].text;
-        assert!(wire_tool_text.len() < 5000);
-        assert!(
-            wire_tool_text.contains("output condensed for LLM context (success output condensed)")
-        );
-        assert!(wire_tool_text.contains("Finished dev in 50s"));
-
-        // 3. 验证再次调用结果完全相同（确定性纯函数，Prefix Cache 安全）
-        let wire_messages_again = c.model_history();
-        assert_eq!(wire_messages[2].text, wire_messages_again[2].text);
+        assert_eq!(wire_messages[2].text, big_success_output);
     }
 
     #[test]
@@ -1561,7 +1492,7 @@ mod tests {
         c.push(Message::user("do two things"));
         c.push(Message::assistant(
             "calling",
-            vec![call("call_1", "write_file"), call("call_2", "echo")],
+            vec![call("call_1", "write"), call("call_2", "echo")],
         ));
         let before = c.messages.clone();
         assert_eq!(c.messages.len(), 2);
@@ -1596,7 +1527,7 @@ mod tests {
         let mut c = Conversation::new();
         c.push(Message::assistant(
             "calling",
-            vec![call("same", "write_file"), call("same", "write_file")],
+            vec![call("same", "write"), call("same", "write")],
         ));
 
         c.backfill_interrupted_tool_results();
@@ -1620,15 +1551,9 @@ mod tests {
     fn cancel_preserves_completed_pairs_and_backfills_incomplete() {
         let mut c = Conversation::new();
         c.push(Message::user("read then edit"));
-        c.push(Message::assistant(
-            "read",
-            vec![call("call_1", "read_file")],
-        ));
+        c.push(Message::assistant("read", vec![call("call_1", "read")]));
         c.push(Message::tool_result("call_1", "fn main() {}", false));
-        c.push(Message::assistant(
-            "edit",
-            vec![call("call_2", "edit_file")],
-        ));
+        c.push(Message::assistant("edit", vec![call("call_2", "edit")]));
         let before = c.messages.clone();
         assert_eq!(c.messages.len(), 4);
 
@@ -1693,7 +1618,7 @@ mod tests {
             vec![
                 ToolCall {
                     id: "call_1".into(),
-                    name: "read_file".into(),
+                    name: "read".into(),
                     arguments: "{\"path\":\"/x\"}".into(),
                 },
                 ToolCall {
@@ -1750,7 +1675,7 @@ mod tests {
             "tool_calls must survive the round-trip"
         );
         assert_eq!(asst.tool_calls[0].id, "call_1");
-        assert_eq!(asst.tool_calls[0].name, "read_file");
+        assert_eq!(asst.tool_calls[0].name, "read");
         assert_eq!(asst.tool_calls[0].arguments, "{\"path\":\"/x\"}");
         assert_eq!(asst.tool_calls[1].id, "call_2");
 
@@ -2250,7 +2175,7 @@ mod tests {
         let mut c = Conversation::new();
         c.push(Message::system("sys"));
         c.push(Message::user("task"));
-        c.push(Message::assistant("call", vec![call("c1", "read_file")]));
+        c.push(Message::assistant("call", vec![call("c1", "read")]));
         c.push(Message::tool_result(
             "c1",
             "HUGE TOOL OUTPUT THAT IS LONG",

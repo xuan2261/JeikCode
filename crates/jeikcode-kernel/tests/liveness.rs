@@ -187,6 +187,78 @@ async fn stream_timeout_exhausts_retries_then_fails() {
     );
 }
 
+// Observational metadata (ResponseId) must NOT reset TTFT. A gateway that
+// heartbeats ids while the model is still silent used to keep the first-token
+// arm alive forever.
+#[tokio::test(start_paused = true)]
+async fn response_id_heartbeat_does_not_reset_ttft() {
+    use async_trait::async_trait;
+    use futures::stream::BoxStream;
+    use jeikcode_kernel::message::Message;
+    use jeikcode_kernel::provider::{ChatOptions, LlmProvider};
+    use jeikcode_kernel::stream::ProviderError;
+    use jeikcode_kernel::tool::ToolDef;
+
+    struct MetadataHeartbeat;
+    #[async_trait]
+    impl LlmProvider for MetadataHeartbeat {
+        fn model_name(&self) -> &str {
+            "meta"
+        }
+        fn context_window(&self) -> u32 {
+            0
+        }
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolDef],
+            _options: &ChatOptions,
+        ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+            Ok(Box::pin(futures::stream::unfold(0u32, |n| async move {
+                if n > 0 {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Some((StreamEvent::ResponseId(format!("id-{n}")), n + 1))
+            })))
+        }
+    }
+
+    let mut handle = Agent::builder()
+        .provider(Arc::new(MetadataHeartbeat))
+        .tools(ToolRegistry::new().mount(&[] as &[&str]))
+        .first_token_timeout(LIVENESS)
+        .first_token_timeout_retries(0)
+        .build()
+        .spawn();
+    handle.commands.send(send("go")).unwrap();
+
+    let (error_msg, completed) = tokio::time::timeout(OUTER_GUARD, async {
+        let mut error_msg: Option<String> = None;
+        let mut completed = false;
+        while let Some(ev) = handle.events.recv().await {
+            match ev {
+                AgentEvent::Error { message, .. } => error_msg = Some(message),
+                AgentEvent::TurnComplete { .. } => {
+                    completed = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        (error_msg, completed)
+    })
+    .await
+    .expect("TTFT must fire despite ResponseId heartbeats");
+
+    assert!(completed);
+    assert!(
+        error_msg
+            .as_deref()
+            .is_some_and(|m| m.contains("首token") || m.contains("延迟")),
+        "TTFT must surface a first-token error; got {error_msg:?}"
+    );
+}
+
 // ── (2) REQUEST ROUND-TRIP TIMEOUT ───────────────────────────────────────────
 //
 // An ApprovalMiddleware round-trips via `rt.request` on a risky tool. The driver

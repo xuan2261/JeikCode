@@ -29,17 +29,10 @@ const NOTICE: &str = "jeikcodex is sending anonymous usage telemetry (token coun
     tool/latency stats — no source code or prompt text). Opt out with DO_NOT_TRACK=1, \
     JEIKCODE_TELEMETRY=0, --no-telemetry, or `[telemetry] enabled = false` in config.toml.";
 
-/// `~/.jeikcode` (honors `$JEIKCODE_HOME`, else `$HOME` / `%USERPROFILE%`). This is the
-/// telemetry queue root — the SAME dir the main app uses, so clix events land in the shared
-/// on-disk queue and ride its uploader. Falls back to `./.jeikcode` when no home is known.
+/// The telemetry queue root — the SAME dir the main app uses (unified derivation:
+/// env → legacy → real home), so clix events land in the shared on-disk queue.
 fn jeikcode_dir() -> PathBuf {
-    if let Some(home) = std::env::var_os("JEIKCODE_HOME") {
-        return PathBuf::from(home);
-    }
-    match std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-        Some(h) => PathBuf::from(h).join(".jeikcode"),
-        None => PathBuf::from(".jeikcode"),
-    }
+    jeikcode_config::Config::config_dir()
 }
 
 #[derive(Deserialize, Default)]

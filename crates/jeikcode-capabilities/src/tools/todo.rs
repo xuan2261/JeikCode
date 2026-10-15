@@ -2,7 +2,8 @@
 //! current state is DERIVED by folding transcript `todo_write`/`todowrite`/`todo` calls
 //! ([`reduce_todos`]). Preferred shape is `actions[]` (or a single action object);
 //! `action` may be omitted when the other fields uniquely determine the op.
-//! `{"todos":[…]}` is resume/legacy full-list replace only. Non-destructive ⇒ `Safe`.
+//! `{"todos":[…]}` is resume/legacy full-list replace only. `list` is a read-only echo of
+//! the current list (legacy name kept as a first-class read; never batched). Non-destructive ⇒ `Safe`.
 
 /// Canonical name advertised to the model. `todowrite` / `todo` remain aliases so
 /// old transcripts and models still fold.
@@ -227,6 +228,9 @@ fn action_kind(v: &serde_json::Value) -> Option<&'static str> {
         Some("update") => Some("update"),
         Some("delete") | Some("remove") => Some("delete"),
         Some("clear") => Some("clear"),
+        // 只读的列表动作：老形态 {\"action\":\"list\"} 仍要能被识别（TUI 详情面板靠它渲染
+        // “list all”，工具侧也不该把它当未知动作拒掉）。
+        Some("list") => Some("list"),
         Some(_) => None,
         None => infer_action_kind(v),
     }
@@ -258,7 +262,7 @@ fn infer_action_kind(v: &serde_json::Value) -> Option<&'static str> {
 fn unknown_or_uninferable_action(v: &serde_json::Value) -> String {
     if let Some(other) = explicit_action(v) {
         format!(
-            "`action` must be `add`, `insert`, `update`, `delete`/`remove`, or `clear` (got `{other}`). Example: {{\"action\": \"add\", \"content\": \"Task text\"}}."
+            "`action` must be `add`, `insert`, `update`, `delete`/`remove`, `clear`, or `list` (got `{other}`). Example: {{\"action\": \"add\", \"content\": \"Task text\"}}."
         )
     } else {
         "could not infer `action` from fields. Use {content} to add, {content,position} to insert, {id,status} or {id,content} to update, {id} to delete. `clear` always needs action=\"clear\"".to_string()
@@ -305,6 +309,14 @@ fn validate_actions_mix(arr: &[serde_json::Value]) -> Result<(), String> {
     {
         return Err(
             "todowrite: `clear` can only be batched with `add` and/or `update` (`clear` runs first)."
+                .into(),
+        );
+    }
+    // `list` is read-only: it travels alone, so a batch can never imply a mutation it did
+    // not ask for and the fold can treat it as a pure no-op.
+    if has("list") && (kinds.len() > 1 || arr.len() > 1) {
+        return Err(
+            "todowrite: `list` is read-only and must be the only action (it cannot be batched)."
                 .into(),
         );
     }
@@ -387,10 +399,6 @@ fn upsert_todo(
     idx + 1
 }
 
-/// A non-empty list whose every item is `completed` is a closed plan.
-/// The next `add` starts a new plan at id 1 instead of appending as 7,8,9…
-/// (models often skip `clear` when pivoting). An in-progress / pending list
-/// is left alone — that is still the current task.
 fn maybe_auto_clear_finished(list: &mut Vec<TodoItem>) {
     if !list.is_empty() && list.iter().all(|t| t.status == TodoStatus::Completed) {
         list.clear();
@@ -457,18 +465,12 @@ fn apply_actions_batch(
         return Ok(tmp);
     }
 
-    // Length the model last saw: after explicit `clear`, else the incoming list
-    // (auto-clear of a closed plan has not run yet).
+    // Length the model last saw: after explicit `clear`, else the incoming list.
     let visible_len = tmp.len();
 
-    // Adds first: append-only, existing 1..n stay put. A finished list (every
-    // item completed) is treated as a closed plan — auto-clear so a new batch
-    // of adds restarts at id 1 instead of appending as 7,8,9…
-    let mut add_landings = Vec::new();
     let has_add = arr.iter().any(|item| action_kind(item) == Some("add"));
     // `{id, content, status}` is inferred as update, so a new-plan payload on an
-    // empty/closed list would otherwise die with "unknown task id 1 (list has 0
-    // items)". Promote those content-bearing updates to adds, sorted by id.
+    // empty list would otherwise die with "unknown task id 1 (list has 0 items)".
     let seed_updates = if list_is_seedable(&tmp) && !has_add {
         let mut v: Vec<&serde_json::Value> = arr
             .iter()
@@ -479,8 +481,31 @@ fn apply_actions_batch(
     } else {
         Vec::new()
     };
+
+    let mut add_landings = Vec::new();
+    let has_add = arr.iter().any(|item| action_kind(item) == Some("add"));
+    // `{id, content, status}` is inferred as update, so a new-plan payload on an
+    // empty list would otherwise die with "unknown task id 1 (list has 0 items)".
+    let seed_updates = if list_is_seedable(&tmp) && !has_add {
+        let mut v: Vec<&serde_json::Value> = arr
+            .iter()
+            .filter(|item| action_kind(item) == Some("update") && item_has_content(item))
+            .collect();
+        v.sort_by_key(|item| json_id(item).unwrap_or(u64::MAX));
+        v
+    } else {
+        Vec::new()
+    };
+
     if has_add || !seed_updates.is_empty() {
-        maybe_auto_clear_finished(&mut tmp);
+        // 关键修复：绝不能仅仅因为 add_count >= 2 就把还在进行中的任务列表暴力清空！
+        // 只有当已有列表此前已经全部完成（全是 Completed），且当前没有对未完成任务的引用时，才允许清除已闭环的旧计划。
+        // 若列表中仍有 pending 或 in_progress 的任务，100% 严格追加，绝不清空！
+        let is_unfinished = tmp.iter().any(|t| t.status != TodoStatus::Completed);
+        if !is_unfinished {
+            maybe_auto_clear_finished(&mut tmp);
+        }
+
         if has_add {
             for item in arr {
                 if action_kind(item) == Some("add") {
@@ -493,9 +518,7 @@ fn apply_actions_batch(
         }
     }
 
-    // Inserts next (id-shifting / re-rank), so later updates use post-insert ids.
-    // `position` is the 1-based slot on the list *before this batch's inserts*
-    // (after any adds). Apply high→low so two original positions don't scramble.
+    // 2. Inserts next (id-shifting / re-rank)
     let mut inserts: Vec<&serde_json::Value> = arr
         .iter()
         .filter(|a| action_kind(a) == Some("insert"))
@@ -509,8 +532,7 @@ fn apply_actions_batch(
         apply_insert(&mut tmp, item)?;
     }
 
-    // Updates last, against the list after add/insert. Array order does not
-    // matter except when two updates set `in_progress` (later one wins).
+    // 3. Updates last, against the list after add/insert.
     for item in arr {
         if action_kind(item) == Some("update") {
             if seed_updates.iter().any(|s| std::ptr::eq(*s, item)) {
@@ -519,6 +541,7 @@ fn apply_actions_batch(
             apply_update(&mut tmp, item, visible_len, &add_landings)?;
         }
     }
+
     Ok(tmp)
 }
 
@@ -676,8 +699,24 @@ fn try_apply_one_action(list: &mut Vec<TodoItem>, v: &serde_json::Value) -> Resu
             list.clear();
             Ok(())
         }
+        // Read-only: the derived list must fold a `list` call as a pure no-op.
+        Some("list") => Ok(()),
         _ => Err(format!("todowrite: {}", unknown_or_uninferable_action(v))),
     }
+}
+
+pub fn is_batch_plan_establishment(args: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(args) else {
+        return false;
+    };
+    if let Some(arr) = v.get("actions").and_then(|a| a.as_array()) {
+        let add_count = arr
+            .iter()
+            .filter(|item| action_kind(item) == Some("add"))
+            .count();
+        return add_count >= 2;
+    }
+    false
 }
 
 /// Whether a todo call's args are the FULL-LIST (re)plan shape (`{"todos":[…]}`) vs the
@@ -721,9 +760,19 @@ pub fn reduce_todos<'a>(calls: impl IntoIterator<Item = (&'a str, &'a str)>) -> 
         .into_iter()
         .filter(|(n, _)| is_todo_tool_name(n))
         .collect();
-    let baseline = calls.iter().rposition(|(_, a)| is_todo_plan(a));
+    let baseline = calls
+        .iter()
+        .rposition(|(_, a)| is_todo_plan(a) || is_batch_plan_establishment(a));
     let (mut list, start) = match baseline {
-        Some(i) => (parse_todos(calls[i].1).unwrap_or_default(), i + 1),
+        Some(i) => {
+            if is_todo_plan(calls[i].1) {
+                (parse_todos(calls[i].1).unwrap_or_default(), i + 1)
+            } else {
+                let mut l = Vec::new();
+                apply_todo_action(&mut l, calls[i].1);
+                (l, i + 1)
+            }
+        }
         None => (Vec::new(), 0),
     };
     for (_, a) in &calls[start..] {
@@ -904,14 +953,14 @@ impl Tool for TodoTool {
             "properties": {
                 "actions": {
                     "type": "array",
-                    "description": "Array of task action objects to apply in sequence. Each item specifies an action ('add', 'insert', 'update', 'delete', 'remove', 'clear').",
+                    "description": "Array of task action objects to apply in sequence. Each item specifies an action ('add', 'insert', 'update', 'delete', 'remove', 'clear'); the read-only 'list' must be the only item.",
                     "items": {
                         "type": "object",
                         "properties": {
                             "action": {
                                 "type": "string",
-                                "enum": ["add", "insert", "update", "delete", "clear"],
-                                "description": "Optional when fields uniquely determine the op: {content}→add, {content,position}→insert, {id,status|content}→update, {id}→delete. Required for clear. Explicit value always wins."
+                                "enum": ["add", "insert", "update", "delete", "remove", "clear", "list"],
+                                "description": "Optional when fields uniquely determine the op: {content}→add, {content,position}→insert, {id,status|content}→update, {id}→delete. Required for `clear` and for the read-only `list` (returns the current tasks). Explicit value always wins."
                             },
                             "id": {
                                 "type": "integer",
@@ -965,6 +1014,19 @@ impl Tool for TodoTool {
         if v.get("actions").is_none() && v.get("todos").is_none() && action_kind(&v).is_some() {
             let single = v.clone();
             v = json!({ "actions": [single] });
+        }
+
+        // Read-only `list`: echo the CURRENT list and touch nothing. The name predates the
+        // `actions` contract and is kept as a first-class read (old transcripts and models still
+        // ask for it), so it answers with the numbered list instead of the mutation summary.
+        if matches!(
+            v.get("actions").and_then(|a| a.as_array()).map(Vec::as_slice),
+            Some([only]) if action_kind(only) == Some("list")
+        ) {
+            return ok(format!(
+                "Current task list:\n\n{}",
+                render_todos_numbered(&list, false)
+            ));
         }
 
         if v.get("actions").and_then(|a| a.as_array()).is_none() {
@@ -1081,6 +1143,10 @@ fn summarize_todo_action(v: &serde_json::Value) -> Result<String, String> {
             _ => Err("`delete`/`remove` needs a valid `id` (1-based task number). Example: {\"action\": \"delete\", \"id\": 1}".into()),
         },
         Some("clear") => Ok("all tasks cleared".to_string()),
+        // Reachable only through a direct call: `execute` short-circuits a lone `list` before
+        // the summary runs and batching is rejected above. Kept total so a read-only kind can
+        // never surface as "unknown action".
+        Some("list") => Ok("listed the current tasks".to_string()),
         _ => Err(unknown_or_uninferable_action(v)),
     }
 }
@@ -1433,6 +1499,54 @@ mod tests {
             .await;
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("task"), "{}", r.content);
+    }
+
+    #[tokio::test]
+    async fn list_action_echoes_the_current_tasks_without_mutating_them() {
+        let t = TodoTool::new();
+        let seeded = t
+            .execute(
+                r#"{"actions":[{"action":"add","content":"alpha"},{"action":"add","content":"beta"}]}"#,
+                &ctx(),
+            )
+            .await;
+        assert!(!seeded.is_error, "{}", seeded.content);
+
+        // Both the bare legacy shape and the explicit `actions[]` shape answer with the list.
+        let bare = t.execute(r#"{"action":"list"}"#, &ctx()).await;
+        assert!(!bare.is_error, "list must not error: {}", bare.content);
+        assert!(
+            bare.content.contains("alpha") && bare.content.contains("beta"),
+            "{}",
+            bare.content
+        );
+        let explicit = t
+            .execute(r#"{"actions":[{"action":"list"}]}"#, &ctx())
+            .await;
+        assert_eq!(
+            explicit.content, bare.content,
+            "list must not mutate the list"
+        );
+
+        // The fold sees the same no-op: a `list` call never changes derived state.
+        let mut folded =
+            parse_todos(r#"{"todos":[{"content":"kept","status":"pending"}]}"#).unwrap();
+        let before = folded.clone();
+        apply_todo_action(&mut folded, r#"{"action":"list"}"#);
+        assert_eq!(folded, before);
+    }
+
+    #[tokio::test]
+    async fn list_action_rejects_being_batched_with_a_mutation() {
+        let t = TodoTool::new();
+        let r = t
+            .execute(
+                r#"{"actions":[{"action":"list"},{"action":"add","content":"x"}]}"#,
+                &ctx(),
+            )
+            .await;
+        assert!(r.is_error, "{}", r.content);
+        assert!(r.content.contains("read-only"), "{}", r.content);
     }
 
     #[tokio::test]
@@ -1809,6 +1923,41 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].content, "导出Excel");
         assert_eq!(list[0].status, TodoStatus::InProgress);
+    }
+
+    #[test]
+    fn update_and_multiple_adds_on_in_progress_list_does_not_clear() {
+        let mut list = (1..=6)
+            .map(|i| TodoItem {
+                content: format!("task-{i}"),
+                status: if i == 6 {
+                    TodoStatus::InProgress
+                } else {
+                    TodoStatus::Completed
+                },
+            })
+            .collect::<Vec<_>>();
+
+        apply_todo_action(
+            &mut list,
+            r#"{"actions":[
+                {"action":"update","id":6,"status":"completed"},
+                {"action":"add","content":"task-7"},
+                {"action":"add","content":"task-8"},
+                {"action":"add","content":"task-9"},
+                {"action":"add","content":"task-10"}
+            ]}"#,
+        );
+
+        assert_eq!(
+            list.len(),
+            10,
+            "list must preserve original 6 tasks and append 4 new ones"
+        );
+        assert_eq!(list[5].content, "task-6");
+        assert_eq!(list[5].status, TodoStatus::Completed);
+        assert_eq!(list[6].content, "task-7");
+        assert_eq!(list[9].content, "task-10");
     }
 
     #[test]
@@ -2249,6 +2398,16 @@ mod tests {
         assert_eq!(v["actions"].as_array().unwrap().len(), 2);
         assert_eq!(v["actions"][0]["content"], "one");
         assert_eq!(v["actions"][1]["id"], 1);
+    }
+
+    #[test]
+    fn merge_todo_write_args_keeps_a_read_only_list_call_independent() {
+        // `list` must never ride inside a merged batch: the mix is illegal, so the merge
+        // declines and the kernel runs the two calls in order (list echoes, add applies).
+        let list = r#"{"action":"list"}"#;
+        let add = r#"{"action":"add","content":"one"}"#;
+        assert!(merge_todo_write_args(&[list, add]).is_none());
+        assert!(merge_todo_write_args(&[list, list]).is_none());
     }
 
     #[test]

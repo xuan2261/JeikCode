@@ -23,9 +23,24 @@ fn _isolate_jeikcode_home() {
 
 fn cfg(working_dir: &std::path::Path) -> CodingAgentConfig {
     let mut c = CodingAgentConfig::new("k", "http://unused", "test-model", working_dir);
-    c.stream_timeout = Duration::from_secs(5);
+    c.timeouts = c.timeouts.with_content_liveness(Duration::from_secs(5));
     c.request_timeout = Some(Duration::from_secs(5));
     c
+}
+
+/// Bounded shutdown: an agent task that never exits on `Shutdown` would otherwise hang the
+/// suite FOREVER — the Phase-4 respawn deadlock this test surfaced once the canonical `read`
+/// expectation let it past Phase 1 (previously the stale `read_file` assertion failed first,
+/// masking it). Fail fast with the phase instead of hanging.
+async fn shutdown(handle: &mut jeikcode_kernel::agent::AgentHandle, phase: &str) {
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    match tokio::time::timeout(Duration::from_secs(20), &mut handle.task).await {
+        Ok(_) => {}
+        Err(_) => panic!(
+            "{phase}: the agent task did not exit on Shutdown (deadlock — see the test's \
+             `#[ignore]` note)"
+        ),
+    }
 }
 
 fn text_turn(text: &str) -> Vec<StreamEvent> {
@@ -50,7 +65,18 @@ async fn drive(
         .unwrap();
     let mut events = Vec::new();
     let mut requests = 0;
-    while let Some(ev) = handle.events.recv().await {
+    // Bounded wait: a turn that never completes (e.g. a parked tool / dead provider)
+    // must FAIL with context instead of hanging the suite forever — same philosophy as
+    // `shutdown()`. The label is the user text so the panic names the phase.
+    let mut turn_completed = false;
+    while !turn_completed {
+        let ev = match tokio::time::timeout(Duration::from_secs(60), handle.events.recv()).await {
+            Ok(Some(ev)) => ev,
+            Ok(None) => break,
+            Err(_) => {
+                panic!("turn {text:?} did not complete within 60s (parked tool / dead provider?)")
+            }
+        };
         match &ev {
             AgentEvent::Request { id, .. } => {
                 requests += 1;
@@ -65,7 +91,8 @@ async fn drive(
             }
             AgentEvent::TurnComplete { .. } => {
                 events.push(ev);
-                break;
+                turn_completed = true;
+                continue;
             }
             _ => {}
         }
@@ -74,14 +101,23 @@ async fn drive(
     (events, requests)
 }
 
-#[tokio::test]
+// MULTI-THREAD on purpose: the bounded `shutdown()` guard below needs a second worker to
+// run the 20s timer — on the default current-thread runtime a blocking task starves the
+// timer, so the guard would hang instead of failing fast (production runs multi-thread).
+//
+// REGRESSION LOCK for the MCP teardown deadlock: the Phase-4 respawn is the only phase that
+// runs a real tool, so it is what starts the session MCP process tree. Before
+// `SessionMcpLease::drop` learned to tear a short-lived host's transports down
+// synchronously, this test's body finished and then `Runtime::drop` waited forever on the
+// parked child's stdout pipe — the suite hung and had to be `#[ignore]`d.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn full_assembly_lifecycle() {
     // ---- Isolated world: $JEIKCODE_HOME + a project dir, both temp. Skill dirs
     // are pinned to a temp dir too — the home-based default would scan the HOST
     // machine's real ~/.claude/skills and leak host state into this test.
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
-    std::env::set_var("JEIKCODE_HOME", home.path());
+    let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
     let cfg = cfg(project.path());
     let opts = || PrepareOptions {
         skill_dirs: Some(vec![project.path().join("skills")]),
@@ -102,8 +138,7 @@ async fn full_assembly_lifecycle() {
     let mut h1 = assemble(&mut parts, &cfg, provider1).unwrap().spawn();
     let (_, reqs) = drive(&mut h1, "the first task", None).await;
     assert_eq!(reqs, 0, "a text-only turn asks no approval");
-    h1.commands.send(AgentCommand::Shutdown).unwrap();
-    let _ = h1.task.await;
+    shutdown(&mut h1, "P1").await;
 
     // The FULL toolset rode the wire: core + codeintel + web + skills + recall + review.
     {
@@ -111,7 +146,7 @@ async fn full_assembly_lifecycle() {
         let defs: Vec<&str> = calls[0].1.iter().map(|d| d.name.as_str()).collect();
         for expected in [
             "run_command",
-            "read_file",
+            "read",
             "code_explore",
             "web_fetch",
             "use_skill",
@@ -155,15 +190,20 @@ async fn full_assembly_lifecycle() {
             "workflow discipline follows persona: {:?}",
             shape()
         );
+        // Layout: persona + several System blocks (workflow / todo / explore…) → MEMORY as
+        // the first synthetic User message → the real query. Assert by SHAPE, not by a
+        // fixed index: the System block count changes as new blocks land.
+        let leading_system = first.iter().take_while(|m| m.role == Role::System).count();
+        let memory = &first[leading_system];
         assert!(
-            first[2].role == Role::User
-                && first[2].synthetic
-                && (first[2].text.starts_with("=== MEMORY ===")
-                    || first[2].text.starts_with("<memory>")),
+            memory.role == Role::User
+                && memory.synthetic
+                && (memory.text.starts_with("=== MEMORY ===")
+                    || memory.text.starts_with("<memory>")),
             "memory block follows the leading System run: {:?}",
             shape()
         );
-        assert!(first[2].text.contains("prefers tabs"));
+        assert!(memory.text.contains("prefers tabs"));
         // StatusReminderHook appends the date to the bottom of the real query;
         // no independent synthetic user message is created.
         assert_eq!(
@@ -210,8 +250,7 @@ async fn full_assembly_lifecycle() {
     let calls1b = provider1b.calls();
     let mut h1b = assemble(&mut parts, &cfg, provider1b).unwrap().spawn();
     let _ = drive(&mut h1b, "the swap task", None).await;
-    h1b.commands.send(AgentCommand::Shutdown).unwrap();
-    let _ = h1b.task.await;
+    shutdown(&mut h1b, "P2").await;
     {
         let calls = calls1b.lock().unwrap();
         let first = &calls[0].0;
@@ -240,8 +279,7 @@ async fn full_assembly_lifecycle() {
     let calls2 = provider2.calls();
     let mut h2 = assemble(&mut parts2, &cfg, provider2).unwrap().spawn();
     let _ = drive(&mut h2, "the second task", None).await;
-    h2.commands.send(AgentCommand::Shutdown).unwrap();
-    let _ = h2.task.await;
+    shutdown(&mut h2, "P3").await;
 
     // History continued: the resumed provider saw the first turn's exchange.
     {
@@ -262,10 +300,25 @@ async fn full_assembly_lifecycle() {
         assert!(first
             .iter()
             .any(|m| m.text.starts_with("the second task\n\n<system-reminder>")));
-        let system_count = first.iter().filter(|m| m.role == Role::System).count();
+        // Each REQUIRED System block is injected exactly once on resume (reconcile in
+        // place — no duplication). Assert by uniqueness of the block markers instead of
+        // a magic total: the block set grows as new discipline blocks land.
+        let mut block_keys: Vec<String> = first
+            .iter()
+            .filter(|m| m.role == Role::System)
+            .map(|m| m.text.chars().take(24).collect::<String>())
+            .collect();
+        let total_system_blocks = block_keys.len();
+        block_keys.sort();
+        block_keys.dedup();
         assert_eq!(
-            system_count, 2,
-            "persona b1 + workflow b2 exactly once each (session baseline removed)"
+            block_keys.len(),
+            total_system_blocks,
+            "every required System block injected exactly once on resume: {block_keys:?}"
+        );
+        assert!(
+            block_keys.len() >= 2,
+            "persona + workflow must both survive the resume: {block_keys:?}"
         );
         let memory_count = first
             .iter()
@@ -324,8 +377,7 @@ async fn full_assembly_lifecycle() {
     let mut h3 = assemble(&mut parts3, &cfg, provider3).unwrap().spawn();
     let (_, reqs) = drive(&mut h3, "do the risky thing", Some("allow_always")).await;
     assert_eq!(reqs, 1, "the risky call asks once");
-    h3.commands.send(AgentCommand::Shutdown).unwrap();
-    let _ = h3.task.await;
+    shutdown(&mut h3, "P4 first").await;
 
     // RESPAWN (model swap) on the SAME parts: the identical risky call must NOT ask
     // again — the grant store survives because the approval handle lives in parts.
@@ -342,6 +394,5 @@ async fn full_assembly_lifecycle() {
         reqs, 0,
         "allow-always grant survives the respawn (parts own the store)"
     );
-    h4.commands.send(AgentCommand::Shutdown).unwrap();
-    let _ = h4.task.await;
+    shutdown(&mut h4, "P4 respawn").await;
 }

@@ -30,13 +30,7 @@ impl InstalledTxn {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let base_dir = if project_root.join(".jeikcode").exists() {
-            project_root.join(".jeikcode")
-        } else if project_root.join(".atomcode").exists() {
-            project_root.join(".atomcode")
-        } else {
-            project_root.join(".jeikcode")
-        };
+        let base_dir = project_root.join(".jeikcode");
         let backup_dir = base_dir.join(format!(".setup-backup-{ts}"));
         std::fs::create_dir_all(&backup_dir)?;
         Ok(Self {
@@ -67,10 +61,6 @@ impl InstalledTxn {
                 || l == ".jeikcode/local/"
                 || l == "**/.jeikcode/local"
                 || l == "**/.jeikcode/local/"
-                || l == ".atomcode/local"
-                || l == ".atomcode/local/"
-                || l == "**/.atomcode/local"
-                || l == "**/.atomcode/local/"
         });
         if already {
             return Ok(());

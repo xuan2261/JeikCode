@@ -30,6 +30,25 @@ pub const READ_BYTE_BUDGET: usize = 65536;
 pub const DEFAULT_READ_LIMIT: usize = READ_LIMIT_DEFAULT;
 pub const MAX_READ_OUTPUT_BYTES: usize = READ_BYTE_BUDGET;
 
+/// Canonical advertised name of the file-read tool. Only THIS name reaches the tool defs;
+/// the legacy name below survives purely as a dispatch alias (old transcripts, gateways).
+pub const READ_TOOL_NAME: &str = "read";
+/// Legacy file-read name, kept ONLY as a registry dispatch alias (`Tool::aliases`) — never
+/// advertised to the model.
+pub const READ_TOOL_ALIAS: &str = "read_file";
+
+/// True when `name` denotes the file-read tool in EITHER its canonical or legacy form.
+///
+/// Policies that special-case file reads (e.g. `StubCompaction`'s "never stub file contents"
+/// exemption, which exists because stubbing them makes the model falsely confident and
+/// re-edit) MUST call this instead of comparing a literal: a hard-coded legacy string
+/// silently stops matching the moment the tool is renamed — the `read_file` → `read` rename
+/// already broke that exemption once.
+#[inline]
+pub fn is_file_read_tool(name: &str) -> bool {
+    name == READ_TOOL_NAME || name == READ_TOOL_ALIAS
+}
+
 /// Per-line display cap (very long minified lines are truncated with a marker).
 const MAX_LINE_LEN: usize = 2000;
 
@@ -418,10 +437,10 @@ where
 #[async_trait]
 impl Tool for ReadFileTool {
     fn name(&self) -> &str {
-        "read"
+        READ_TOOL_NAME
     }
     fn aliases(&self) -> &'static [&'static str] {
-        &["read_file"]
+        &[READ_TOOL_ALIAS]
     }
     fn description(&self) -> &str {
         "Read file content generously (reading several hundred lines or the whole file in one call is safe and expected), view images, or list directories."

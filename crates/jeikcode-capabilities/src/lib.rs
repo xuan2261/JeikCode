@@ -60,6 +60,12 @@ pub mod cc_hooks;
 /// Kernel-only deps, so it is always available regardless of capability features.
 pub mod compaction;
 
+/// Unified capability enable/disable surface for MCP servers AND skills: one
+/// [`control::CapItem`] model with GLOBAL + PROJECT scopes, backed by each family's
+/// standard config file. Compiled when either family is present.
+#[cfg(any(feature = "mcp", feature = "skills"))]
+pub mod control;
+
 /// Universal tool parameter schema sanitizer (MCP protocol leaks, bare objects, header cleanup).
 /// Serde-only deps, so it is always available regardless of capability features.
 pub mod schema_sanitizer;
@@ -74,6 +80,7 @@ pub mod schema_sanitizer;
     feature = "memory",
     feature = "provider",
     feature = "tools",
+    feature = "skills",
     feature = "codeintel"
 ))]
 pub(crate) mod paths;
@@ -102,6 +109,15 @@ pub(crate) mod proxy;
 /// model-supplied paths resolve identically across both — see [`pathutil`].
 /// Free of any feature `cfg` because `codeintel` is independent of `tools`.
 pub(crate) mod pathutil;
+
+/// ONE source for the special directories JeikCode exports to shells and the
+/// `$VAR` expansion of model-supplied paths: `tools::bash` injects
+/// `$TMPDIR`/`$TMP`/`$TEMP`/`$DESKTOP` into every shell child and
+/// `pathutil::resolve_path` expands the same names in tool paths, so the two can
+/// no longer drift (on Windows the desktop is registry-backed — see
+/// [`special_dirs::desktop_dir`]). Ungated (`dirs` is a baseline dependency); the
+/// daemon reuses it for its shortcut list.
+pub mod special_dirs;
 
 /// Structured tool-argument errors + path-not-found "Did you mean?" enrichment.
 /// Shared by `tools` and `codeintel` so model feedback is consistent.

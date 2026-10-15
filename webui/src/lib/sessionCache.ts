@@ -8,7 +8,9 @@ export interface CachedSessionData {
   sessionId: string;
   projectHash: string;
   messages: any[];
-  todos?: any[];
+  todos?: any[] | null;
+  turns?: any[] | null;
+  tokenUsage?: any | null;
   timestamp: number;
   mtime_ms?: number;
 }
@@ -131,14 +133,18 @@ export async function saveSessionCache(
   projectHash: string,
   sessionId: string,
   messages: any[],
-  todos?: any[],
+  todos?: any[] | null,
   mtime_ms?: number,
+  turns?: any[] | null,
+  tokenUsage?: any | null,
 ): Promise<void> {
   const data: CachedSessionData = {
     sessionId,
     projectHash,
     messages,
-    todos,
+    todos: todos ?? undefined,
+    turns: turns ?? undefined,
+    tokenUsage: tokenUsage ?? undefined,
     timestamp: Date.now(),
     mtime_ms,
   };
@@ -163,19 +169,45 @@ export async function saveSessionCache(
 }
 
 /**
+ * 删除某会话的本地缓存（L1 内存 + L2 IndexedDB）。
+ *
+ * 会话被删除（本端操作或跨实例推送）后必须立即失效：否则侧栏/正文一旦
+ * 再次读到旧缓存，幽灵会话就会复活到下一次冷启动重拉为止。
+ */
+export async function deleteSessionCache(
+  projectHash: string,
+  sessionId: string,
+): Promise<void> {
+  const key = makeKey(projectHash, sessionId);
+  memoryCache.delete(key);
+  const db = await getDB();
+  if (!db) return;
+  try {
+    const tx = db.transaction(STORE_SESSIONS, 'readwrite');
+    tx.objectStore(STORE_SESSIONS).delete(key);
+  } catch (err) {
+    console.warn('[SessionCache] Failed to delete from IndexedDB:', err);
+  }
+}
+
+/**
  * 实时向缓存中追加新消息 (反向增量注入，保证后台和异地实例状态时刻新鲜)
  */
 export function appendMessageToSessionCache(
   projectHash: string,
   sessionId: string,
   message: any,
+  turns?: any[],
+  tokenUsage?: any,
 ): void {
   const current = getMemorySession(projectHash, sessionId);
   if (current) {
     current.messages.push(message);
+    if (turns) current.turns = turns;
+    if (tokenUsage) current.tokenUsage = tokenUsage;
     current.timestamp = Date.now();
     // 异步排队更新 IndexedDB
-    void saveSessionCache(projectHash, sessionId, current.messages, current.todos, current.mtime_ms);
+    void saveSessionCache(projectHash, sessionId, current.messages, current.todos, current.mtime_ms, current.turns, current.tokenUsage);
   }
 }
 

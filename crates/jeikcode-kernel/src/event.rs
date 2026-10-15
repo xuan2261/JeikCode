@@ -19,6 +19,12 @@ pub struct SteeredInput {
     pub text: String,
     #[serde(default)]
     pub images: Vec<ImageContent>,
+    /// Stable identity of the STORED user message this input became. Lets a
+    /// client bind its optimistic steer bubble to the same id the disk
+    /// snapshot/transcript carries, so id-based merges (refresh, session
+    /// switch, reconnect replay) never fall back to text heuristics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
 }
 
 /// WHY a turn ended (FAILURE PERCEPTION). Carried by the terminal
@@ -144,6 +150,23 @@ pub struct ToolBatchCall {
 pub enum AgentEvent {
     /// A turn began (perception granularity).
     TurnStarted,
+    /// The model has begun an assistant message for THIS turn (one per round).
+    /// Marks a fresh assistant-message boundary and carries its stable
+    /// `message_id` so a driver can tag subsequent text/reasoning/tool deltas
+    /// with the SAME identity the persisted `Message` will carry. Purely a
+    /// boundary marker — an existing driver that ignores it is unaffected.
+    AssistantMessage {
+        message_id: String,
+    },
+    /// The REAL user prompt this turn runs on, announced at the single push
+    /// seam with its stored `message_id` and its 0-based `turn_ordinal` (rank
+    /// among real, non-synthetic, non-empty user prompts). Purely a boundary
+    /// marker — a driver that ignores it is unaffected; a client uses it to
+    /// bind its optimistic first-prompt bubble to the stored identity.
+    UserMessage {
+        message_id: String,
+        turn_ordinal: u32,
+    },
     TextDelta(String),
     /// A STREAMING fragment of a tool call the model is still emitting — live display of
     /// the tool name / arguments as they arrive. `index` groups fragments of the same
@@ -371,6 +394,7 @@ mod tests {
             inputs: vec![SteeredInput {
                 text: "follow up".into(),
                 images: Vec::new(),
+                message_id: None,
             }],
         };
         let json = serde_json::to_string(&event).unwrap();
@@ -383,6 +407,7 @@ mod tests {
             } if inputs == vec![SteeredInput {
                 text: "follow up".into(),
                 images: Vec::new(),
+                message_id: None,
             }]
         ));
     }

@@ -29,7 +29,7 @@ precedence:
     - Content enclosed in XML tags represents current environment, status, system reminders, and working constraints, and constitutes SYSTEM PROVISIONS.
     - Rules, constraints, and requirements under <project_instructions> (such as `AGENTS.md`, `JEIKCODE.md`, `CLAUDE.md`, `rules.md`, `glossary.md`, `dbwords.md`, etc.) and <memory> constitute USER PROVISIONS.
 
-    Global user provisions reside under ~/.jeikcode/ (or legacy ~/.atomcode/), and project-level user provisions reside under ./, ./.jeikcode/, or ./.atomcode/. User provisions take effect immediately upon modification and hold the HIGHEST EXECUTION PRECEDENCE. System provisions cannot be modified.
+    Global user provisions reside under ~/.jeikcode/, and project-level user provisions reside under ./ or ./.jeikcode/. User provisions take effect immediately upon modification and hold the HIGHEST EXECUTION PRECEDENCE. System provisions cannot be modified.
 
     When user provisions do not exist, strictly adhere to system provisions.
     When user provisions exist, strictly prioritize user provisions. Comply with both system provisions and user provisions where they do not conflict; when conflicts arise, unconditionally obey user provisions (except core safety gates, destructive operation confirmation gates, product identity, and configured model code, which are non-overridable).
@@ -45,4 +45,6 @@ environment:
     - Platform: {os_platform} (Command habit: {command_habit})
     - Project working directory: {working_dir}
     - Git branch: {git_branch}
+    - Temp files: use `"$TMPDIR"` instead of a hardcoded `/tmp` — it works for shell-internal paths AND as an ARGUMENT to native Windows programs (python / node / curl / …); `"$TMPDIR_WIN"` is the same path under a second name for nested non-bash shells.
+    - Desktop: use `"$DESKTOP"` instead of assuming `~/Desktop` — it honors a relocated / redirected desktop; `"$DESKTOP_WIN"` is the equivalent alias.
     </environment>

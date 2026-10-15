@@ -232,8 +232,8 @@ eager = "auto"                  # auto | preferred | always
 [tools.bash]
 default_timeout_secs = 120      # 仅 !cmd 默认墙钟
 max_timeout_secs = 1800         # 所有 spawn 命令的工具共用硬寿命（秒）
-silent_kill_secs = 60           # 第一档探测空闲
-second_levell_secs = 120        # 第二档：有输出后的宽限 / 升档后空闲。磁盘/网络 IO 不自动升长任务，二轮后交给模型杀或临时升级
+silent_kill_secs = 60           # 短命令复查间隔：到点只体检（交互指纹/常驻服务才杀；安静等待继续跑）
+second_levell_secs = 120        # 自动升档后的空闲窗口
 
 [tools.timeouts]
 search_secs = 72                # grep / glob（Grok WSL 60s +20%）
@@ -250,7 +250,8 @@ fs_gate_secs = 36               # 权限门 canonicalize（Grok 30s +20%）
 idle_ttl_secs = 600             # 默认 10 分钟
 
 [tools.tool_output]
-max_bytes = 65536               # 输出折叠阈值（64KiB）
+max_bytes = 65536               # 通用压缩阈值（64KiB；0 禁用）
+terminal_max_bytes = 24576      # 终端更早的压缩线（24KiB；0 跟随 max_bytes）
 no_fold_tools = ["fetch_output", "code_explore", "web_fetch", "web_search"]
 
 # =============================================================================

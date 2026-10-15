@@ -152,7 +152,9 @@ pub async fn code(args: CodeArgs) -> Result<()> {
     let mut cfg = CodingAgentConfig::new(api_key, base_url, &model, &dir);
     cfg.preferred_language = selected.language;
     cfg.context_window = entry.and_then(|e| e.context_window).unwrap_or(128_000);
-    cfg.stream_timeout = std::time::Duration::from_secs(args.stream_timeout);
+    cfg.timeouts = cfg
+        .timeouts
+        .with_content_liveness(std::time::Duration::from_secs(args.stream_timeout));
     // Telemetry: the full host-loop instrumentation (turn-level TelemetryHook + tool
     // middleware + the review-slot MeteredProvider) lights up purely from setting this —
     // a disabled sink makes every emit a no-op. Flushed to disk on exit (below).

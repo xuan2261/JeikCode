@@ -1,7 +1,8 @@
 //! Cache-friendly history compaction — the v2 port of core's `collapse_committed`.
 //!
 //! Stubs OLD tool results in place (full output → a one-line summary), keeping the
-//! ACTIVE turn full and exempting `read_file`. It is the POLICY only: the kernel owns
+//! ACTIVE turn full and exempting file reads (`read`, plus the legacy `read_file` alias).
+//! It is the POLICY only: the kernel owns
 //! every invariant (sacred floor, net-loss guard, tool-call/result pairing repair,
 //! `cache_epoch` bump, and turn-boundary-only triggering) in
 //! [`Conversation::apply_plan`](jeikcode_kernel::message::Conversation::apply_plan) plus
@@ -30,6 +31,8 @@ use jeikcode_kernel::message::{
 use jeikcode_kernel::provider::{ChatOptions, LlmProvider};
 use jeikcode_kernel::stream::StreamEvent;
 
+use crate::tools::read::is_file_read_tool;
+
 /// Tool results at or below this byte size are left alone. A produced stub is far under
 /// this, which is what makes the rewrite MONOTONIC: re-running never re-stubs a stub.
 /// Mirrors core's `MIN_COLLAPSE_SIZE`.
@@ -41,14 +44,16 @@ pub struct StubCompaction {
     /// Keep this many most-recent turns FULL (`1` = only the active turn). A "turn"
     /// begins at a non-synthetic [`Role::User`] message.
     keep_recent_turns: usize,
-    /// Never stub `read_file` results — compacting them makes the model "falsely
+    /// Never stub file-read results — compacting them makes the model "falsely
     /// confident" and re-edit the same file (core's 5–7 atomgr finding); keeping them
-    /// preserves line-number context for edit mode.
+    /// preserves line-number context for edit mode. Matches BOTH the canonical `read`
+    /// name and the legacy `read_file` alias (see [`is_file_read_tool`]: comparing a
+    /// literal silently drops the exemption on every rename).
     exempt_read_file: bool,
 }
 
 impl Default for StubCompaction {
-    /// The normal-path policy from core: keep only the active turn full, exempt read_file.
+    /// The normal-path policy from core: keep only the active turn full, exempt file reads.
     fn default() -> Self {
         Self {
             keep_recent_turns: 1,
@@ -89,7 +94,7 @@ impl CompactionStrategy for StubCompaction {
                 .and_then(|id| id_to_tool.get(id))
                 .map(String::as_str)
                 .unwrap_or("tool");
-            if self.exempt_read_file && tool == "read_file" {
+            if self.exempt_read_file && is_file_read_tool(tool) {
                 continue;
             }
             // Tool RESULT success = NOT is_error.

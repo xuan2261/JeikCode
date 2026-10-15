@@ -1,0 +1,21 @@
+# 编辑器 / 格式化器一侧的行尾与空白约定，与 .gitattributes 对齐。
+# VSCode / JetBrains / Vim / Emacs 等原生识别：保存即守规矩，不再产生行尾噪音。
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+[*.rs]
+indent_size = 4
+
+[*.{bat,cmd,ps1}]
+end_of_line = crlf
+
+[*.md]
+# Markdown 的行尾双空格是「硬换行」语义，不能裁剪
+trim_trailing_whitespace = false

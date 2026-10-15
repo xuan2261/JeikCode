@@ -13,17 +13,25 @@ fn unified_prompt_has_all_sections() {
     assert!(prompt.contains("TOOLS"), "Must have tool guide");
     assert!(prompt.contains("WHEN STUCK"), "Must have stuck section");
     assert!(prompt.contains("OUTPUT"), "Must have output guidelines");
-    assert!(prompt.contains("edit_file"), "Must mention edit_file");
-    assert!(prompt.contains("write_file"), "Must mention write_file");
+    assert!(
+        prompt.contains("`edit`"),
+        "Must mention the canonical edit tool"
+    );
+    assert!(
+        prompt.contains("`write`"),
+        "Must mention the canonical write tool"
+    );
 }
 
 #[test]
 fn unified_prompt_has_key_guidance() {
     let prompt = build_rules();
-    assert!(prompt.contains("edit_file"), "Must guide edit mode format");
+    assert!(prompt.contains("`edit`"), "Must guide edit mode format");
+    // Project-wide replacement now rides `edit`'s multi-hunk `edits` array — the former
+    // `global_search_replace` tool is purged.
     assert!(
-        prompt.contains("global_search_replace"),
-        "Must guide global search-replace editing"
+        prompt.contains("multi-hunk") && prompt.contains("edits:[{old_string,new_string}"),
+        "Must guide batch editing through the canonical `edit` multi-hunk array"
     );
     assert!(
         prompt.contains("never with `run_command`"),

@@ -27,15 +27,7 @@ pub struct SetupState {
 }
 
 pub fn state_path(project_root: &Path) -> PathBuf {
-    let jeik = project_root.join(".jeikcode");
-    if jeik.exists() {
-        return jeik.join(STATE_FILENAME);
-    }
-    let legacy_dir = project_root.join(".atomcode");
-    if legacy_dir.exists() {
-        return legacy_dir.join(STATE_FILENAME);
-    }
-    jeik.join(STATE_FILENAME)
+    project_root.join(".jeikcode").join(STATE_FILENAME)
 }
 
 pub fn load_setup_state(project_root: &Path) -> Option<SetupState> {

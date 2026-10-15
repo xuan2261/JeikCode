@@ -33,6 +33,15 @@ pub mod config;
 /// Transactional, cross-process-safe access to `config.toml`.
 pub mod store;
 
+/// Test-only isolation seam. Always compiled so INTEGRATION tests can use it too:
+/// dev-dependency features apply to the test target, not to the crate's own lib
+/// build that those integration tests link against — a feature-gated seam would
+/// silently do nothing there. Installing an override only ever happens in tests;
+/// production never calls it, so behavior is unchanged (and the resolved-once
+/// memo makes the check free after the first call).
+#[doc(hidden)]
+pub mod test_util;
+
 /// Pure parsers for OS system-proxy descriptions: Windows ProxyServer/ProxyOverride
 /// and macOS `scutil --proxy` output → normalized HTTP(S)_PROXY / NO_PROXY values.
 pub mod system_proxy;

@@ -157,6 +157,31 @@ pub enum StreamEvent {
     },
 }
 
+impl StreamEvent {
+    /// Thinking channel (live reasoning text or a signed block boundary).
+    pub fn is_thinking(&self) -> bool {
+        matches!(
+            self,
+            StreamEvent::Reasoning(_) | StreamEvent::ReasoningSignature { .. }
+        )
+    }
+
+    /// Visible model output: assistant text or a tool call.
+    pub fn is_visible_output(&self) -> bool {
+        matches!(
+            self,
+            StreamEvent::TextDelta(_)
+                | StreamEvent::ToolCall(_)
+                | StreamEvent::ToolCallDelta { .. }
+        )
+    }
+
+    /// Any model token that resets the content sliding window.
+    pub fn is_business_token(&self) -> bool {
+        self.is_thinking() || self.is_visible_output()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

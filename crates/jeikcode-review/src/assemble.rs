@@ -50,14 +50,7 @@ use std::sync::Arc;
 /// reviewer investigates and reports, it never mutates. (The diff itself is injected as
 /// the task by the caller, so the agent needs no shell to obtain it.)
 fn review_tool_names(no_web: bool, mount_graph: bool) -> Vec<&'static str> {
-    let mut names = vec![
-        "read_file",
-        "grep",
-        "glob",
-        "list_directory",
-        "ast_grep",
-        "report_finding",
-    ];
+    let mut names = vec!["read", "grep", "glob", "ast_grep", "report_finding"];
     // web_search is mounted by default; `no_web` drops it (the tool stays registered but
     // unmounted), so a blocked/unreachable web egress can't make the model's web_search
     // call abort the whole review.
@@ -216,7 +209,7 @@ fn mount_review_tools(
     skill_dirs: &[PathBuf],
 ) -> MountedTools {
     let mut reg = ToolRegistry::new();
-    register_coding_tools(&mut reg); // read_file/grep/glob/list_directory (+ write/edit/bash, unmounted)
+    register_coding_tools(&mut reg); // read/grep/glob (+ write/edit/run_command, unmounted)
     register_codeintel_tools(&mut reg); // registered always; mounted only when `mount_graph`
     reg.register(Arc::new(AstGrepTool));
     reg.register(Arc::new(WebSearchTool::new())); // registered always; mounted only when !no_web
@@ -503,12 +496,14 @@ mod tests {
         // The mounted names are read-only — no mutation tools.
         let names = review_tool_names(false, true);
         assert!(
-            names.contains(&"read_file")
+            names.contains(&"read")
                 && names.contains(&"report_finding")
                 && names.contains(&"ast_grep")
         );
         for forbidden in [
+            "write",
             "write_file",
+            "edit",
             "edit_file",
             "bash",
             "run_command",
@@ -536,14 +531,7 @@ mod tests {
             "no_web 应去掉 web_search"
         );
         // 其它只读工具仍在
-        for keep in [
-            "read_file",
-            "grep",
-            "glob",
-            "list_directory",
-            "ast_grep",
-            "report_finding",
-        ] {
+        for keep in ["read", "grep", "glob", "ast_grep", "report_finding"] {
             assert!(without_web.contains(&keep), "no_web 不应误伤 `{keep}`");
         }
     }
@@ -564,7 +552,7 @@ mod tests {
             "graph tools dropped when off"
         );
         // Base tools unaffected either way.
-        for keep in ["read_file", "grep", "report_finding"] {
+        for keep in ["read", "grep", "report_finding"] {
             assert!(
                 without_graph.contains(&keep),
                 "base tool `{keep}` must survive"

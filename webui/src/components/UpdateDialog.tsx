@@ -1,6 +1,25 @@
+import DOMPurify from 'dompurify';
 import { useState, useEffect, useRef } from 'preact/hooks';
-import { checkUpdate, executeUpdate, getUpdateStatus, UpdateCheckResponse, UpdateStatus } from '../api';
+import { checkUpdate, executeUpdate, getUpdateStatus, UpdateCheckResponse, UpdateStatus, UpdateVersionEntry } from '../api';
+import { copyTextToClipboard } from '../lib/clipboard';
+import { shouldReloadUpgradedPage } from '../lib/upgradeReload';
+import { Markdown } from './Markdown';
 import { useT } from '../settings';
+
+/** 边缘 Atom 的公告是 HTML；GitHub REST 兜底时仍是 Markdown。 */
+function looksLikeHtml(text: string): boolean {
+  return /<\/?[a-z][^>]*>/i.test(text);
+}
+
+function sanitizeNotesHtml(text: string): string {
+  return DOMPurify.sanitize(text, { ADD_ATTR: ['target', 'rel'] });
+}
+
+function notesPlainText(text: string): string {
+  if (!looksLikeHtml(text)) return text;
+  const doc = new DOMParser().parseFromString(sanitizeNotesHtml(text), 'text/html');
+  return (doc.body.textContent || text).replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+}
 
 const STORAGE_KEY_CHANNEL = 'jeikcode_update_channel';
 
@@ -24,14 +43,22 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
 
   const [channel, setChannel] = useState<'stable' | 'beta'>(getInitialChannel);
   const [info, setInfo] = useState<UpdateCheckResponse | null>(initialInfo);
+  const [selectedVersion, setSelectedVersion] = useState('');
+  const [notesOpen, setNotesOpen] = useState(false);
+  const [notesCopied, setNotesCopied] = useState<'idle' | 'ok' | 'fail'>('idle');
   const [isChecking, setIsChecking] = useState(false);
   const [checkError, setCheckError] = useState<string | null>(null);
 
   const [updating, setUpdating] = useState(false);
   const [status, setStatus] = useState<UpdateStatus | null>(null);
 
-  const isDesktop = info?.is_desktop ?? false;
+  const isDesktop = false;
   const isMounted = useRef(true);
+  const reloadStarted = useRef(false);
+  const sawInstallProgress = useRef(false);
+  const targetVersionRef = useRef('');
+  const currentVersionRef = useRef('');
+  const reloadAfterRestartRef = useRef<() => void>(() => {});
 
   useEffect(() => {
     isMounted.current = true;
@@ -48,6 +75,8 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
       const res = await checkUpdate(targetChannel);
       if (isMounted.current) {
         setInfo(res);
+        setSelectedVersion('');
+        setNotesOpen(false);
         if (onUpdateInfoChange) {
           onUpdateInfoChange(res);
         }
@@ -76,37 +105,111 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
     doCheckUpdate(channel);
   }, []);
 
-  // 轮询更新进度
+  // 轮询更新进度。进度变化不能拆掉这次轮询。
+  // 安装开始后，状态变为完成或服务重启，都走和「完成」按钮同一条刷新。
   useEffect(() => {
-    let timer: any = null;
-    if (updating) {
-      timer = setInterval(async () => {
-        try {
-          const s = await getUpdateStatus();
-          if (isMounted.current) {
-            setStatus(s);
-            if (s.status === 'done' || s.status === 'error') {
-              if (timer) clearInterval(timer);
-            }
-          }
-        } catch {
-          // ignore transient poll error
-        }
-      }, 500);
-    }
+    if (!updating) return;
+    let stopped = false;
+    let misses = 0;
+    const timer = window.setInterval(async () => {
+      if (stopped || reloadStarted.current) return;
+      try {
+        const s = await getUpdateStatus();
+        if (!isMounted.current || stopped) return;
+        misses = 0;
+        setStatus(s);
+        const progressed =
+          s.status === 'installing' ||
+          s.status === 'done' ||
+          (s.status === 'downloading' && (s.progress ?? 0) >= 90);
+        if (progressed) sawInstallProgress.current = true;
+        const restarted =
+          s.status === 'done' ||
+          (sawInstallProgress.current && (s.status === 'idle' || s.status === 'ready'));
+        if (!restarted) return;
+        stopped = true;
+        window.clearInterval(timer);
+        reloadAfterRestartRef.current();
+      } catch {
+        misses += 1;
+        if (!sawInstallProgress.current || misses < 3 || stopped) return;
+        stopped = true;
+        window.clearInterval(timer);
+        reloadAfterRestartRef.current();
+      }
+    }, 500);
     return () => {
-      if (timer) clearInterval(timer);
+      stopped = true;
+      window.clearInterval(timer);
     };
   }, [updating]);
 
+  const sameVersion = (a?: string, b?: string) => {
+    const n = (v?: string) => (v || '').trim().replace(/^v/i, '').toLowerCase();
+    const x = n(a);
+    const y = n(b);
+    return x.length > 0 && x === y;
+  };
+  const versionEntries: UpdateVersionEntry[] =
+    info?.versions && info.versions.length > 0
+      ? info.versions
+      : info?.latest_version
+        ? [{ version: info.latest_version, notes: info.release_notes, released_at: info.released_at }]
+        : [];
+  const versionOptions = versionEntries.map((entry) => entry.version);
+  const targetVersion =
+    selectedVersion && versionOptions.some((v) => sameVersion(v, selectedVersion))
+      ? versionOptions.find((v) => sameVersion(v, selectedVersion)) || versionOptions[0] || ''
+      : versionOptions[0] || '';
+  const selectedEntry = versionEntries.find((entry) => sameVersion(entry.version, targetVersion));
+  const isLatestPick = !targetVersion || sameVersion(targetVersion, info?.latest_version || versionOptions[0]);
+  const forceReinstall = isLatestPick && sameVersion(info?.current_version, targetVersion);
+  targetVersionRef.current = targetVersion;
+  currentVersionRef.current = info?.current_version || '';
+  // 点「完成」和进度到完成后的自动等待是同一次刷新：确认 /health 已是目标版本再重载。
+  // 旧进程退出前仍会应答，不能在那一次应答上把页面刷回去。
+  reloadAfterRestartRef.current = () => {
+    if (reloadStarted.current) return;
+    reloadStarted.current = true;
+    const want = targetVersionRef.current;
+    const from = currentVersionRef.current;
+    void (async () => {
+      let misses = 0;
+      const deadline = Date.now() + 60000;
+      while (Date.now() < deadline) {
+        try {
+          const resp = await fetch('/health', {
+            credentials: 'include',
+            signal: AbortSignal.timeout(2000),
+          });
+          if (!resp.ok) throw new Error(String(resp.status));
+          const body = await resp.json();
+          const got = String(body?.version ?? '');
+          if (shouldReloadUpgradedPage({ want, from, got, consecutiveMisses: misses })) {
+            window.location.reload();
+            return;
+          }
+          misses = 0;
+        } catch {
+          misses += 1;
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 400));
+      }
+      reloadStarted.current = false;
+    })();
+  };
+
   const handleStartUpdate = async () => {
-    if (isChecking) return;
+    if (isChecking || !targetVersion) return;
+    reloadStarted.current = false;
+    sawInstallProgress.current = false;
     setUpdating(true);
     try {
       await executeUpdate({
         channel,
-        version: info?.latest_version,
-        download_url: info?.download_url ?? undefined,
+        version: targetVersion,
+        download_url: isLatestPick ? info?.download_url ?? undefined : undefined,
+        force: forceReinstall || !isLatestPick,
       });
     } catch (err: any) {
       setStatus({
@@ -119,9 +222,46 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
     }
   };
 
+  useEffect(() => {
+    if (!notesOpen) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.stopPropagation();
+        setNotesOpen(false);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [notesOpen]);
+
+  useEffect(() => {
+    setNotesCopied('idle');
+  }, [targetVersion, notesOpen]);
+
+  const notesText = (selectedEntry?.notes || '').trim();
+  const notesReleasedAt = (() => {
+    const raw = selectedEntry?.released_at;
+    if (!raw) return '';
+    const date = new Date(raw);
+    if (Number.isNaN(date.getTime())) return raw;
+    return date.toLocaleString();
+  })();
+
+  const handleCopyNotes = async () => {
+    if (!notesText) return;
+    const ok = await copyTextToClipboard(notesPlainText(notesText));
+    setNotesCopied(ok ? 'ok' : 'fail');
+  };
+
   const hasUpdate = info?.has_update ?? false;
+  const canInstall =
+    !isChecking &&
+    !checkError &&
+    !!targetVersion &&
+    (!isLatestPick || hasUpdate || forceReinstall);
 
   return (
+    <>
     <div
       class="modal-overlay"
       onClick={(e) => {
@@ -179,9 +319,11 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
             </div>
             <div class="update-version-arrow">➔</div>
             <div class="update-version-row">
-              <span class="update-version-label">{t('update.latestVersion')}</span>
-              <span class={`update-version-val ${hasUpdate ? 'latest' : 'current'}`}>
-                {isChecking ? '...' : (info?.latest_version || info?.current_version || '...')}
+              <span class="update-version-label">
+                {isLatestPick ? t('update.latestVersion') : t('update.targetVersion')}
+              </span>
+              <span class={`update-version-val ${hasUpdate || !isLatestPick ? 'latest' : 'current'}`}>
+                {isChecking ? '...' : (targetVersion || info?.latest_version || '...')}
               </span>
             </div>
           </div>
@@ -199,10 +341,20 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
                   <span class="update-status-error-icon">⚠️</span>
                   <span>{t('update.failed', { error: checkError })}</span>
                 </div>
+              ) : !isLatestPick && targetVersion ? (
+                <div class="update-status-row has-update">
+                  <span class="update-status-sparkle">✨</span>
+                  <span>{t('update.dialogDescTarget', { version: targetVersion })}</span>
+                </div>
               ) : hasUpdate ? (
                 <div class="update-status-row has-update">
                   <span class="update-status-sparkle">✨</span>
                   <span>{t('update.dialogDesc', { version: info?.latest_version || '' })}</span>
+                </div>
+              ) : forceReinstall ? (
+                <div class="update-status-row has-update">
+                  <span class="update-status-sparkle">🔁</span>
+                  <span>{t('update.dialogDescForce', { version: info?.latest_version || '' })}</span>
                 </div>
               ) : (
                 <div class="update-status-row latest">
@@ -244,9 +396,34 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
         </div>
 
         <div class="modal-footer update-dialog-footer">
+          <label class="update-version-picker">
+            <span class="update-version-picker-label">{t('update.historyLabel')}</span>
+            <select
+              class="update-version-select"
+              aria-label={t('update.historyLabel')}
+              value={targetVersion}
+              disabled={updating || isChecking || versionOptions.length === 0}
+              onChange={(e) => setSelectedVersion((e.target as HTMLSelectElement).value)}
+            >
+              {versionOptions.map((version) => (
+                <option key={version} value={version}>
+                  {version}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button
+            type="button"
+            class="update-notes-btn"
+            disabled={updating || isChecking || !targetVersion}
+            onClick={() => setNotesOpen(true)}
+          >
+            {t('update.notesBtn')}
+          </button>
+          <div class="update-footer-actions">
           {!updating ? (
             <>
-              {hasUpdate ? (
+              {canInstall ? (
                 <>
                   <button
                     type="button"
@@ -260,7 +437,7 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
                     class="btn btn-primary update-confirm-btn"
                     onClick={handleStartUpdate}
                   >
-                    {t('update.btnUpdate')}
+                    {forceReinstall ? t('update.btnForce') : t('update.btnUpdate')}
                   </button>
                 </>
               ) : (
@@ -304,7 +481,7 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
             <button
               type="button"
               class="btn btn-primary"
-              onClick={onClose}
+              onClick={() => reloadAfterRestartRef.current()}
             >
               {t('update.btnDone')}
             </button>
@@ -317,8 +494,68 @@ export function UpdateDialog({ info: initialInfo, onClose, onUpdateInfoChange }:
               {isDesktop ? t('update.preparing') : t('update.installing')}
             </button>
           )}
+          </div>
         </div>
       </div>
     </div>
+    {notesOpen && (
+      <div
+        class="release-notes-overlay"
+        onClick={(e) => {
+          if (e.target === e.currentTarget) setNotesOpen(false);
+        }}
+      >
+        <div
+          class="release-notes-card"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="release-notes-title"
+        >
+          <div class="release-notes-accent" />
+          <div class="release-notes-header">
+            <div class="release-notes-heading">
+              <span class="release-notes-kicker">{t('update.notesTitle')}</span>
+              <h3 id="release-notes-title">{targetVersion}</h3>
+              {notesReleasedAt && <time class="release-notes-time">{notesReleasedAt}</time>}
+            </div>
+            <div class="release-notes-header-actions">
+              <button
+                type="button"
+                class="release-notes-copy"
+                onClick={handleCopyNotes}
+                disabled={!notesText}
+              >
+                {notesCopied === 'ok'
+                  ? t('update.notesCopied')
+                  : notesCopied === 'fail'
+                    ? t('update.notesCopyFailed')
+                    : t('update.notesCopy')}
+              </button>
+              <button
+                type="button"
+                class="ghost-btn modal-close"
+                onClick={() => setNotesOpen(false)}
+                aria-label={t('update.btnClose')}
+              >
+                ×
+              </button>
+            </div>
+          </div>
+          <div class="release-notes-body">
+            {notesText && looksLikeHtml(notesText) ? (
+              <div
+                class="markdown-root assistant-message-content"
+                dangerouslySetInnerHTML={{ __html: sanitizeNotesHtml(notesText) }}
+              />
+            ) : notesText ? (
+              <Markdown content={notesText} />
+            ) : (
+              <p class="release-notes-empty">{t('update.notesEmpty')}</p>
+            )}
+          </div>
+        </div>
+      </div>
+    )}
+    </>
   );
 }

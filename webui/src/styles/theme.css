@@ -37,56 +37,63 @@
   --app-monospace-font-family:ui-monospace,'SFMono-Regular','Menlo','Monaco','Courier New',monospace;
   --app-monospace-font-size:13px; --app-monospace-font-size-small:12px;
 }
-/* Light palette — refined, low-glare titanium frost slate (Gemini & Linear style).
-   Avoids harsh blinding pure-white canvas; uses cohesive #f8f9fb canvas + #f1f3f6 secondary surfaces. */
+/* Light palette — refined, low-glare eye-care matte slate (Linear, GitHub & Apple HIG inspired).
+   Avoids harsh blinding pure-white canvas; uses soothing #f4f5f7 canvas + #eaecee structured surfaces
+   with high-contrast WCAG AAA typography, deep amber accents, and crisp tactile borders. */
 :root[data-theme='light'] {
   color-scheme: light;
-  --app-brand:#2563eb; --app-brand-button:#2563eb; --app-brand-ivory:#ffffff; --app-brand-slate:#1f2328;
-  --app-primary-foreground:#1f2328; --app-primary-background:#f8f9fb; --app-brand-text:#2563eb;
-  --app-secondary-foreground:#64748b; --app-secondary-background:#f1f3f6;
-  --app-card-background:#ffffff; --app-border:#e2e8f0;
+  --app-brand:#2563eb; --app-brand-button:#2563eb; --app-brand-ivory:#ffffff; --app-brand-slate:#0f172a;
+  --app-primary-foreground:#0f172a; --app-primary-background:#f4f5f7; --app-brand-text:#2563eb;
+  --app-secondary-foreground:#475569; --app-secondary-background:#eaecee;
+  --app-card-background:#ffffff; --app-border:#d2d6dc;
   --app-msg-time-color:#64748b;
-  --app-input-foreground:#1f2328; --app-input-background:#ffffff; --app-input-border:#e2e8f0;
-  --app-input-placeholder-foreground:#94a3b8; --app-input-secondary-background:#e9ecf1;
-  --app-ghost-button-hover-background:rgba(0, 0, 0, 0.05); --app-tool-background:#f1f3f6; --app-header-background:#f8f9fb;
-  --app-primary-border-color:#e2e8f0; --app-list-hover-background:#e9ecf1; --app-list-active-background:#dfe3ea;
-  --app-table-border:#e2e8f0;
-  --app-menu-background:#ffffff; --app-menu-border:#e2e8f0; --app-menu-foreground:#1f2328; --app-menu-selection-background:#eff6ff;
-  --app-command-menu-hover-background:rgba(0, 0, 0, 0.04); --app-command-menu-active-background:color-mix(in srgb,var(--app-brand) 8%,transparent); --app-command-menu-active-accent:#2563eb;
-  --app-link-color:#2563eb; --app-transparent-inner-border:rgba(0, 0, 0, 0.06);
+  --app-input-foreground:#0f172a; --app-input-background:#ffffff; --app-input-border:#cbd2d9;
+  --app-input-active-border:#2563eb; --app-input-placeholder-foreground:#64748b; --app-input-secondary-background:#e2e6ea;
+  --app-button-foreground:#ffffff; --app-button-background:#2563eb; --app-button-hover-background:#1d4ed8; --app-ghost-button-hover-background:rgba(0, 0, 0, 0.06);
+  --app-tool-background:#e8ebef; --app-header-background:#eaecee;
+  --app-primary-border-color:#d2d6dc; --app-list-hover-background:#e1e5ea; --app-list-active-background:#d4d9e1; --app-list-active-foreground:#0f172a;
+  --app-table-border:#d2d6dc;
+  --app-menu-background:#ffffff; --app-menu-border:#cbd2d9; --app-menu-foreground:#0f172a; --app-menu-selection-background:#e8f0fe;
+  --app-command-menu-hover-background:rgba(0, 0, 0, 0.05); --app-command-menu-active-background:color-mix(in srgb,var(--app-brand) 10%,transparent); --app-command-menu-active-accent:#2563eb;
+  --app-link-color:#1d4ed8; --app-transparent-inner-border:rgba(0, 0, 0, 0.08);
   --app-spinner-foreground:var(--app-brand-button);
-  --app-success-foreground:#16a34a;
+  --app-success-foreground:#15803d;
+  --app-warning-accent:#b45309;
+  --app-error-foreground:#dc2626;
   --app-diff-deletion-foreground:#dc2626;
-  --app-diff-addition-foreground:#16a34a;
+  --app-diff-addition-foreground:#15803d;
   --app-diff-addition-bg:#dcfce7;
   --app-diff-deletion-bg:#fee2e2;
-  --app-terminal-bg:#1e293b; --app-terminal-fg:#f8fafc; --app-tool-name-color:#2563eb;
-  --app-json-key:#2563eb; --app-json-string:#16a34a; --app-json-number:#d97706; --app-json-boolean:#7c3aed; --app-json-null:#64748b; --app-json-punct:#94a3b8;
+  --app-terminal-bg:#1e293b; --app-terminal-fg:#f8fafc; --app-tool-name-color:#1d4ed8;
+  --app-json-key:#1d4ed8; --app-json-string:#15803d; --app-json-number:#b45309; --app-json-boolean:#6d28d9; --app-json-null:#475569; --app-json-punct:#64748b;
 }
 @media (prefers-color-scheme: light) {
   :root:not([data-theme='dark']):not([data-theme='light']) {
     color-scheme: light;
-    --app-brand:#2563eb; --app-brand-button:#2563eb; --app-brand-ivory:#ffffff; --app-brand-slate:#1f2328;
-    --app-primary-foreground:#1f2328; --app-primary-background:#f8f9fb; --app-brand-text:#2563eb;
-    --app-secondary-foreground:#64748b; --app-secondary-background:#f1f3f6;
-    --app-card-background:#ffffff; --app-border:#e2e8f0;
+    --app-brand:#2563eb; --app-brand-button:#2563eb; --app-brand-ivory:#ffffff; --app-brand-slate:#0f172a;
+    --app-primary-foreground:#0f172a; --app-primary-background:#f4f5f7; --app-brand-text:#2563eb;
+    --app-secondary-foreground:#475569; --app-secondary-background:#eaecee;
+    --app-card-background:#ffffff; --app-border:#d2d6dc;
     --app-msg-time-color:#64748b;
-    --app-input-foreground:#1f2328; --app-input-background:#ffffff; --app-input-border:#e2e8f0;
-    --app-input-placeholder-foreground:#94a3b8; --app-input-secondary-background:#e9ecf1;
-    --app-ghost-button-hover-background:rgba(0, 0, 0, 0.05); --app-tool-background:#f1f3f6; --app-header-background:#f8f9fb;
-    --app-primary-border-color:#e2e8f0; --app-list-hover-background:#e9ecf1; --app-list-active-background:#dfe3ea;
-    --app-table-border:#e2e8f0;
-    --app-menu-background:#ffffff; --app-menu-border:#e2e8f0; --app-menu-foreground:#1f2328; --app-menu-selection-background:#eff6ff;
-    --app-command-menu-hover-background:rgba(0, 0, 0, 0.04); --app-command-menu-active-background:color-mix(in srgb,var(--app-brand) 8%,transparent); --app-command-menu-active-accent:#2563eb;
-    --app-link-color:#2563eb; --app-transparent-inner-border:rgba(0, 0, 0, 0.06);
+    --app-input-foreground:#0f172a; --app-input-background:#ffffff; --app-input-border:#cbd2d9;
+    --app-input-active-border:#2563eb; --app-input-placeholder-foreground:#64748b; --app-input-secondary-background:#e2e6ea;
+    --app-button-foreground:#ffffff; --app-button-background:#2563eb; --app-button-hover-background:#1d4ed8; --app-ghost-button-hover-background:rgba(0, 0, 0, 0.06);
+    --app-tool-background:#e8ebef; --app-header-background:#eaecee;
+    --app-primary-border-color:#d2d6dc; --app-list-hover-background:#e1e5ea; --app-list-active-background:#d4d9e1; --app-list-active-foreground:#0f172a;
+    --app-table-border:#d2d6dc;
+    --app-menu-background:#ffffff; --app-menu-border:#cbd2d9; --app-menu-foreground:#0f172a; --app-menu-selection-background:#e8f0fe;
+    --app-command-menu-hover-background:rgba(0, 0, 0, 0.05); --app-command-menu-active-background:color-mix(in srgb,var(--app-brand) 10%,transparent); --app-command-menu-active-accent:#2563eb;
+    --app-link-color:#1d4ed8; --app-transparent-inner-border:rgba(0, 0, 0, 0.08);
     --app-spinner-foreground:var(--app-brand-button);
-    --app-success-foreground:#16a34a;
+    --app-success-foreground:#15803d;
+    --app-warning-accent:#b45309;
+    --app-error-foreground:#dc2626;
     --app-diff-deletion-foreground:#dc2626;
-    --app-diff-addition-foreground:#16a34a;
+    --app-diff-addition-foreground:#15803d;
     --app-diff-addition-bg:#dcfce7;
     --app-diff-deletion-bg:#fee2e2;
-    --app-terminal-bg:#1e293b; --app-terminal-fg:#f8fafc; --app-tool-name-color:#2563eb;
-    --app-json-key:#2563eb; --app-json-string:#16a34a; --app-json-number:#d97706; --app-json-boolean:#7c3aed; --app-json-null:#64748b; --app-json-punct:#94a3b8;
+    --app-terminal-bg:#1e293b; --app-terminal-fg:#f8fafc; --app-tool-name-color:#1d4ed8;
+    --app-json-key:#1d4ed8; --app-json-string:#15803d; --app-json-number:#b45309; --app-json-boolean:#6d28d9; --app-json-null:#475569; --app-json-punct:#64748b;
   }
 }
 

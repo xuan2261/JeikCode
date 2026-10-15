@@ -81,7 +81,7 @@ irm https://raw.githubusercontent.com/jeikl/JeikCode/main/scripts/install.ps1 | 
 
 ---
 
-## 💡 Quick Start
+## 💡 Quick Start & Full Documentation & Advanced Guides
 
 ### 1. Launching
 
@@ -110,77 +110,17 @@ jeikcode -p "Investigate and fix OAuth callback 404 issue"
 jeikcode update
 ```
 
-### 2. Model Configuration (`~/.jeikcode/config.toml`)
+Update, rollback, and uninstall commands: https://jeikcode.top/guide/updates.html
 
-On first launch, `~/.jeikcode/config.toml` is created automatically. You can configure models visually or interactively:
+### 2. Full Documentation & Tutorials
 
-- Run `/modeladd` in the terminal to open the interactive setup wizard;
-- **Or directly instruct JeikCode**: *"Configure my Anthropic API Key (sk-ant-xxx) and set claude-3-7-sonnet as default"*. JeikCode will safely update `config.toml` with zero-restart live reload!
-
-Typical configuration example:
-
-```toml
-# Default active model profile
-default_model = "xai/grok-4.7"
-language = "en"
-
-# ── 1. Provider Accounts (API Keys and Base URLs) ──
-[provider_accounts.xai]
-provider = "openai-compatible"
-api_key  = "xai-xxxxxxxxxxxxxxxxxxxxxxxx"
-base_url = "https://api.x.ai/v1"
-
-[provider_accounts.anthropic]
-provider = "anthropic"
-api_key  = "sk-ant-api03-xxxxxxxxxxxxxxxx"
-
-[provider_accounts.gemini]
-provider = "gemini"
-api_key  = "AIzaxxxxxxxxxxxxxxxxxxxxxxxx"
-
-[provider_accounts.xiaomi-mimo]
-provider = "openai-compatible"
-api_key  = "mimo-xxxxxxxxxxxxxxxxxxxxxxxx"
-base_url = "https://api.xiaomimimo.com/v1"
-
-[provider_accounts.ollama]
-provider = "ollama"
-base_url = "http://localhost:11434"
-
-# ── 2. Model Profiles (Tiering, Reasoning & Protocol Mapping) ──
-[models."xai/grok-4.7"]
-account          = "xai"
-model            = "grok-4.7"
-reasoning_model  = true
-reasoning_effort = "high"
-
-[models."anthropic/claude-3-7-sonnet"]
-account          = "anthropic"
-model            = "claude-3-7-sonnet-20250219"
-thinking_enabled = true
-thinking_budget  = 8192
-
-[models."gemini/2.5-pro"]
-account          = "gemini"
-model            = "gemini-2.5-pro"
-thinking_enabled = true
-thinking_budget  = 8192
-
-[models."mimo/v2.6-pro"]
-account          = "xiaomi-mimo"
-model            = "mimo-v2.6-pro"
-reasoning_model  = true
-reasoning_effort = "high"
-```
-
----
-
-## 📚 Full Documentation & Advanced Guides
+> 💡 **Tutorials & Guides**: Please visit the official documentation portal 👉 **[https://jeikcode.top](https://jeikcode.top)**
 
 For comprehensive tutorials, architectural specifications, and ecosystem integrations, visit the official docs:
 
 - 📖 **Official Documentation Site**: [https://jeikcode.top](https://jeikcode.top)
 - 🚀 [Installation & Quickstart Guide](https://jeikcode.top/guide/getting-started)
+- 🔄 [Updates, Rollback & Uninstall](https://jeikcode.top/guide/updates.html)
 - ⚙️ [Model Provider Configuration](https://jeikcode.top/guide/login)
 - 🔌 [Model Context Protocol (MCP) Integration](https://jeikcode.top/advanced/mcp)
 - 🧩 [Agent Skills System](https://jeikcode.top/advanced/skills)
@@ -191,55 +131,7 @@ For comprehensive tutorials, architectural specifications, and ecosystem integra
 
 ## 📝 Changelog
 
-> Only showing the latest 2 releases. For the full release history, see [CHANGELOG.md](./CHANGELOG.md) and [GitHub Releases](https://github.com/jeikl/JeikCode/releases).
-
-### v7.2.0 (2026-10-08)
-
-- **[Core Tools Overhaul & Robustness] Unified and Streamlined Tool Architecture, Enhanced `read` & `grep`, Deterministic Shell Execution, and LLM Glob Normalization**:
-  - Permanently retired legacy `codeintel::repo_map` in favor of a modern, unified `read` tool supporting massive safe chunk reads, directory trees, images, and centered keyword search (`key_string`) with pure-text responses;
-  - Enhanced `grep` with multi-mode outputs (`content`, `files_with_matches`, `count`) and dedicated context lines control; hardened `glob` with `./` prefix stripping and Windows backslash normalization;
-  - Overhauled `run_command` with deterministic shell execution, workspace-relative `cwd`, native Windows PowerShell support, MSYS2/Bash PATH hardening, process grace periods (`settle_secs`), and multi-field structured parameter validation.
-- **[Prompts & Agentic Workflow Discipline] Overhauled Core System Prompts, Reinforced Operational Discipline, Stable High-Concurrency Tool Dispatch, and Aggressive Reading Strategy**:
-  - Redesigned system prompts and workflow discipline across `rules.yaml` and `system.yaml`, enforcing strict task boundary awareness, atomic commit discipline, and checklist closure verification;
-  - Optimized multi-turn reasoning pipelines to launch independent tool calls in parallel concurrently whenever no data dependency exists, slashing turnaround latency;
-  - Mandated wide-window context reading (reading several hundred lines or entire files in a single pass) to build an authoritative mental model upfront, eliminating fragmented blind edits; hardened in-flight steer prompt guidance.
-- **[CodeIntel & CodeGraph] Multi-Ecosystem Source Protection, Context-Aware MSBuild Pruning, and Adaptive Workspace Indexing**:
-  - Unlocked executable language source bins (Rust `src/bin/*.rs`, Ruby `bin/rails`, Node `bin/cli.js`), reclaimed ASP.NET `wwwroot` assets, and preserved hand-written `AssemblyInfo.cs`;
-  - Pruned MSBuild build directories (`Debug`/`Release` under `bin/` or `obj/`) based on path context, and expanded native `.codegraphignore` presets for .NET, Elixir, Flutter, Zig, Haskell, Swift, Unreal, and Unity.
-- **[WebUI & Visual Polish] Refined Charcoal Palette, Streamlined Single-Line Composer, Interactive Mermaid Diagrams, and VSCode-Style Git Inspector**:
-  - Redesigned the WebUI palette inspired by Gemini, setting a charcoal dark canvas as default; streamlined composer into a single-line capsule with a live green-lightning token badge;
-  - Integrated interactive Mermaid diagrams directly into chat streams; upgraded Git panel with VSCode-style commit hover cards, responsive Git Graph, and compact action menus; fixed nested Markdown code block glitches.
-- **[Mobile Experience] Comprehensive Mobile-First UI Overhaul, Touch Navigation, and Resilient Connection Architecture**:
-  - Implemented adaptive top navigation with auto-collapsing controls; optimized mobile virtual keyboard interaction with soft newlines and seamless keyboard docking;
-  - Added dedicated Mobile Approval Dock with thumb-friendly layout; hardened mobile reconnection resilience to automatically re-sync session state without blank screens.
-- **[Remote Browsing & Workspace Sync] Seamless Remote Directory Selection, Multi-Observer Project Synchronization, and Windows Verbatim Path Normalization**:
-  - Integrated an in-page directory picker for remote browser sessions to eliminate hanging native dialog requests; added confirmation for project hiding while preserving session files;
-  - Synchronized pinned and hidden sidebar projects across tabs and observers via `GET/POST /projects/sidebar`, automatically surfacing running projects; stripped Windows extended verbatim path prefixes (`\\?\`, `//?/`, `/?/`).
-- **[Session Architecture & Daemon Robustness] Direct Session Deep-Linking, Retirement of Legacy Sync Streams, Hardened Permissions, and Disk Quota Governance**:
-  - Passed active session IDs in `/webui` launch URLs for immediate deep-linking; retired legacy `/sync` double-streaming in favor of unified `/chat` and `/chat/watch` SSE pipelines;
-  - Hardened approval permission handling with instant dismissal and strict correlation; reinforced security boundaries; disabled verbose datalogs by default and enforced disk storage quotas.
-- **[Docs, CI/CD & Engineering Discipline] Full-Stack Docs Refresh, Hardened Native CI Matrix, and Upgraded Release Infrastructure**:
-  - Elevated built-in tools to top-level site navigation; resolved Ubuntu 22.04 / 24.04 Linux desktop packaging compatibility; coupled `tsc --noEmit` as an automated frontend build gate; adopted standardized Pull Request templates.
-
-### v7.1.53 (2026-10-05)
-
-- **[Beta Release Channel] Prioritize latest pre-releases in Beta channel to properly display preview version numbers**:
-  - Updated `check_update` in `api_update.rs` so the Beta channel selects the latest pre-release instead of formal releases with matching core versions.
-- **[Image Lightbox Modal] Add prominent touch-friendly close button (✕) for image previews**:
-  - Added a floating `.img-lightbox-close` button positioned at top-safe-area right with backdrop blur for one-tap dismiss on mobile devices.
-- **[Collapsible Sticky Todo Panel & Blank Drawer Fix] Mobile-first collapsible Todo list capsule and drawer fix**:
-  - Re-engineered `SessionTodoPanel` to collapse into a sleek single-line capsule showing status metrics and active task on mobile views; resolved mobile sidebar drawer going black when collapsed.
-- **[Queued Cards Control Actions] Bottom action buttons for queued messages (Steer -> Send Now -> Cancel)**:
-  - Moved queued action buttons below the card ordered as Steer, Send Now (interrupts running turn and sends immediately), and Cancel with touch-friendly dimensions.
-
-### v7.1.52 (2026-10-05)
-
-- **[Universal Responsive & Mobile UX] Gemini-aligned responsive mobile architecture, bottom-sheet modals, bottom-docked composer, and native media/file upload button**:
-  - Built universal responsive design system across mobile (≤768px), tablet/iPad (769-1024px), and desktop (>1024px). Modals automatically elevate to native-style bottom sheets with top pull handles and safe-area insets. Overhauled model configuration into a fluid layout, docked mobile composer to the bottom (Gemini style), and added a dedicated native media/file upload button.
-- **[Update Channels & Modal] Add Stable and Beta release channels with interactive modal and pre-release support**:
-  - Added `UpdateDialog` modal with dual-channel toggle (Stable / Beta) aligned with Antigravity-Manager, persistent channel preference (`localStorage`), real-time channel switching, and progress indicators. Enhanced daemon backend with SemVer pre-release version comparison.
-- **[WebUI Session Switch & Queued Steers] Fix disappearing queued cards, preserve steer cards, and prevent message loss on session switch**:
-  - Refactored `diskSettled` check so an active turn requires the disk transcript to actually include the current user turn and not lag behind before replacing `currentCached`. Added `sessionStorage` persistence (`STORAGE_KEY_QUEUED_MESSAGES`) for queued and steered messages across refreshes. Bound `targetSid` in `handleSteerQueuedMessage` to eliminate asynchronous session switching race conditions.
+> For the full release history, see [CHANGELOG.md](./CHANGELOG.md) and [GitHub Releases](https://github.com/jeikl/JeikCode/releases).
 
 ---
 

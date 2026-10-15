@@ -552,6 +552,19 @@ pub fn cancel_via_registry(session_id: &str) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+/// Whether a **bound** live-runtime turn still occupies `session_id`.
+///
+/// `/chat/stop` uses this to answer `released` truthfully: the compat registry can
+/// already be idle (or the runtime cancel is still winding down) while a native
+/// runtime turn keeps the session occupied. View-only rows (`Starting` without a
+/// bound handle) are not occupancy and deliberately do not count.
+pub fn live_turn_running(session_id: &str) -> bool {
+    jeikcode_coding::session_runtime_registry::SessionRuntimeRegistry::global()
+        .live_turn_session_ids()
+        .iter()
+        .any(|key| key.as_str() == session_id)
+}
+
 /// Deliver a Respond for a pending request on a registry-owned session.
 pub fn resolve_via_registry(
     session_id: &str,

@@ -171,6 +171,8 @@ struct ReviewArgs {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Normalize a Git-Bash-launched TMP/TEMP/TMPDIR before spawning any child process.
+    jeikcode_capabilities::special_dirs::sanitize_process_temp_env();
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Code(args) => code::code(args).await,
@@ -778,13 +780,10 @@ fn select_config(fc: &FileConfig, provider: Option<&str>) -> ConfigSelection {
     }
 }
 
-/// `~/.jeikcode/config.toml` (honors $JEIKCODE_HOME, else $HOME / %USERPROFILE%).
+/// `~/.jeikcode/config.toml` — the unified derivation (env → legacy → real home),
+/// so clix never reads a different config file than the main app.
 fn default_config_path() -> Option<PathBuf> {
-    if let Some(home) = std::env::var_os("JEIKCODE_HOME") {
-        return Some(PathBuf::from(home).join("config.toml"));
-    }
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-    Some(PathBuf::from(home).join(".jeikcode").join("config.toml"))
+    Some(jeikcode_config::Config::default_path())
 }
 
 /// Resolve the effective model context window: explicit `--context-window` flag wins, else the

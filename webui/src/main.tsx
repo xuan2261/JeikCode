@@ -2,6 +2,7 @@ import { render } from 'preact';
 import { App } from './app';
 import { SettingsProvider } from './settings';
 import { ensureRandomUUIDPolyfill } from './lib/randomId';
+import { initPageZoom } from './lib/pageZoom';
 // Bundled serif for the landing greeting (close to claude.ai's display serif).
 import '@fontsource/source-serif-4/400.css';
 import '@fontsource/source-serif-4/500.css';
@@ -9,6 +10,11 @@ import './styles/theme.css';
 import './styles/app.css';
 import './index.css';
 import 'katex/dist/katex.min.css';
+
+// 禁用浏览器默认的历史滚动恢复，避免刷新时与聊天时间线底部粘性定位冲突产生跳变
+if (typeof window !== 'undefined' && 'scrollRestoration' in window.history) {
+  window.history.scrollRestoration = 'manual';
+}
 
 // 当服务端发版重启导致异地旧标签页请求的异步 chunk hash 失效时，自动刷新页面拉取最新资源
 if (typeof window !== 'undefined') {
@@ -20,6 +26,9 @@ if (typeof window !== 'undefined') {
 // http://LAN-IP (jeikcode serve remote clients) is not a secure context —
 // crypto.randomUUID is missing there. Polyfill before any component mounts.
 ensureRandomUUIDPolyfill();
+
+// 初始化类似 Chrome 的页面缩放（Ctrl + 滚轮 / 快捷键）
+initPageZoom();
 
 render(
   <SettingsProvider>

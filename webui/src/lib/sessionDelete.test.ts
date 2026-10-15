@@ -53,6 +53,26 @@ test('streaming delete keeps going after a per-item failure', async () => {
   assert.match((failed[0].cause as Error).message, /nope/);
 });
 
+test('an already-deleted session counts as deleted instead of a failure', async () => {
+  const seen: string[] = [];
+  const gone = Object.assign(new Error('该会话不存在或已被删除。'), {
+    code: 'SESSION_NOT_FOUND',
+  });
+  const { failed } = await deleteSessionsStreaming(
+    [target('ghost'), target('live')],
+    async (_hash, id) => {
+      if (id === 'ghost') throw gone;
+    },
+    (id) => {
+      seen.push(id);
+    },
+    1,
+  );
+  // 404 = 目标状态已达成：本地行必须被剔除，而不是报错残留。
+  assert.deepEqual(seen, ['ghost', 'live']);
+  assert.deepEqual(failed, []);
+});
+
 test('worker pool runs more than one delete at a time', async () => {
   let inFlight = 0;
   let maxInFlight = 0;

@@ -9,8 +9,11 @@ import { RenameDialog, DeleteDialog } from './components/SessionDialogs';
 import { CwdPicker } from './components/CwdPicker';
 import { onboardingDone } from './lib/onboarding';
 import { LiveReviewState, NotificationDock } from './components/NotificationDock';
+import { onGlobalEvent, startGlobalEventStream } from './lib/globalEvents';
 import { RemoteAccessControl } from './components/RemoteAccessControl';
 import { resolvePendingAfterDecision } from './lib/pendingPermission';
+import { ToastHost, showToast } from './components/Toast';
+import { ConfirmModalHost } from './components/ConfirmDialog';
 
 // 动态按需懒加载非首屏必需的独立弹窗，削减冷启动初始 JS 解析开销
 const ThemeDialog = lazy(() => import('./components/SettingsDialogs').then((m) => ({ default: m.ThemeDialog })));
@@ -69,6 +72,23 @@ export function App() {
   const [projectHash, setProjectHash] = useState('');
   const [pending, setPending] = useState<any | null>(null);
   const [liveReview, setLiveReview] = useState<LiveReviewState | null>(null);
+  // 跨实例增量流（每实例一条）：侧栏/通知 dock 各自订阅自己需要的增量，
+  // 全程按 id 就地 upsert/remove，无周期性轮询、无整表重拉。
+  useEffect(() => startGlobalEventStream(), []);
+  // 待交互卡在别处被解决时，同步清掉本实例正在展示的卡片状态。
+  useEffect(
+    () =>
+      onGlobalEvent((event) => {
+        if (event.type !== 'review_resolved') return;
+        setPending((cur: any | null) =>
+          cur && event.approval_id && cur.approval_id === event.approval_id ? null : cur,
+        );
+        setLiveReview((cur) =>
+          cur && cur.sessionId === event.session_id && !cur.userInput ? null : cur,
+        );
+      }),
+    [],
+  );
   const dismissLiveReview = useRef({
     permission: (_runtimeInstanceId: string, _generation: number, _requestId: number, _callId: string) => {},
     userInput: () => {},
@@ -504,15 +524,16 @@ export function App() {
   const handleManualCheckUpdate = async () => {
     setIsCheckingUpdate(true);
     try {
-      const res = await checkUpdate();
+      const savedChannel = localStorage.getItem('jeikcode_update_channel') || undefined;
+      const res = await checkUpdate(savedChannel);
       setUpdateInfo(res);
       if (res.has_update) {
         setShowUpdateDialog(true);
       } else {
-        alert(t('update.latest', { version: res.current_version }));
+        showToast(t('update.latest', { version: res.current_version }), 'info');
       }
     } catch (e: any) {
-      alert(t('update.failed', { error: e?.message || String(e) }));
+      showToast(t('update.failed', { error: e?.message || String(e) }), 'error');
     } finally {
       setIsCheckingUpdate(false);
     }
@@ -639,7 +660,8 @@ export function App() {
 
   function handleNewSession(targetDir?: string) {
     setSidebarOpen(false);
-    openNewSession(targetDir || '~');
+    // Top-level 「新建对话」 stays in the current/serve workspace.
+    openNewSession(targetDir || cwd || undefined);
   }
 
   function applySessionSelection(session: SessionMetaWithProject) {
@@ -748,7 +770,7 @@ export function App() {
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
     } catch {
-      alert(t('sidebar.exportFailed'));
+      showToast(t('sidebar.exportFailed'), 'error');
     } finally {
       setHeaderExporting(false);
     }
@@ -1440,7 +1462,10 @@ export function App() {
             diffs={configDiffs}
             onDone={(count) => {
               setConfigDiffs(null);
-              alert(t('configSync.successToast', { n: count }));
+              // 选中大于 0 个文件才弹出成功提示；若选中 0 个文件点击确定直接静默完成，不跳提示
+              if (count > 0) {
+                showToast(t('configSync.successToast', { n: count }), 'success');
+              }
             }}
             onSkip={() => {
               setConfigDiffs(null);
@@ -1448,6 +1473,8 @@ export function App() {
           />
         )}
       </Suspense>
+      <ConfirmModalHost />
+      <ToastHost />
       <NotificationDock
         liveReview={liveReview}
         chatPermission={pending}

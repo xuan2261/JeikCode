@@ -3,8 +3,8 @@
 // instant subfolder filtering, breadcrumbs navigation, and global language safety.
 
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { listDir, getProjects, changeDir, deleteProject, mkdir, ProjectInfo, FsShortcut } from '../api';
-import { fsBreadcrumbs, joinFsChild, stripExtendedPathPrefix } from '../lib/displayPath';
+import { listDir, listLocalRepairDir, getProjects, changeDir, deleteProject, mkdir, ProjectInfo, FsShortcut } from '../api';
+import { fsBreadcrumbsForPicker, joinFsChild, stripExtendedPathPrefix } from '../lib/displayPath';
 import { useT } from '../settings';
 
 interface CwdPickerProps {
@@ -19,7 +19,9 @@ interface CwdPickerProps {
 
 export function CwdPicker({ current, onPick, onClose, title, selectionOnly = false }: CwdPickerProps) {
   const t = useT();
-  const initialPath = stripExtendedPathPrefix(current || '~');
+  // The repair selection-only picker must validate raw user paths before
+  // normalization; otherwise \\?\C:\... can be silently rewritten to C:\...
+  const initialPath = selectionOnly ? (current || '~') : stripExtendedPathPrefix(current || '~');
   const [inputPath, setInputPath] = useState(initialPath);
   const [browsePath, setBrowsePath] = useState(initialPath);
   const [dirs, setDirs] = useState<string[]>([]);
@@ -45,7 +47,9 @@ export function CwdPicker({ current, onPick, onClose, title, selectionOnly = fal
     setDirError(null);
     setLoadedPath('');
     setFilterQuery(''); // Reset filter when navigating into a new folder
-    listDir(browsePath)
+    // The selection-only picker is used by repair. Guard its filesystem
+    // reads before calling /fs/list; the regular cwd picker is unchanged.
+    (selectionOnly ? listLocalRepairDir : listDir)(browsePath)
       .then((result) => {
         if (!active || sequence !== listingSequence.current) return;
         const path = stripExtendedPathPrefix(result.path);
@@ -69,7 +73,7 @@ export function CwdPicker({ current, onPick, onClose, title, selectionOnly = fal
         if (active && sequence === listingSequence.current) setDirLoading(false);
       });
     return () => { active = false; };
-  }, [browsePath, listingAttempt]);
+  }, [browsePath, listingAttempt, selectionOnly]);
 
   // Load recent projects once
   useEffect(() => {
@@ -102,7 +106,7 @@ export function CwdPicker({ current, onPick, onClose, title, selectionOnly = fal
   }
 
   function handleJump() {
-    const p = stripExtendedPathPrefix(inputPath.trim());
+    const p = selectionOnly ? inputPath.trim() : stripExtendedPathPrefix(inputPath.trim());
     if (p) navigateTo(p);
   }
 
@@ -158,7 +162,8 @@ export function CwdPicker({ current, onPick, onClose, title, selectionOnly = fal
   }
 
   async function handleConfirm() {
-    const finalPath = stripExtendedPathPrefix(browsePath.trim() || inputPath.trim());
+    const path = browsePath.trim() || inputPath.trim();
+    const finalPath = selectionOnly ? path : stripExtendedPathPrefix(path);
     if (!finalPath) return;
     if (selectionOnly) {
       if (!selectionReady) return;
@@ -187,7 +192,7 @@ export function CwdPicker({ current, onPick, onClose, title, selectionOnly = fal
     return dirs.filter((d) => d.toLowerCase().includes(query));
   }, [dirs, filterQuery]);
 
-  const crumbs = fsBreadcrumbs(browsePath);
+  const crumbs = fsBreadcrumbsForPicker(browsePath, loadedPath, selectionOnly);
   const selectionReady = loadedPath === browsePath && !!loadedPath &&
     inputPath.trim() === browsePath && !dirLoading && !dirError;
 

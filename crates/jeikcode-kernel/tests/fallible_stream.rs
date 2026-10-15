@@ -552,6 +552,56 @@ async fn empty_response_is_retried_then_succeeds() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn thinking_only_stream_is_retried_then_succeeds() {
+    let reg = ToolRegistry::new();
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            StreamEvent::Reasoning("planning the change".into()),
+            StreamEvent::Done { truncated: false },
+        ],
+        vec![
+            StreamEvent::TextDelta("done".into()),
+            StreamEvent::Done { truncated: false },
+        ],
+    ]));
+    let received = provider.received.clone();
+    let recorder = Arc::new(RecorderHook::new());
+
+    let handle = spawn_agent(provider, reg, recorder);
+    handle.commands.send(send("go")).unwrap();
+
+    let mut events = handle.events;
+    let mut warnings: Vec<String> = Vec::new();
+    let mut text = String::new();
+    let mut stop: Option<String> = None;
+    while let Some(ev) = events.recv().await {
+        match ev {
+            AgentEvent::Warning(w) => warnings.push(w),
+            AgentEvent::TextDelta(t) => text.push_str(&t),
+            AgentEvent::TurnComplete { reason } => {
+                stop = Some(format!("{reason:?}"));
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let calls = received.lock().unwrap().len();
+    assert_eq!(
+        calls, 2,
+        "a thinking-only stream must be RETRIED; got {calls}"
+    );
+    assert_eq!(text, "done");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("只返回了思考") && w.contains("重试")),
+        "thinking-only must emit a distinct retry notice; got {warnings:?}"
+    );
+    assert_eq!(stop.as_deref(), Some("Stopped"));
+}
+
 // ── EMPTY-RESPONSE EXHAUSTION (a run of empty 200s fails VISIBLY, not silently) ──
 //
 // If every resend is also empty, the dedicated budget is exhausted and the turn

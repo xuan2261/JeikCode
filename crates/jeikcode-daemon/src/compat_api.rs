@@ -10,6 +10,12 @@
 //! - `GET  /v1/sessions`            — list JeikCode sessions (filter by `user` title)
 //! - `GET  /v1/sessions/:id`        — session detail
 //!
+//! Workspace: protocol turns are pinned to `AppState.bind_working_dir` (the
+//! directory `jeikcode serve --host --port` was started in). WebUI multi-project
+//! switches update the live `project` for the session panel; they do not move
+//! `/v1/chat/completions`, `/v1/responses`, or `/v1/messages` into the first
+//! sidebar project.
+//!
 //! Design (JeikCode core, not a dumb proxy):
 //! - Client multi-turn history is **ignored**; only the latest user query is admitted.
 //! - System prompts from the request are appended **after** AGENTS.md / glossary / db packs.
@@ -558,7 +564,7 @@ pub(crate) async fn list_sessions(
     State(state): State<AppState>,
     Query(q): Query<SessionListQuery>,
 ) -> Response {
-    let working_dir = state.project.read().await.working_dir.clone();
+    let working_dir = state.bind_working_dir.clone();
     let limit = q.limit.unwrap_or(100).min(500);
     let filter = normalize_session_key(q.user.as_deref());
     let data: Vec<CompatSession> = list_project_sessions(&working_dir)
@@ -585,7 +591,7 @@ pub(crate) async fn list_sessions(
 
 /// GET /v1/sessions/:id  (UUID, prefix, or exact session key / `user` value)
 pub(crate) async fn get_session(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    let working_dir = state.project.read().await.working_dir.clone();
+    let working_dir = state.bind_working_dir.clone();
     let key = normalize_session_key(Some(id.as_str())).unwrap_or(id.clone());
     match list_project_sessions(&working_dir)
         .into_iter()
@@ -902,7 +908,7 @@ pub(super) enum WireFormat {
 }
 
 async fn run_compat_turn(state: AppState, turn: CompatTurn, format: WireFormat) -> Response {
-    let working_dir = state.project.read().await.working_dir.clone();
+    let working_dir = state.bind_working_dir.clone();
     let config = match load_config() {
         Ok(c) => c,
         Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, e, "config_error"),
@@ -984,8 +990,16 @@ async fn run_compat_turn(state: AppState, turn: CompatTurn, format: WireFormat) 
         .event_bus_with_replay(&admission.operation_id)
         .await
         .map(|(_, r)| r);
-    let fan_tx =
-        fanout_chat_events_for_session(client_tx, event_bus, replay, chat_req.session_id.clone());
+    let fan_tx = fanout_chat_events_for_session(
+        client_tx,
+        event_bus,
+        replay,
+        chat_req.session_id.clone(),
+        chat_req
+            .working_dir
+            .as_deref()
+            .map(std::path::PathBuf::from),
+    );
     let active_chats = state.active_chats.clone();
     let mcp_pool = state.mcp_pool.clone();
     let telemetry = state.telemetry.clone();
@@ -1246,7 +1260,7 @@ async fn collect_compat_response(
         // Still run projector for any side effects / ordering consistency.
         let _ = projector.project(event.clone());
         match event {
-            ChatEvent::TextDelta { content } => current_block.push_str(&content),
+            ChatEvent::TextDelta { content, .. } => current_block.push_str(&content),
             ChatEvent::ArtifactStart { .. }
             | ChatEvent::ArtifactContent { .. }
             | ChatEvent::ArtifactEnd { .. } => {
@@ -1254,7 +1268,7 @@ async fn collect_compat_response(
                     current_block.push_str(&text);
                 }
             }
-            ChatEvent::ReasoningDelta { content } => reasoning.push_str(&content),
+            ChatEvent::ReasoningDelta { content, .. } => reasoning.push_str(&content),
             ChatEvent::ToolBatchStarted { calls } => {
                 if !current_block.is_empty() {
                     text_blocks.push(std::mem::take(&mut current_block));
@@ -1270,6 +1284,7 @@ async fn collect_compat_response(
                 id,
                 name,
                 arguments,
+                ..
             } => {
                 if !current_block.is_empty() {
                     text_blocks.push(std::mem::take(&mut current_block));
@@ -1712,6 +1727,9 @@ mod tests {
         let mut p = CompatProjector::openai_chat("id1".into(), "m".into(), 1, None);
         let chunks = p.project(ChatEvent::TextDelta {
             content: "hi".into(),
+            message_id: None,
+            part_id: None,
+            part_seq: None,
         });
         assert!(chunks[0].data.contains("\"role\":\"assistant\"") || chunks.len() >= 2);
         let joined: String = chunks.iter().map(|c| c.data.as_str()).collect();
@@ -1724,6 +1742,9 @@ mod tests {
         let mut p = CompatProjector::openai_chat("id1".into(), "m".into(), 1, None);
         let chunks = p.project(ChatEvent::ReasoningDelta {
             content: "think".into(),
+            message_id: None,
+            part_id: None,
+            part_seq: None,
         });
         let joined: String = chunks.iter().map(|c| c.data.as_str()).collect();
         assert!(joined.contains("reasoning_content"));
@@ -1737,6 +1758,7 @@ mod tests {
             id: "call_1".into(),
             name: "bash".into(),
             arguments: r#"{"command":"ls"}"#.into(),
+            message_id: None,
         });
         let out = p.project(ChatEvent::ToolOutputChunk {
             id: "call_1".into(),
@@ -1771,9 +1793,15 @@ mod tests {
         let mut p = CompatProjector::anthropic("msg_1".into(), "m".into(), None);
         let a = p.project(ChatEvent::ReasoningDelta {
             content: "r".into(),
+            message_id: None,
+            part_id: None,
+            part_seq: None,
         });
         let b = p.project(ChatEvent::TextDelta {
             content: "t".into(),
+            message_id: None,
+            part_id: None,
+            part_seq: None,
         });
         let joined: String = a.iter().chain(b.iter()).map(|c| c.data.as_str()).collect();
         assert!(joined.contains("thinking"));

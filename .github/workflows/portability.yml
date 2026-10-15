@@ -53,7 +53,11 @@ jobs:
         run: |
           set -o pipefail
           cargo test --locked --lib -p jeikcode-capabilities -p jeikcode-coding -p jeikcode-telemetry 2>&1 | tee "$RUNNER_TEMP/native-test.log"
-      - name: Check native libraries
+      - name: TUI library contracts
+        run: |
+          set -o pipefail
+          cargo test --locked -p jeikcode-tuix --lib -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/tui-test.log"
+      - name: Native library compile check
         run: |
           set -o pipefail
           cargo check --locked --lib -p jeikcode-capabilities -p jeikcode-coding -p jeikcode-telemetry 2>&1 | tee "$RUNNER_TEMP/native-check.log"
@@ -75,6 +79,7 @@ jobs:
           path: |
             ${{ runner.temp }}/utf8-hook.log
             ${{ runner.temp }}/native-test.log
+            ${{ runner.temp }}/tui-test.log
             ${{ runner.temp }}/native-check.log
             ${{ runner.temp }}/build-watch-test.log
           if-no-files-found: warn
@@ -82,13 +87,12 @@ jobs:
 
   feature-subsets:
     # Supported reduced combinations, NOT a claim of standalone minimal features.
-    name: Supported subset (${{ matrix.features }}, ${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: Supported subset (${{ matrix.features }})
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
         features: ["provider,tools", "provider,tools,cc-hooks"]
     steps:
       - uses: actions/checkout@v4

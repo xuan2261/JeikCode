@@ -2699,8 +2699,8 @@ mod tests {
     fn tool_call_updates_spinner_label() {
         let mut s = UiState::new();
         s.on_submit();
-        s.on_tool_call_started("read_file");
-        assert!(s.spinner_label.contains("read_file"));
+        s.on_tool_call_started("read");
+        assert!(s.spinner_label.contains("read"));
     }
 
     #[test]
@@ -2727,12 +2727,12 @@ mod tests {
     fn sub_agent_dispatch_overrides_stale_tool_label() {
         // Reproduces the user's "Running ReadFile… 82s" stale-spinner
         // problem: the foreground turn was waiting on pool.execute_all and
-        // the last tool name (read_file) stayed pinned. After dispatch_start
+        // the last tool name (read) stayed pinned. After dispatch_start
         // the label must reflect the sub-agent counter, not the dead tool.
         let mut s = UiState::new();
         s.on_submit();
-        s.on_tool_call_started("read_file");
-        assert!(s.spinner_label.contains("read_file"));
+        s.on_tool_call_started("read");
+        assert!(s.spinner_label.contains("read"));
         let tasks = (0..6)
             .map(|i| task_info(&format!("a{}.rs", i), ""))
             .collect();
@@ -3131,6 +3131,7 @@ mod tests {
         let confirmed = st.on_steered(&[jeikcode_kernel::event::SteeredInput {
             text: "one".into(),
             images: Vec::new(),
+            message_id: None,
         }]); // kernel confirms one fold
         assert_eq!(
             confirmed
@@ -3149,6 +3150,7 @@ mod tests {
             st.on_steered(&[jeikcode_kernel::event::SteeredInput {
                 text: "remote".into(),
                 images: Vec::new(),
+                message_id: None,
             }])
             .is_empty(),
             "a different client's fold cannot consume the local queue front"
@@ -3161,6 +3163,7 @@ mod tests {
             st.on_steered(&[jeikcode_kernel::event::SteeredInput {
                 text: "two".into(),
                 images: Vec::new(),
+                message_id: None,
             }])[0]
                 .message
                 .text,
@@ -3171,6 +3174,7 @@ mod tests {
             st.on_steered(&[jeikcode_kernel::event::SteeredInput {
                 text: "remote".into(),
                 images: Vec::new(),
+                message_id: None,
             }])
             .is_empty(),
             "spurious / cross-client fold cannot fabricate a local echo"

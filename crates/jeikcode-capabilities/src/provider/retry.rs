@@ -11,7 +11,37 @@
 use std::time::Duration;
 
 use jeikcode_kernel::provider::RateLimitRetryOwner;
-use jeikcode_kernel::stream::StreamEvent;
+use jeikcode_kernel::stream::{ProviderError, StreamEvent};
+
+pub(crate) enum OpenSend {
+    Response(reqwest::Response),
+    Transport(reqwest::Error),
+    Timeout,
+}
+
+/// TTFB watchdog around `req.send()`. Headers arriving ends the wait; a slow
+/// streaming body is never truncated.
+pub(crate) async fn send_with_ttfb(
+    req: reqwest::RequestBuilder,
+    open_timeout: Duration,
+) -> OpenSend {
+    match tokio::time::timeout(open_timeout, req.send()).await {
+        Ok(Ok(resp)) => OpenSend::Response(resp),
+        Ok(Err(e)) => OpenSend::Transport(e),
+        Err(_) => OpenSend::Timeout,
+    }
+}
+
+pub(crate) fn ttfb_timeout_error(open_timeout: Duration) -> ProviderError {
+    ProviderError {
+        retryable: true,
+        message: format!(
+            "open failed: 等待首字节超过 {}s(网关无响应)",
+            open_timeout.as_secs()
+        ),
+        ..Default::default()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StreamReadRecovery {

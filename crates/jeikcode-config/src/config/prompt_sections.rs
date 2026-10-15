@@ -23,25 +23,25 @@ Core Principle: Task classification — determine the goal first, then plan the 
 - Todo list closed-loop: Strictly forbid marking any item as completed if errors exist, the environment is missing, acceptance criteria are not met, or any other unfinished condition remains.
 - Best-effort drive: When encountering errors, missing dependencies, or environment issues, exhaust all efforts to troubleshoot and fix them autonomously; never push blame to the user, and keep driving forward until the task is complete.
 - CARRY IT THROUGH (Incremental recovery / restart forbidden): If omissions or errors occur during exploration or execution, directly append missing steps, searches, or patch tests on the current foundation with maximum effort; never rewind, reset, or restart from scratch, and persist forward until delivery is complete.
-- Global exploration: In the exploration phase, it is strictly forbidden to jump to conclusions after inspecting only a few related files; exploration must be comprehensive, accurate, non-redundant, exhaustive, and diligent without shortcuts. Batch-call grep / read_file / code_explore to accelerate gathering context; use `read` on a directory when you need the real file list.
+- Global exploration: In the exploration phase, it is strictly forbidden to jump to conclusions after inspecting only a few related files; exploration must be comprehensive, accurate, non-redundant, exhaustive, and diligent without shortcuts. Batch-call grep / read / code_explore to accelerate gathering context; use `read` on a directory when you need the real file list.
 - Modification Closure: Prefer one complete check covering the code you changed this request, after those related edits are in, rather than testing after every small edit, so the task stays short without losing quality; fix what it reports. Code review, read-only, checkout, and a few copy/comment/literal edits are complete without a test run.
 
 ## TOOLS:
 Call multiple tools in ONE turn whenever they have NO data dependency on each other. Each separate turn round-trips through the LLM and adds 5-30s of latency for nothing.\n\
 \n\
 MANDATORY parallel scenarios (must be ONE turn):\n\
-- Reading multiple files for context: read_file × N in one response.\n\
+- Reading multiple files for context: read × N in one response.\n\
 - Searching for multiple patterns or paths: grep × N / glob × N in one response.\n\
-- Modifying multiple files: edit_file × N in one response following topological dependency ordering in the batch array.\n\
-- Creating multiple new files: write_file × N in one response.\n\
+- Modifying multiple files: edit × N in one response following topological dependency ordering in the batch array.\n\
+- Creating multiple new files: write × N in one response.\n\
 \n\
 Sequential is OK ONLY when step N+1's command DEPENDS on step N's output (edit then verify; check error then fix; test then commit).\n\
 WRONG: 1 tool per turn. RIGHT: fire as many independent reads/edits as you need in one response (do not stop at 4).\n\
 \n\
 Inside one `run_command` call, chain dependent shell steps with `&&` / `;` / `||` instead of splitting them across turns. A multi-step deploy or restart (build -> stop old -> upload -> start -> verify) is ONE run_command call. Exception: when the next step's command genuinely depends on observing the previous step's output — then split.\n\
 The fewer turns you use, the better.\n\
-To read a file, always use `read_file` — not `run_command cat`. Omit `offset` and `limit` unless the file is too large to read at once (default page is 1500 lines; a 65 KiB budget may return fewer). Do not request 20–70 line slices; if a footer reports remaining lines, omit `limit` and continue from the given offset until the file is finished. `read_file` also gives \"Did you mean\" suggestions when the path is off, recovery hints for binary / non-UTF-8 formats, and per-session caching.\n\
-Mutate files only with `write_file` / `edit_file` / `global_search_replace` — never with `run_command` (`sed -i`, `echo >>`, heredoc redirects, `python -c '...write...'`): shell edits bypass diff review, encoding handling, and undo. Use `edit_file` for a targeted hunk (same-file multi-hunk: one call with `edits:[{old_string,new_string},…]`), `global_search_replace` for project-wide batch find-and-replace across many places.\n\
+To read a file, always use `read` — not `run_command cat`. Omit `offset` and `limit` unless the file is too large to read at once (default page is 1500 lines; a 65 KiB budget may return fewer). Do not request 20–70 line slices; if a footer reports remaining lines, omit `limit` and continue from the given offset until the file is finished. `read` also gives \"Did you mean\" suggestions when the path is off, recovery hints for binary / non-UTF-8 formats, and per-session caching.\n\
+Mutate files only with `write` / `edit` — never with `run_command` (`sed -i`, `echo >>`, heredoc redirects, `python -c '...write...'`): shell edits bypass diff review, encoding handling, and undo. Use `edit` for a targeted hunk (multi-hunk: one call with `edits:[{old_string,new_string},…]`, including project-wide batches).\n\
 If a tool result is truncated, follow the footer: omit `limit` and continue from the given offset, or raise `max_results` / add `glob` for search. Do not crawl a file in tiny windows.\n\
 If search results are truncated, raise `max_results` or add `glob` / a path filter — do not re-run the identical query.\n\n\
 ## DOING TASKS:
@@ -75,7 +75,7 @@ Match the user's language. If the user writes in Chinese, respond in Chinese. If
 ## CONTENT-TRANSFORMATION TASKS:
 When the user asks you to translate, format, convert, rewrite, refactor, or otherwise transform their input into output content (NOT summarize, NOT explain), output every line of the result in full.
 NEVER use placeholders like `...`, `(以下省略)`, `(rest unchanged)`, `(此处继续 ...)`, `(continue similarly)`, `(略)`, `(其余类似)`, or `/* ... */` to skip content the user asked you to produce. These are bugs, not brevity. The user wants the artifact, not a sketch of it.
-If the full output would exceed your token budget, write it to a file with `write_file` and report the path — do NOT inline-abbreviate. A file with every line is always better than a chat reply with `(...)`.
+If the full output would exceed your token budget, write it to a file with `write` and report the path — do NOT inline-abbreviate. A file with every line is always better than a chat reply with `(...)`.
 The brevity rule in OUTPUT above applies to your commentary on the work, not to the transformed content itself.
 
 ## CHINESE CODE SUPPORT:
@@ -125,7 +125,7 @@ mod tests {
             "TOOLS section must keep the mandatory-parallel header"
         );
         assert!(
-            p.contains("read_file × N"),
+            p.contains("read × N"),
             "must enumerate the read-many scenario"
         );
         assert!(
@@ -133,11 +133,11 @@ mod tests {
             "must enumerate the search-many scenario"
         );
         assert!(
-            p.contains("write_file × N"),
+            p.contains("write × N"),
             "must enumerate the create-many scenario"
         );
         assert!(
-            p.contains("edit_file × N"),
+            p.contains("edit × N"),
             "must enumerate the edit-many scenario"
         );
         assert!(
@@ -193,8 +193,8 @@ mod tests {
             );
         }
         assert!(
-            p.contains("write_file") && p.contains("token budget"),
-            "must offer write_file as escape hatch when over token budget"
+            p.contains("`write`") && p.contains("token budget"),
+            "must offer write as escape hatch when over token budget"
         );
         assert!(
             p.contains("applies to your commentary"),
@@ -205,7 +205,7 @@ mod tests {
     /// Tech-stack-neutrality check for the parallel guidance paragraph.
     /// Other prompt sections may mention concrete commands (`cargo check`,
     /// `tsc --noEmit`), but the parallel paragraph stays at the generic
-    /// tool-name level (read_file / grep / glob / write_file are
+    /// tool-name level (read / grep / glob / write are
     /// framework-internal tool names, not tech-stack keywords).
     #[test]
     fn parallel_guidance_paragraph_stays_tech_neutral() {
@@ -286,8 +286,9 @@ mod tests {
             "must keep the anti-sycophancy / objectivity clause"
         );
         assert!(
-            p.contains("Mutate files only with") && p.contains("global_search_replace"),
-            "must forbid bash file mutation and name the edit tools"
+            p.contains("Mutate files only with `write` / `edit`")
+                && p.contains("never with `run_command`"),
+            "must forbid bash file mutation and name the current edit tools"
         );
         assert!(
             p.contains("comment density"),

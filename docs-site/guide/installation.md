@@ -81,21 +81,3 @@ cd JeikCode
 cd webui && npm run build && cd ..
 cargo install --path crates/jeikcode-cli --bin jeikcode --locked
 ```
-
-### 3. Uninstallation & Data Cleanup
-
-To remove JeikCode, run the uninstallation script:
-
-::: code-group
-
-```bash [Linux / macOS / HarmonyOS PC]
-curl -fsSL https://raw.githubusercontent.com/jeikl/JeikCode/main/scripts/uninstall.sh | bash
-```
-
-```powershell [Windows (PowerShell)]
-irm https://raw.githubusercontent.com/jeikl/JeikCode/main/scripts/uninstall.ps1 | iex
-```
-
-:::
-
-- **Configuration & State**: Session histories and configurations are stored in `~/.jeikcode/`. Delete this directory manually to completely reset.

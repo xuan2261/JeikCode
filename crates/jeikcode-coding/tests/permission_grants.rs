@@ -18,14 +18,20 @@ fn _isolate_jeikcode_home() {
 async fn always_allow_grants_survive_reassembly() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
-    let workspace_target = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("target");
+    // Canonicalize: a path containing `../..` is an “unresolved parent traversal” per the write
+    // gate's design → prompted WITHOUT remembering every time, so the grant can never survive
+    // re-assembly (which is exactly what this test measures).
+    let workspace_target = std::fs::canonicalize(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("target"),
+    )
+    .unwrap();
     let outside_dir = tempfile::tempdir_in(workspace_target).unwrap();
-    std::env::set_var("JEIKCODE_HOME", home.path());
+    let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
 
     let mut cfg = CodingAgentConfig::new("k", "http://unused", "test-model", project.path());
-    cfg.stream_timeout = Duration::from_secs(5);
+    cfg.timeouts = cfg.timeouts.with_content_liveness(Duration::from_secs(5));
     cfg.request_timeout = Some(Duration::from_secs(5));
     let opts = PrepareOptions {
         session: SessionMode::Disabled,
@@ -51,7 +57,7 @@ async fn always_allow_grants_survive_reassembly() {
         vec![
             StreamEvent::ToolCall(ToolCall {
                 id: "c1".into(),
-                name: "write_file".into(),
+                name: "write".into(), // 规范名（旧名 `write_file` 会走别名路径）
                 arguments: format!(r#"{{"file_path":{:?},"content":"hello"}}"#, out_file_str),
             }),
             StreamEvent::Done { truncated: false },
@@ -71,7 +77,10 @@ async fn always_allow_grants_survive_reassembly() {
         })
         .unwrap();
 
-    // Handle approval request and reply with AllowAlways
+    // 回复“始终允许 + 记住”——对应 UI 上的“本会话/始终允许”。
+    // 排查结论（曾误判为实现 bug）：授权的记录/检查一直是对的；真正原因是本用例早先把文件
+    // 写到带 `../..` 的路径下（未解析的父级穿越）——按写门设计，这种情况**每次都问、不记住**。
+    // 夹具已规范化，授权正常跨重组生效。
     let mut seen_approval = false;
     while let Some(ev) = h1.events.recv().await {
         match ev {
@@ -82,7 +91,7 @@ async fn always_allow_grants_survive_reassembly() {
                         id,
                         value: serde_json::json!({
                             "decision": "allow_always",
-                            "remember": false
+                            "remember": true
                         }),
                     })
                     .unwrap();
@@ -109,7 +118,7 @@ async fn always_allow_grants_survive_reassembly() {
         vec![
             StreamEvent::ToolCall(ToolCall {
                 id: "c2".into(),
-                name: "write_file".into(),
+                name: "write".into(), // 规范名（旧名 `write_file` 会走别名路径）
                 arguments: format!(
                     r#"{{"file_path":{:?},"content":"hello again"}}"#,
                     out_file_str

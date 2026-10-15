@@ -4,7 +4,10 @@ import {
   isAbsoluteRepairPath, makeRepairExportRequest, parseRepairCapability, parseRepairExport,
   parseRepairInfo, parseRepairPreview, REPAIR_PACKET_FILES, repairPacketSummary,
 } from './repairEvidence.ts';
-import { exportRepairPacket, getRepairCapability, getRepairInfo, getRepairPreview, listDir } from '../api.ts';
+import {
+  exportRepairPacket, getRepairCapability, getRepairInfo, getRepairPreview,
+  listDir, listLocalRepairDir,
+} from '../api.ts';
 
 const source = '/work/JeikCode';
 const run = '/work/repair-run';
@@ -75,6 +78,47 @@ test('source identity requires a full revision while unknown build fields remain
   assert.equal(value.installed_runtime_match, 'unknown');
   assert.throws(() => parseRepairInfo({ ...sourceInfo(), source: { ...sourceInfo().source, commit: 'b123456' } }));
   assert.throws(() => parseRepairInfo({ ...sourceInfo(), installed_runtime_match: 'matched' }));
+});
+
+test('trusted Windows canonical disk responses normalize without admitting UNC or device paths', () => {
+  const sourceRoot = 'C:\\Work\\JeikCode';
+  const runRoot = 'D:\\Repair\\run-1';
+  const exported = 'E:\\Repair\\packet';
+  const canonical = (path: string) => '\\\\?\\' + path;
+  const info = parseRepairInfo({ ...sourceInfo(), source_root: canonical(sourceRoot) });
+  assert.equal(info.source_root, sourceRoot);
+
+  const rawPreview = {
+    ...previewResponse(),
+    source_root: canonical(sourceRoot),
+    run_root: canonical(runRoot),
+  };
+  const preview = parseRepairPreview(rawPreview, info.source_root);
+  assert.equal(preview.source_root, sourceRoot);
+  assert.equal(preview.run_root, runRoot);
+  assert.equal(preview.packet.sha256, digest);
+  assert.deepEqual(makeRepairExportRequest(preview, digest, exported), {
+    source: sourceRoot, run: runRoot, accept: digest, output: exported,
+  });
+  assert.equal(parseRepairExport({
+    status: 'exported_local', output: canonical(exported), sha256: digest,
+  }, digest).output, exported);
+
+  for (const unsafe of [
+    '\\\\?\\UNC\\server\\share\\repair', '\\\\.\\pipe\\repair',
+    '\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy1\\repair',
+  ]) {
+    assert.throws(() => parseRepairInfo({ ...sourceInfo(), source_root: unsafe }));
+    assert.throws(() => parseRepairPreview({
+      ...rawPreview, run_root: unsafe,
+    }, sourceRoot));
+    assert.throws(() => parseRepairExport({
+      status: 'exported_local', output: unsafe, sha256: digest,
+    }, digest));
+  }
+  // Raw user input stays disallowed even though equivalent host-returned
+  // canonical disk paths are accepted solely after a trusted response.
+  assert.equal(isAbsoluteRepairPath(canonical(sourceRoot)), false);
 });
 
 test('preview retains all five exact original strings including CRLF, Unicode and controls', () => {
@@ -158,11 +202,62 @@ test('export requires acknowledgment of exactly this preview and uses its bound 
 });
 
 test('explicit absolute host paths accept supported forms and reject drive-relative input', () => {
-  for (const path of ['/work/source', 'C:\\Work\\JeikCode', 'D:/Work/JeikCode', '\\\\server\\share\\repo']) {
+  for (const path of ['/work/source', 'C:\\Work\\JeikCode', 'D:/Work/JeikCode']) {
     assert.equal(isAbsoluteRepairPath(path), true, path);
   }
-  for (const path of ['', '.', '../repo', '~', 'C:repo', 'C:', '/work/\0source']) {
+  // Windows UNC, device and extended-length namespaces must not reach any
+  // repair picker filesystem lookup (which can otherwise contact SMB hosts).
+  for (const path of [
+    '', '.', '../repo', '~', 'C:repo', 'C:', '/work/\0source',
+    '\\\\server\\share\\repo', '//server/share/repo',
+    '\\\\?\\UNC\\server\\share', '\\\\?\\C:\\Work\\JeikCode',
+    '\\\\.\\pipe\\repair', '//?/UNC/server/share', '/?/UNC/server/share',
+  ]) {
     assert.equal(isAbsoluteRepairPath(path), false, path);
+  }
+});
+
+test('local-only repair picker blocks network/device paths before issuing HTTP requests', async () => {
+  const originalFetch = globalThis.fetch;
+  const requests: string[] = [];
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    requests.push(String(input));
+    return new Response(JSON.stringify({ path: '/local/home', dirs: [] }), { status: 200 });
+  }) as typeof fetch;
+  try {
+    for (const path of [
+      '\\\\server\\share\\repo', '//server/share/repo', '\\\\?\\C:\\Work',
+    '\\\\.\\pipe\\repair', '//?/UNC/server/share', '../relative', '~',
+    ]) {
+      await assert.rejects(() => listLocalRepairDir(path), /local absolute directory/);
+    }
+    assert.deepEqual(requests, [], 'rejected paths must not reach generic /fs/list');
+    // An explicit absolute local path is required before any listing.
+    const local = await listLocalRepairDir('/local/home');
+    assert.equal(local.path, '/local/home');
+    assert.deepEqual(requests, ['/fs/list?path=%2Flocal%2Fhome']);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('repair picker refuses a host listing redirected to a network or device namespace', async () => {
+  const previousFetch = globalThis.fetch;
+  const requests: string[] = [];
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    requests.push(String(input));
+    return new Response(JSON.stringify({
+      path: '\\\\?\\UNC\\server.invalid\\share\\repo', dirs: [],
+    }), { status: 200 });
+  }) as typeof fetch;
+  try {
+    await assert.rejects(
+      () => listLocalRepairDir('/local/source'),
+      /nonlocal directory/,
+    );
+    assert.deepEqual(requests, ['/fs/list?path=%2Flocal%2Fsource']);
+  } finally {
+    globalThis.fetch = previousFetch;
   }
 });
 

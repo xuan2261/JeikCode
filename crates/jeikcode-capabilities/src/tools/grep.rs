@@ -1,9 +1,11 @@
 //! `grep` — regex content search under a directory, gitignore-aware. Read-only ⇒
 //! always `Safe`. Smart-case when `case_insensitive` is omitted (insensitive unless
-//! the pattern has an uppercase letter); `true`/`false` force the mode. An invalid
-//! regex falls back to a literal search. Build/VCS/cache dirs and `.log` files are
-//! skipped. A `path` pointing at a single file ignores `glob`/`type` so models that
-//! pass both do not get a spurious "0 files searched".
+//! the pattern has an uppercase letter); `true`/`false` force the mode. Regex mode
+//! treats a bare `{` as a literal (PCRE / GNU ERE semantics) instead of failing the
+//! build; a pattern that is still invalid falls back to a literal search. Build/VCS/
+//! cache dirs and `.log` files are skipped. A `path` pointing at a single file
+//! ignores `glob`/`type` so models that pass both do not get a spurious "0 files
+//! searched".
 
 use super::read::lenient_usize;
 use super::{err, for_each_project_entry, not_found_hint, ok, resolve_path};
@@ -183,6 +185,94 @@ fn unescape_punctuation_escapes(p: &str) -> String {
     res
 }
 
+/// 花括号宽容化：rust regex 会把任何未转义的 `{` 强制按计数重复解析，像
+/// `.sidebar {`、`function foo() {` 这类极常见的选择器/代码片段会直接让整串构建
+/// 失败；而 PCRE / GNU ERE / JS 都把这些「非合法量词」的 `{` 视为字面量。
+/// 该语义在此补齐：合法量词 `{n}` / `{n,}` / `{n,m}` 原样保留，其余未转义 `{`
+/// 一律转义为字面量 `\{`。反斜杠转义对整体搬运，`\{`、`\\` 不受影响。
+/// （`}` 无需处理：rust regex 允许未转义的 `}` 直接作为字面量。）
+fn escape_bare_braces(pat: &str) -> String {
+    let cs: Vec<char> = pat.chars().collect();
+    let mut out = String::with_capacity(pat.len() + 8);
+    let mut i = 0;
+    while i < cs.len() {
+        match cs[i] {
+            '\\' => {
+                out.push(cs[i]);
+                if i + 1 < cs.len() {
+                    out.push(cs[i + 1]);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            '{' => match counted_repetition_chars(&cs[i..]) {
+                Some(len) => {
+                    out.extend(cs[i..i + len].iter());
+                    i += len;
+                }
+                None => {
+                    out.push_str("\\{");
+                    i += 1;
+                }
+            },
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// `cs` 以 `{` 开头时，判断其能否构成 rust regex 认可的计数重复
+/// （`{n}` / `{n,}` / `{n,m}`，数字紧贴花括号），是则返回子串字符数。
+fn counted_repetition_chars(cs: &[char]) -> Option<usize> {
+    debug_assert_eq!(cs.first(), Some(&'{'));
+    let mut end = 1;
+    let digits_start = end;
+    while end < cs.len() && cs[end].is_ascii_digit() {
+        end += 1;
+    }
+    if end == digits_start {
+        return None; // `{}`、`{abc` 等非量词
+    }
+    if end < cs.len() && cs[end] == ',' {
+        end += 1;
+        while end < cs.len() && cs[end].is_ascii_digit() {
+            end += 1;
+        }
+    }
+    if end < cs.len() && cs[end] == '}' {
+        Some(end + 1)
+    } else {
+        None
+    }
+}
+
+/// 构建正则匹配器：raw 构建失败时，用 `escape_bare_braces` 修正后重试一次，
+/// 仍失败则返回原始错误（由调用方决定是否再降级为全量字面量）。
+fn build_regex_lenient(
+    pat: &str,
+    case_insensitive: bool,
+) -> Result<RegexMatcher, grep::regex::Error> {
+    match RegexMatcherBuilder::new()
+        .case_insensitive(case_insensitive)
+        .build(pat)
+    {
+        Ok(m) => Ok(m),
+        Err(orig) => {
+            let fixed = escape_bare_braces(pat);
+            if fixed == pat {
+                return Err(orig);
+            }
+            RegexMatcherBuilder::new()
+                .case_insensitive(case_insensitive)
+                .build(&fixed)
+        }
+    }
+}
+
 /// 智能嗅探 pattern 是否包含明显的正则表达式复合语法特征
 /// 用于在默认字面量搜空时触发同轮静默重试，绝不将单个点号或标点误判为正则
 fn has_regex_indicators(p: &str) -> bool {
@@ -210,6 +300,16 @@ fn has_regex_indicators(p: &str) -> bool {
         || (p.contains('[')
             && p.contains(']')
             && (p.contains("0-9") || p.contains("a-z") || p.contains("A-Z")))
+}
+
+/// 字面量搜索零命中、pattern 里带 `.` / `{` / `}` 这类「既像正则又像普通文本」的
+/// 歧义字符、且不含任何显式正则特征时，附加一行引导（绝不自动按正则重试——
+/// 单个点号必须按字面量处理，避免 v1.2.3 / file.txt 这类模式被误判）。
+fn literal_metachar_hint(p: &str) -> Option<&'static str> {
+    if has_regex_indicators(p) || !(p.contains('.') || p.contains('{') || p.contains('}')) {
+        return None;
+    }
+    Some("[grep: exact-text search — `.` / `{` / `}` are literal characters here. Retry with is_regex=true for regex semantics.]")
 }
 
 fn file_type_to_glob(t: &str) -> String {
@@ -286,7 +386,7 @@ impl Tool for GrepTool {
                 "is_regex": {
                     "type": "boolean",
                     "default": false,
-                    "description": "Whether pattern is a regular expression (default false)."
+                    "description": "Whether pattern is a regular expression (default false). A `{` that is not a valid quantifier (e.g. `.sidebar {`) is matched literally."
                 },
                 "case_insensitive": {
                     "type": "boolean",
@@ -328,7 +428,7 @@ impl Tool for GrepTool {
 
     // read-only → risk() defaults to Safe.
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
-        let (a, recovered) = match parse_grep_args(args) {
+        let (a, mut recovered) = match parse_grep_args(args) {
             Ok(v) => v,
             Err(e) => return e.into_tool_result(),
         };
@@ -337,7 +437,29 @@ impl Tool for GrepTool {
             .clone()
             .unwrap_or_else(|| ".".to_string())
             .replace('\\', "/");
-        let root = resolve_path(&raw, &ctx.working_dir);
+        let mut root = resolve_path(&raw, &ctx.working_dir);
+        // 路径落空时的兜底（避免“报错 → 模型再猜一轮”）：
+        // ① 工作区内存在唯一同名条目 → 直接搜它；
+        // ② 否则退到最近的、仍在工作区内的已存在祖先目录（同时列出 did-you-mean 候选）；
+        // ③ 都不可用（工作区外等）→ 保持原有报错语义（含最近祖先提示）。
+        if tokio::fs::metadata(&root).await.is_err() {
+            match missing_path_fallback(&root, &ctx.working_dir).await {
+                Some((fallback, notice)) => {
+                    root = fallback;
+                    recovered = Some(match recovered {
+                        Some(prev) => format!("{prev}\n{notice}"),
+                        None => notice,
+                    });
+                }
+                None => {
+                    let hint = not_found_hint(&root, &ctx.working_dir).await;
+                    return err(format!(
+                        "{}{hint}",
+                        format_path_not_found("grep", &raw, &root, &ctx.working_dir)
+                    ));
+                }
+            }
+        }
         let root_meta = match tokio::fs::metadata(&root).await {
             Ok(m) => m,
             Err(_) => {
@@ -411,10 +533,9 @@ impl Tool for GrepTool {
 
         let initial_matcher = if explicit_regex {
             let pat = make_pat(&a.pattern, false);
-            match RegexMatcherBuilder::new()
-                .case_insensitive(is_case_insensitive)
-                .build(&pat)
-            {
+            // 花括号宽容构建：`.sidebar {` / `function foo() {` 里的裸 `{` 不再让整串
+            // 正则构建失败（转而按字面量匹配），保住 `.`、`.*` 等真实正则语义。
+            match build_regex_lenient(&pat, is_case_insensitive) {
                 Ok(m) => m,
                 Err(_) => {
                     let esc = regex::escape(&a.pattern);
@@ -500,9 +621,10 @@ impl Tool for GrepTool {
                     && has_regex_indicators(&search_pattern)
                     && Instant::now() < deadline
                 {
-                    if let Ok(retry_matcher) = RegexMatcherBuilder::new()
-                        .case_insensitive(is_case_insensitive)
-                        .build(&make_pat(&search_pattern, false))
+                    // 花括号宽容构建：`side.*rail {` 这类含裸 `{` 的正则特征模式
+                    // 此前会因构建失败被静默丢弃，现在可以正常救活。
+                    if let Ok(retry_matcher) =
+                        build_regex_lenient(&make_pat(&search_pattern, false), is_case_insensitive)
                     {
                         let retry_res = search(
                             &root,
@@ -534,6 +656,12 @@ impl Tool for GrepTool {
                     msg.push_str(
                         "\n[Search timed out; narrow `path` / `glob` or use code_explore]",
                     );
+                }
+                if !explicit_regex {
+                    if let Some(hint) = literal_metachar_hint(&pattern) {
+                        msg.push('\n');
+                        msg.push_str(hint);
+                    }
                 }
                 if let Some(note) = recovered {
                     msg = format!("{note}\n{msg}");
@@ -576,6 +704,70 @@ impl Tool for GrepTool {
 }
 
 const GREP_SHAPE: &str = r#"{"pattern":"<regex>","path":"<dir>"}"#;
+
+/// 目标路径不存在时的兜底搜索根（含写进输出的告示）。
+///
+/// 返回 `None` 表示不应兜底（例如最近祖先在工作区之外），调用方保留原有报错语义。
+async fn missing_path_fallback(
+    resolved: &Path,
+    working_dir: &Path,
+) -> Option<(std::path::PathBuf, String)> {
+    let leaf = resolved.file_name()?.to_string_lossy().to_string();
+    let display = crate::pathnorm::to_display(resolved);
+    // ① 工作区内同名候选（最多列 5 个；唯一时才自动选中）。
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    let deadline = Instant::now() + Duration::from_millis(800);
+    for_each_project_entry(working_dir, false, |entry| {
+        if Instant::now() >= deadline || candidates.len() >= 6 {
+            return false;
+        }
+        if entry.file_name().to_string_lossy() == leaf {
+            candidates.push(entry.path().to_path_buf());
+        }
+        true
+    });
+    if candidates.len() == 1 {
+        let candidate = candidates.remove(0);
+        return Some((
+            candidate.clone(),
+            format!(
+                "⚠ grep: path not found: {display} \u{2014} searched the only same-named entry instead: {}",
+                crate::pathnorm::to_display(&candidate)
+            ),
+        ));
+    }
+    let did_you_mean = if candidates.is_empty() {
+        String::new()
+    } else {
+        let listed: Vec<String> = candidates
+            .iter()
+            .map(|path| crate::pathnorm::to_display(path))
+            .collect();
+        format!("\ndid you mean: {}", listed.join(", "))
+    };
+    // ② 最近的、仍在工作区内的已存在祖先目录。
+    // 路径含 `..` 时必须 canonicalize 后再比：词法 `starts_with` 会把 `wd/..` 误判成在 wd 内。
+    let mut ancestor = resolved.parent();
+    while let Some(dir) = ancestor {
+        if let Ok(canonical) = tokio::fs::canonicalize(dir).await {
+            let base = tokio::fs::canonicalize(working_dir)
+                .await
+                .unwrap_or_else(|_| working_dir.to_path_buf());
+            if canonical.starts_with(&base) {
+                return Some((
+                    canonical.clone(),
+                    format!(
+                        "⚠ grep: path not found: {display} \u{2014} searched from the nearest existing directory instead: {}{did_you_mean}",
+                        crate::pathnorm::to_display(&canonical)
+                    ),
+                ));
+            }
+            break;
+        }
+        ancestor = dir.parent();
+    }
+    None
+}
 
 fn parse_grep_args(args: &str) -> Result<(Args, Option<String>), crate::tool_feedback::ParamError> {
     if let Ok(a) = parse_tool_args::<Args>("grep", args, GREP_SHAPE) {
@@ -1024,25 +1216,58 @@ mod tests {
 
     /// The real-world shape (a Windows user, 2026-08-05): a Gradle project whose `app/` has no
     /// `src/`. The model grepped `app/src`, got a bare "path not found", and spent the next
-    /// three turns guessing deeper paths. The error must name where the tree actually stops.
+    /// three turns guessing deeper paths.
+    ///
+    /// 现在不再只是报错：目标路径落空时自动退到“最近的、仍在工作区内的已存在目录”（此处
+    /// 即 `app/`）继续搜索，并把落空事实写进输出头部，一次调用就拿到信号。
     #[tokio::test]
-    async fn missing_path_error_carries_the_nearest_existing_ancestor() {
+    async fn missing_path_falls_back_to_the_nearest_existing_ancestor() {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir(d.path().join("app")).unwrap();
-        std::fs::write(d.path().join("app/build.gradle"), "").unwrap();
+        std::fs::write(d.path().join("app/build.gradle"), "dependencies { Serial }").unwrap();
         let r = GrepTool
             .execute(
                 r#"{"pattern":"Serial","path":"app/src/main/java"}"#,
                 &ctx(d.path()),
             )
             .await;
-        assert!(r.is_error, "{}", r.content);
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("path not found"), "{}", r.content);
         assert!(
-            r.content.contains("Nearest existing directory"),
+            r.content.contains("nearest existing directory"),
             "{}",
             r.content
         );
+        // 兜底根是 app/，因此能搜到里面的文件。
         assert!(r.content.contains("build.gradle"), "{}", r.content);
+    }
+
+    /// 目标文件落空、但工作区内只有一个同名条目 → 直接搜它（did-you-mean 单命中）。
+    #[tokio::test]
+    async fn missing_file_path_searches_the_only_same_named_entry() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("nested/deep")).unwrap();
+        std::fs::write(d.path().join("nested/deep/target.ts"), "NEEDLE here\n").unwrap();
+        let r = GrepTool
+            .execute(r#"{"pattern":"NEEDLE","path":"target.ts"}"#, &ctx(d.path()))
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("same-named entry"), "{}", r.content);
+        assert!(r.content.contains("NEEDLE here"), "{}", r.content);
+    }
+
+    /// 工作区之外的落空路径不兜底（否则会搜整个盘）：保留原有报错语义。
+    #[tokio::test]
+    async fn missing_path_outside_the_workspace_still_errors() {
+        let d = tempfile::tempdir().unwrap();
+        let r = GrepTool
+            .execute(
+                r#"{"pattern":"x","path":"../outside-worktree"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(r.is_error, "{}", r.content);
+        assert!(r.content.contains("does not exist"), "{}", r.content);
     }
 
     // Issue #722 parity (v2): weak models send max_results/context as a string ("50")
@@ -1856,5 +2081,83 @@ mod tests {
             "字面量命中优先，原样匹配：{}",
             r.content
         );
+    }
+
+    /// 用户上报回归：`.sidebar {`（CSS 选择器 / 代码片段形状）里的 `{` 不是合法量词，
+    /// rust regex 会因它构建失败，曾被静默降级为字面量搜索 → 正则模式下也 0 命中。
+    /// 现在按 PCRE / GNU ERE 语义把非法量词 `{` 当字面量，`.` 等正则语义保留。
+    #[tokio::test]
+    async fn regex_mode_tolerates_bare_brace_as_literal() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("app.css"),
+            ".app-sidebar {\n  width: 12px;\n}\n",
+        )
+        .unwrap();
+        let r = GrepTool
+            .execute(
+                r#"{"pattern":".sidebar {","is_regex":true}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        // `.` 保持通配：`-sidebar {` 命中 `.app-sidebar {`
+        assert!(r.content.contains("app.css:1:"), "{}", r.content);
+
+        // 合法量词不受影响，仍按重复语义工作
+        std::fs::write(d.path().join("rep.txt"), "aab\n").unwrap();
+        let r2 = GrepTool
+            .execute(r#"{"pattern":"a{2}b","is_regex":true}"#, &ctx(d.path()))
+            .await;
+        assert!(!r2.is_error, "{}", r2.content);
+        assert!(r2.content.contains("rep.txt:1:"), "{}", r2.content);
+    }
+
+    /// 自愈回归：默认字面量搜空 + 含 `.*` 正则特征 + 含裸 `{` 时，正则重试不再
+    /// 因花括号构建失败而夭折（此前 `side.*rail {` 会静默失败收场）。
+    #[tokio::test]
+    async fn self_healing_brace_pattern_regex_retry_fires() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("app.css"),
+            ".sidebar-rail {\n  width: 48px;\n}\n",
+        )
+        .unwrap();
+        let r = GrepTool
+            .execute(
+                r#"{"pattern":"side.*rail {","regex":false}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("app.css:1:"), "{}", r.content);
+    }
+
+    /// 零命中且 pattern 带单点号/花括号（歧义字符）时，提示可改走 is_regex=true；
+    /// 纯词搜零命中不附加该提示，保持原文案稳定。
+    #[tokio::test]
+    async fn zero_match_with_ambiguous_metachars_hints_is_regex() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.css"), ".other {\n}\n").unwrap();
+        let r = GrepTool
+            .execute(r#"{"pattern":".sidebar {","path":"a.css"}"#, &ctx(d.path()))
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("No matches found"), "{}", r.content);
+        assert!(r.content.contains("is_regex=true"), "{}", r.content);
+
+        let plain = GrepTool
+            .execute(r#"{"pattern":"absent_xyz"}"#, &ctx(d.path()))
+            .await;
+        assert!(!plain.content.contains("is_regex"), "{}", plain.content);
+    }
+
+    #[test]
+    fn escape_bare_braces_keeps_valid_quantifiers() {
+        assert_eq!(escape_bare_braces(".sidebar {"), ".sidebar \\{");
+        assert_eq!(escape_bare_braces("a{2}b{2,}c{2,3}"), "a{2}b{2,}c{2,3}");
+        assert_eq!(escape_bare_braces(r"foo\{bar{"), r"foo\{bar\{");
+        assert_eq!(escape_bare_braces(".x{abc}"), ".x\\{abc}");
+        assert_eq!(escape_bare_braces("{}"), "\\{}");
     }
 }

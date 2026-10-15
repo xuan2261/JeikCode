@@ -835,6 +835,12 @@ impl StdioClient {
 
 #[async_trait]
 impl McpClient for StdioClient {
+    /// `Drop`-context kill hook: the lease's last-owner teardown calls this so a host that
+    /// is winding its runtime down never leaves the child behind (see `kill_now` above).
+    fn kill_now(&self) {
+        StdioClient::kill_now(self);
+    }
+
     async fn initialize(&mut self) -> Result<InitializeResult> {
         let _reconnect = self.reconnect_lock.lock().await;
         match self.initialize_connection().await {
@@ -1280,8 +1286,13 @@ fn windows_wrap_command(command: &str, args: &[String]) -> (String, Vec<String>)
     wrap_cmd_script(command, args, "cmd.exe")
 }
 
-impl Drop for StdioClient {
-    fn drop(&mut self) {
+impl StdioClient {
+    /// Synchronous best-effort teardown: cancel recovery, drop the Windows job
+    /// (`KILL_ON_JOB_CLOSE` reaps the whole npx/cmd/node tree) and `start_kill` the direct
+    /// child so its stdout pipe closes and any reader unblocks. Idempotent (`process.take()`)
+    /// and `Drop`-safe (only `try_lock`, never awaits). Shared by [`Drop`] and
+    /// [`McpClient::kill_now`](super::client::McpClient::kill_now).
+    pub(crate) fn kill_now(&self) {
         if !self.owns_transport_lifetime {
             return;
         }
@@ -1301,6 +1312,12 @@ impl Drop for StdioClient {
                 let _ = child.start_kill();
             }
         }
+    }
+}
+
+impl Drop for StdioClient {
+    fn drop(&mut self) {
+        self.kill_now();
     }
 }
 

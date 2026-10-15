@@ -11,7 +11,7 @@ JeikCode supports dual-layer MCP mounting:
 2. **User Global-Level**: `~/.jeikcode/mcp.json` (globally accessible across all workspaces);
 3. **Priority & Overrides**: When a service name matches, the project-level definition overrides the global configuration.
 
-> 🛡️ **Project Trust Security**: When opening an untrusted project for the first time, project-level `.mcp.json` servers remain in a `blocked: untrusted project` state to prevent untrusted repositories from executing local commands automatically. You can click "Trust this project" in the WebUI sidebar or run `/mcp trust` in the terminal to grant connection access.
+> 🛡️ **Project Trust Security**: When opening an untrusted project for the first time, project-level `.mcp.json` servers remain in a `blocked: untrusted project` state to prevent untrusted repositories from executing local commands automatically. The WebUI sidebar auto-confirms that trust silently and reconnects (no prompt is shown); in the terminal you can still run `/mcp trust` to grant access manually.
 
 ---
 

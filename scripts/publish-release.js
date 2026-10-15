@@ -190,16 +190,17 @@ function upsertChangelog(existing, section, tag) {
 
 function renderReleaseNotes(tag, section) {
   const body = section.replace(/^## .+\n+/, '').trimEnd();
-  const releasePage = `https://github.com/jeikl/JeikCode/releases/tag/${tag}`;
+  const cleanVer = tag.replace(/^v/, '');
+  const downloadBase = `https://github.com/jeikl/JeikCode/releases/download/${tag}`;
 
   return [
     `## 🚀 Downloads & Installation`,
     '',
     '| Operating System | Recommended Installers (GUI + CLI) | Architecture |',
     '| :--- | :--- | :--- |',
-    `| **Windows** | [📥 **Open release assets for Windows installer (.exe)**](${releasePage}) | x64 |`,
-    `| **macOS** | [🍏 **Open release assets for macOS installers (.dmg)**](${releasePage}) | arm64 / x64 |`,
-    `| **Linux** | [🐧 **Open release assets for Linux packages (.deb / AppImage / rpm)**](${releasePage}) | x64 / arm64 |`,
+    `| **Windows** | [📥 **Download Windows Installer (.exe)**](${downloadBase}/JeikCode.Desktop_${cleanVer}_x64-setup.exe) | x64 |`,
+    `| **macOS** | [🍏 **Download for Apple Silicon (.dmg)**](${downloadBase}/JeikCode.Desktop_${cleanVer}_aarch64.dmg) · [🍏 **Intel (.dmg)**](${downloadBase}/JeikCode.Desktop_${cleanVer}_x64.dmg) | arm64 / x64 |`,
+    `| **Linux** | [🐧 **Download (.deb)**](${downloadBase}/JeikCode.Desktop_${cleanVer}_amd64.deb) · [🐧 **Universal (.AppImage)**](${downloadBase}/JeikCode.Desktop_${cleanVer}_amd64.AppImage) | x64 |`,
     '',
     '#### ⚡ One-Line Terminal Installation (CLI)',
     '',

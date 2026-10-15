@@ -473,7 +473,7 @@ async fn background_registry_reads_project_mcp_json() {
     // SAFETY: edition 2021; this is the only test that reads global MCP config, and
     // it only ever points JEIKCODE_HOME at an empty dir (no user mcp.json), so a
     // concurrent `load_mcp_config` still resolves to "no user servers".
-    std::env::set_var("JEIKCODE_HOME", home.path());
+    let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
 
     let project = tempfile::tempdir().unwrap();
 
@@ -519,7 +519,7 @@ async fn background_registry_reads_project_mcp_json() {
 async fn session_scope_spawns_once_per_session_while_project_scope_stays_shared() {
     let home = tempfile::tempdir().unwrap();
     unsafe {
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
     }
     let project = tempfile::tempdir().unwrap();
     let trust_store = home.path().join("mcp_trust.json");
@@ -636,7 +636,7 @@ async fn session_scope_spawns_once_per_session_while_project_scope_stays_shared(
 async fn session_scope_reload_recycles_only_the_changed_server() {
     let home = tempfile::tempdir().unwrap();
     unsafe {
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
     }
     let project = tempfile::tempdir().unwrap();
     let trust_store = home.path().join("mcp_trust.json");
@@ -760,7 +760,7 @@ async fn session_scope_reload_recycles_only_the_changed_server() {
 async fn session_scope_idle_reap_parks_then_lazy_respawns() {
     let home = tempfile::tempdir().unwrap();
     unsafe {
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
     }
     let project = tempfile::tempdir().unwrap();
     let trust_store = home.path().join("mcp_trust.json");
@@ -852,7 +852,7 @@ async fn session_scope_idle_reap_parks_then_lazy_respawns() {
 async fn session_scoped_mcp_receives_jeikcode_session_id_while_project_scoped_does_not() {
     let home = tempfile::tempdir().unwrap();
     unsafe {
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
     }
     let project = tempfile::tempdir().unwrap();
     let trust_store = home.path().join("mcp_trust.json");

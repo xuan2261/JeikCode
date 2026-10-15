@@ -1,13 +1,13 @@
-//! In-memory per-turn file state machine for `write_file`.
+//! In-memory per-turn file state machine for `write`.
 //!
 //! Enforces safety discipline for overwriting existing files:
-//! 1. When a target file does NOT exist on disk: `write_file` directly creates it (bypassing the state machine).
+//! 1. When a target file does NOT exist on disk: `write` directly creates it (bypassing the state machine).
 //! 2. When a target file DOES exist on disk:
-//!    - Requires that before the first `write_file` in the current turn, the last file operation on that file was `read_file`.
+//!    - Requires that before the first `write` in the current turn, the last file operation on that file was `read`.
 //!    - Once confirmed read in a turn, the file can be repeatedly overwritten until the turn ends.
 //!    - At the start of the next turn (`turn_start` or `advance_turn`), the read confirmation resets to 0 (unread).
 //! 3. If an existing file is unread:
-//!    - Intercepts `write_file` (refuses to mutate the file).
+//!    - Intercepts `write` (refuses to mutate the file).
 //!    - Informs the model to read and confirm before writing.
 //!    - Directly returns the file's latest 1500 lines formatted with line anchors.
 //!    - If total lines > 1500, informs how many lines remain and instructs reading the remainder via offset/limit.
@@ -101,7 +101,7 @@ pub fn reset_all() {
     lock.global_turn = 1;
 }
 
-/// Record a successful `read_file` on `path`.
+/// Record a successful `read` on `path`.
 pub fn record_read(path: &Path) {
     let p = canon(path);
     let mut lock = STATE_MACHINE.lock().unwrap();
@@ -123,7 +123,7 @@ pub fn record_read(path: &Path) {
     }
 }
 
-/// Record a successful `edit_file` on `path`.
+/// Record a successful `edit` on `path`.
 pub fn record_edit(path: &Path) {
     let p = canon(path);
     let mut lock = STATE_MACHINE.lock().unwrap();
@@ -145,7 +145,7 @@ pub fn record_edit(path: &Path) {
     }
 }
 
-/// Record a successful `write_file` on `path`.
+/// Record a successful `write` on `path`.
 pub fn record_write_success(path: &Path) {
     let p = canon(path);
     let mut lock = STATE_MACHINE.lock().unwrap();
@@ -179,7 +179,7 @@ pub enum WritePermission {
     RefusedUnread,
 }
 
-/// Check whether `write_file` is permitted on `path`.
+/// Check whether `write` is permitted on `path`.
 /// Returns `WritePermission::Allowed` if:
 /// - Target file does NOT exist (new file creation)
 /// - Target file exists and has been confirmed read in this turn (either prior write succeeded, or last_op is Read)
@@ -206,7 +206,7 @@ pub fn check_write_permitted(path: &Path) -> WritePermission {
     }
 
     if entry.1.last_op == Some(FileOpKind::Read) {
-        // First write in this turn, and the last operation before write was read_file!
+        // First write in this turn, and the last operation before write was read!
         entry.1.read_confirmed = true;
         return WritePermission::Allowed;
     }
@@ -277,21 +277,21 @@ pub async fn build_unread_refusal_message(path: &Path, display_path: &str) -> St
         format!(
             "[Showing lines 1-{display_count} of {total}. {remaining} lines remaining.]\n\
              ⚠️ **提示**：目标文件共有 {total} 行，当前已截断显示前 {display_count} 行，尚有 {remaining} 行未读取。\
-             请全部读取完（使用 `read_file` 配合 offset={}, limit=1500）确认后再写入！",
+             请全部读取完（使用 `read` 配合 offset={}, limit=1500）确认后再写入！",
             DEFAULT_READ_LIMIT + 1
         )
     } else {
         record_read_confirmed(path);
         format!(
             "[Showing lines 1-{total} of {total} (全量内容)]\n\
-             提示：以上为目标文件的全量内容（共 {total} 行）。当前已将该文件状态更新为【已读】，请确认欲写入文件内容后直接再次调用 `write_file` 写入。"
+             提示：以上为目标文件的全量内容（共 {total} 行）。当前已将该文件状态更新为【已读】，请确认欲写入文件内容后直接再次调用 `write` 写入。"
         )
     };
 
     format!(
         "❌ **[写入拦截：目标文件未读取确认]**\n\
          欲写入的文件已存在（`{display_path}`），且当前处于【未读取状态】。\n\
-         根据安全规范：在覆盖写入已存在的文件之前，必须先使用 `read_file` 读取确认该文件的当前内容！请读取确认欲写入文件内容后再写入。\n\n\
+         根据安全规范：在覆盖写入已存在的文件之前，必须先使用 `read` 读取确认该文件的当前内容！请读取确认欲写入文件内容后再写入。\n\n\
          已直接为你返回目标文件最新前 {display_count} 行内容：\n\
          ```\n\
          {rendered_lines}```\n\

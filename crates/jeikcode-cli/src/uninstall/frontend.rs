@@ -9,9 +9,22 @@ use super::{
     scan::scan,
     Decisions, ExecuteContext, Group, Outcome,
 };
+use jeikcode_config::i18n::{t, Msg};
 use jeikcode_updater::current_exe_path;
 
+/// How `jeikcode uninstall` was invoked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Preset {
+    /// Guided prompts. Asks whether to keep user configuration.
+    Interactive,
+    /// Program and PATH only. Keeps user configuration. No prompts.
+    Simple,
+    /// Program, PATH, and all user configuration. No prompts.
+    All,
+}
+
 pub struct Args {
+    pub preset: Preset,
     pub yes: bool,
     pub purge: bool,
     pub keep_data: bool,
@@ -27,24 +40,21 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     use is_terminal::IsTerminal;
     let tty = std::io::stdin().is_terminal();
 
-    if args.purge && args.keep_data {
-        eprintln!("jeikcode uninstall: --purge conflicts with --keep-data");
-        std::process::exit(EXIT_BAD_ARGS as i32);
-    }
-
-    let mode = decision_mode(&args, tty);
-    let tty_mode = matches!(mode, DecisionMode::Tty);
-    let decisions = match mode {
-        DecisionMode::Tty => None,
-        DecisionMode::Flag(d) => Some(d),
-        DecisionMode::AbortNoTty => {
-            eprintln!(
-                "jeikcode uninstall: refusing to run interactively without a TTY.\n\
-                 Pass one of: --yes (use defaults), --purge (delete everything),\n\
-                              --keep-data (binary only), --dry-run."
-            );
+    let mode = match resolve_uninstall(&args, tty) {
+        Ok(mode) => mode,
+        Err(Reject::Conflict) => {
+            eprintln!("{}", t(Msg::UninstallConflict));
             std::process::exit(EXIT_BAD_ARGS as i32);
         }
+        Err(Reject::NoTty) => {
+            eprintln!("{}", t(Msg::UninstallNoTty));
+            std::process::exit(EXIT_BAD_ARGS as i32);
+        }
+    };
+    let interactive = matches!(mode, DecisionMode::Interactive);
+    let decisions = match mode {
+        DecisionMode::Interactive => None,
+        DecisionMode::Ready(d) => Some(d),
     };
 
     let exe = current_exe_path()?;
@@ -65,15 +75,17 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     };
 
     if !final_decisions.binary {
-        eprintln!("jeikcode uninstall: cannot uninstall without removing binary; aborted.");
+        eprintln!("{}", t(Msg::UninstallAborted));
         std::process::exit(EXIT_USER_DECLINED as i32);
     }
 
-    if tty_mode {
-        if !confirm_and_kill_running_processes()? {
-            eprintln!("aborted: running processes were not terminated.");
-            std::process::exit(EXIT_USER_DECLINED as i32);
-        }
+    let stop = match args.preset {
+        Preset::Interactive if interactive => StopMode::Ask,
+        Preset::Simple | Preset::All => StopMode::Auto,
+        _ => StopMode::Skip,
+    };
+    if !stop_other_processes(stop)? {
+        std::process::exit(EXIT_USER_DECLINED as i32);
     }
 
     let ctx = build_context(&plan)?;
@@ -88,64 +100,99 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum DecisionMode {
-    Tty,
-    Flag(Decisions),
-    AbortNoTty,
+    Interactive,
+    Ready(Decisions),
 }
 
-fn decision_mode(args: &Args, tty: bool) -> DecisionMode {
-    if args.purge {
-        return DecisionMode::Flag(Decisions::PURGE);
+#[derive(Debug, PartialEq, Eq)]
+enum Reject {
+    Conflict,
+    NoTty,
+}
+
+enum StopMode {
+    Ask,
+    Auto,
+    Skip,
+}
+
+fn resolve_uninstall(args: &Args, tty: bool) -> Result<DecisionMode, Reject> {
+    let simple = matches!(args.preset, Preset::Simple);
+    let all = matches!(args.preset, Preset::All);
+    if (args.purge && args.keep_data)
+        || (simple && (args.purge || args.yes))
+        || (all && (args.keep_data || args.yes))
+    {
+        return Err(Reject::Conflict);
     }
-    if args.keep_data {
-        return DecisionMode::Flag(Decisions::KEEP_DATA);
+    if simple || args.keep_data {
+        return Ok(DecisionMode::Ready(Decisions::KEEP_DATA));
     }
-    if args.yes {
-        return DecisionMode::Flag(Decisions::DEFAULTS);
+    if all || args.purge {
+        return Ok(DecisionMode::Ready(Decisions::PURGE));
     }
-    if args.dry_run {
-        return DecisionMode::Flag(Decisions::DEFAULTS);
+    if args.yes || args.dry_run {
+        return Ok(DecisionMode::Ready(Decisions::DEFAULTS));
     }
     if !tty {
-        return DecisionMode::AbortNoTty;
+        return Err(Reject::NoTty);
     }
-    DecisionMode::Tty
+    Ok(DecisionMode::Interactive)
 }
 
-fn confirm_and_kill_running_processes() -> anyhow::Result<bool> {
+fn stop_other_processes(mode: StopMode) -> anyhow::Result<bool> {
     use super::actions::{kill_process, list_jeikcode_processes};
-    use std::io::{BufRead, Write};
+    use std::io::Write;
 
+    if matches!(mode, StopMode::Skip) {
+        return Ok(true);
+    }
     let procs = list_jeikcode_processes();
     if procs.is_empty() {
         return Ok(true);
     }
-
-    println!("\nFound {} running jeikcode process(es):", procs.len());
-    for p in &procs {
-        println!("  pid {}  {}", p.pid, p.name);
-    }
-    print!("Kill them and continue? [y/N]: ");
-    std::io::stdout().flush()?;
-    let mut line = String::new();
-    std::io::stdin().lock().read_line(&mut line)?;
-    if !line.trim().eq_ignore_ascii_case("y") {
-        return Ok(false);
+    if matches!(mode, StopMode::Ask) {
+        println!(
+            "{}",
+            t(Msg::UninstallKillFound {
+                count: procs.len() as u64
+            })
+        );
+        for p in &procs {
+            println!("  pid {}  {}", p.pid, p.name);
+        }
+        print!("{}", t(Msg::UninstallKillAsk));
+        std::io::stdout().flush()?;
+        if !read_yes(false)? {
+            eprintln!("{}", t(Msg::UninstallKillDeclined));
+            return Ok(false);
+        }
+    } else {
+        println!(
+            "{}",
+            t(Msg::UninstallAutoKilled {
+                count: procs.len() as u64
+            })
+        );
     }
     for p in procs {
         if let Err(e) = kill_process(p.pid) {
+            let err = e.to_string();
+            eprintln!(
+                "{}",
+                t(Msg::UninstallKillFailed {
+                    pid: u64::from(p.pid),
+                    error: &err,
+                })
+            );
+            // Windows cannot rename a running executable. Unix can unlink it.
             #[cfg(windows)]
-            {
-                eprintln!("could not kill pid {}: {}", p.pid, e);
-                return Ok(false); // Windows: must succeed or rename will fail
-            }
+            return Ok(false);
             #[cfg(not(windows))]
             {
-                eprintln!(
-                    "warn: could not kill pid {}: {} (continuing — Unix unlink doesn't need it)",
-                    p.pid, e
-                );
+                let _ = err;
             }
         }
     }
@@ -155,24 +202,24 @@ fn confirm_and_kill_running_processes() -> anyhow::Result<bool> {
 // ----- Task 9 implementations -----
 
 fn print_plan(plan: &super::scan::Plan, decisions: Decisions) {
-    println!("DRY RUN — no changes will be made.\n");
+    println!("{}", t(Msg::UninstallDryRun));
 
     print_group(
         plan,
         Group::Binary,
-        "[Group 1] Binary + PATH edit",
+        &t(Msg::UninstallGroupBinary),
         decisions.binary,
     );
     print_group(
         plan,
         Group::Credentials,
-        "[Group 2] Credentials and global config",
+        &t(Msg::UninstallGroupCredentials),
         decisions.credentials,
     );
     print_group(
         plan,
         Group::State,
-        "[Group 3] Local state and extensions",
+        &t(Msg::UninstallGroupState),
         decisions.state,
     );
 }
@@ -184,7 +231,11 @@ fn print_group(plan: &super::scan::Plan, g: Group, label: &str, will_remove: boo
     }
     println!(
         "{label}  [{}]",
-        if will_remove { "WILL REMOVE" } else { "KEEP" }
+        if will_remove {
+            t(Msg::UninstallWillRemove)
+        } else {
+            t(Msg::UninstallWillKeep)
+        }
     );
     for it in &items {
         let mark = if it.needs_privilege { " (sudo)" } else { "" };
@@ -214,65 +265,61 @@ fn human_size(bytes: u64) -> String {
 }
 
 fn prompt_user(plan: &super::scan::Plan) -> anyhow::Result<Option<Decisions>> {
-    use std::io::{BufRead, Write};
+    use std::io::Write;
 
-    println!("This will uninstall JeikCode from your system.\n");
+    println!("{}", t(Msg::UninstallIntro));
+    print_items(plan, Group::Binary, &t(Msg::UninstallRemovingBinary));
 
-    let g1 = ask_group(
-        plan,
-        Group::Binary,
-        "[Group 1] Remove binary and PATH edit?",
-        true,
-    )?;
-    if !g1 {
-        eprintln!("Group 1 declined; aborting (cannot keep binary while removing data).");
-        return Ok(None);
-    }
-    let g2 = ask_group(
-        plan,
-        Group::Credentials,
-        "[Group 2] Remove credentials and global config?",
-        false,
-    )?;
-    let g3 = ask_group(
-        plan,
-        Group::State,
-        "[Group 3] Remove local state and extensions?",
-        true,
-    )?;
+    let has_config = plan
+        .items
+        .iter()
+        .any(|i| matches!(i.group, Group::Credentials | Group::State));
+    let keep_config = if has_config {
+        let dir = plan.jeikcode_dir.display().to_string();
+        println!("{}", t(Msg::UninstallConfigHeader { dir: &dir }));
+        for group in [Group::Credentials, Group::State] {
+            for it in plan.items.iter().filter(|i| i.group == group) {
+                println!("  {}", it.path.display());
+            }
+        }
+        print!("{}", t(Msg::UninstallKeepConfig));
+        std::io::stdout().flush()?;
+        read_yes(true)?
+    } else {
+        println!("{}", t(Msg::UninstallNoConfig));
+        true
+    };
 
-    println!("\nSummary:");
-    summarize_decision(plan, Group::Binary, true);
-    summarize_decision(plan, Group::Credentials, g2);
-    summarize_decision(plan, Group::State, g3);
-
-    print!("\nContinue? [y/N]: ");
+    println!("{}", t(Msg::UninstallSummaryTitle));
+    println!("{}", t(Msg::UninstallSummaryRemoveBinary));
+    println!(
+        "{}",
+        if keep_config {
+            t(Msg::UninstallSummaryKeepConfig)
+        } else {
+            t(Msg::UninstallSummaryRemoveConfig)
+        }
+    );
+    print!("{}", t(Msg::UninstallContinue));
     std::io::stdout().flush()?;
-    let mut line = String::new();
-    std::io::stdin().lock().read_line(&mut line)?;
-    if !line.trim().eq_ignore_ascii_case("y") {
+    if !read_yes(false)? {
+        eprintln!("{}", t(Msg::UninstallAborted));
         return Ok(None);
     }
     Ok(Some(Decisions {
         binary: true,
-        credentials: g2,
-        state: g3,
+        credentials: !keep_config,
+        state: !keep_config,
     }))
 }
 
-fn ask_group(
-    plan: &super::scan::Plan,
-    g: Group,
-    prompt: &str,
-    default_yes: bool,
-) -> anyhow::Result<bool> {
-    use std::io::{BufRead, Write};
-    let items: Vec<_> = plan.items.iter().filter(|i| i.group == g).collect();
+fn print_items(plan: &super::scan::Plan, group: Group, header: &str) {
+    let items: Vec<_> = plan.items.iter().filter(|i| i.group == group).collect();
     if items.is_empty() {
-        return Ok(default_yes);
+        return;
     }
-    println!("\n{prompt}");
-    for it in &items {
+    println!("{header}");
+    for it in items {
         let mark = if it.needs_privilege { " (sudo)" } else { "" };
         println!(
             "  {}  ({}){}",
@@ -281,9 +328,10 @@ fn ask_group(
             mark
         );
     }
-    let prompt_suffix = if default_yes { "[Y/n]" } else { "[y/N]" };
-    print!("Proceed? {prompt_suffix}: ");
-    std::io::stdout().flush()?;
+}
+
+fn read_yes(default_yes: bool) -> anyhow::Result<bool> {
+    use std::io::BufRead;
     let mut line = String::new();
     std::io::stdin().lock().read_line(&mut line)?;
     let answer = line.trim();
@@ -295,42 +343,28 @@ fn ask_group(
     })
 }
 
-fn summarize_decision(plan: &super::scan::Plan, g: Group, will_remove: bool) {
-    let count = plan.items.iter().filter(|i| i.group == g).count();
-    if count == 0 {
-        return;
-    }
-    let action = if will_remove { "Remove" } else { "Keep" };
-    let label = match g {
-        Group::Binary => "binary + PATH",
-        Group::Credentials => "credentials",
-        Group::State => "local state",
-    };
-    println!("  {action}: {count} items ({label})");
-}
-
 fn print_summary(outcome: &Outcome) {
     println!("\n──────────────────");
     if !outcome.removed.is_empty() {
-        println!("Removed:");
+        println!("{}", t(Msg::UninstallRemoved));
         for p in &outcome.removed {
             println!("  {}", p.display());
         }
     }
     if !outcome.kept.is_empty() {
-        println!("Kept (use --purge to remove later):");
+        println!("{}", t(Msg::UninstallKeptHint));
         for p in &outcome.kept {
             println!("  {}", p.display());
         }
     }
     if !outcome.failed.is_empty() {
-        println!("Failed:");
+        println!("{}", t(Msg::UninstallFailed));
         for (p, e) in &outcome.failed {
             println!("  {}  ({})", p.display(), e);
         }
     }
     if !outcome.backups.is_empty() {
-        println!("Backups:");
+        println!("{}", t(Msg::UninstallBackups));
         for p in &outcome.backups {
             println!("  {}", p.display());
         }
@@ -372,4 +406,93 @@ fn build_context(plan: &super::scan::Plan) -> anyhow::Result<ExecuteContext> {
             .map(|p| p.to_string_lossy().into_owned()),
     };
     Ok(ctx)
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::*;
+
+    fn args(preset: Preset) -> Args {
+        Args {
+            preset,
+            yes: false,
+            purge: false,
+            keep_data: false,
+            dry_run: false,
+        }
+    }
+
+    #[test]
+    fn simple_keeps_config_without_a_tty() {
+        let mode = resolve_uninstall(&args(Preset::Simple), false).unwrap();
+        assert_eq!(mode, DecisionMode::Ready(Decisions::KEEP_DATA));
+    }
+
+    #[test]
+    fn all_removes_config_without_a_tty() {
+        let mode = resolve_uninstall(&args(Preset::All), false).unwrap();
+        assert_eq!(mode, DecisionMode::Ready(Decisions::PURGE));
+    }
+
+    #[test]
+    fn interactive_needs_a_tty() {
+        assert_eq!(
+            resolve_uninstall(&args(Preset::Interactive), false),
+            Err(Reject::NoTty)
+        );
+        assert_eq!(
+            resolve_uninstall(&args(Preset::Interactive), true).unwrap(),
+            DecisionMode::Interactive
+        );
+    }
+
+    #[test]
+    fn flags_still_choose_a_plan_without_a_tty() {
+        let mut keep = args(Preset::Interactive);
+        keep.keep_data = true;
+        assert_eq!(
+            resolve_uninstall(&keep, false).unwrap(),
+            DecisionMode::Ready(Decisions::KEEP_DATA)
+        );
+
+        let mut purge = args(Preset::Interactive);
+        purge.purge = true;
+        assert_eq!(
+            resolve_uninstall(&purge, false).unwrap(),
+            DecisionMode::Ready(Decisions::PURGE)
+        );
+
+        let mut yes = args(Preset::Interactive);
+        yes.yes = true;
+        assert_eq!(
+            resolve_uninstall(&yes, false).unwrap(),
+            DecisionMode::Ready(Decisions::DEFAULTS)
+        );
+
+        let mut dry = args(Preset::Interactive);
+        dry.dry_run = true;
+        assert_eq!(
+            resolve_uninstall(&dry, false).unwrap(),
+            DecisionMode::Ready(Decisions::DEFAULTS)
+        );
+    }
+
+    #[test]
+    fn conflicting_options_are_rejected() {
+        let mut both = args(Preset::Interactive);
+        both.purge = true;
+        both.keep_data = true;
+        assert_eq!(resolve_uninstall(&both, true), Err(Reject::Conflict));
+
+        let mut simple_purge = args(Preset::Simple);
+        simple_purge.purge = true;
+        assert_eq!(
+            resolve_uninstall(&simple_purge, false),
+            Err(Reject::Conflict)
+        );
+
+        let mut all_keep = args(Preset::All);
+        all_keep.keep_data = true;
+        assert_eq!(resolve_uninstall(&all_keep, false), Err(Reject::Conflict));
+    }
 }

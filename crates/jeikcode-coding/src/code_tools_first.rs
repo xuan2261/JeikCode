@@ -58,7 +58,7 @@ fn apply_wander(count: &mut u8, name: &str) -> bool {
             *count = 0;
             false
         }
-        "grep" | "glob" | "read_file" => {
+        "grep" | "glob" | "read" | "read_file" => {
             *count = count.saturating_add(1);
             let nudge = *count == WANDER_NUDGE_AT;
             if *count >= WANDER_WINDOW {
@@ -214,10 +214,22 @@ mod tests {
         assert_eq!(n, 7);
         assert!(apply_wander(&mut n, "glob"), "8th combined wander nudges");
         assert_eq!(n, 8);
-        assert!(!apply_wander(&mut n, "read_file"));
+        assert!(!apply_wander(&mut n, "read"));
         assert_eq!(n, 9);
         assert!(!apply_wander(&mut n, "grep"), "10th combined call clears");
         assert_eq!(n, 0);
+    }
+
+    /// The legacy `read_file` alias counts exactly like the canonical `read` — old
+    /// transcripts (and gateways that still emit the alias) must not slip past the meter.
+    #[test]
+    fn legacy_read_file_alias_still_counts_as_a_wander_call() {
+        let mut n = 0u8;
+        for _ in 0..7 {
+            assert!(!apply_wander(&mut n, "grep"));
+        }
+        assert!(apply_wander(&mut n, "read_file"), "alias counts too");
+        assert_eq!(n, 8);
     }
 
     #[test]
@@ -227,8 +239,8 @@ mod tests {
         assert!(!apply_wander(&mut n, "grep"));
         assert!(!apply_wander(&mut n, "glob"));
         assert!(!apply_wander(&mut n, "glob"));
-        assert!(!apply_wander(&mut n, "read_file"));
-        assert!(!apply_wander(&mut n, "read_file"));
+        assert!(!apply_wander(&mut n, "read"));
+        assert!(!apply_wander(&mut n, "read"));
         assert!(!apply_wander(&mut n, "grep"));
         assert!(apply_wander(&mut n, "glob"));
         assert_eq!(n, 8);
@@ -238,7 +250,7 @@ mod tests {
     fn code_explore_clears_the_combined_count() {
         let mut n = 0u8;
         for _ in 0..6 {
-            apply_wander(&mut n, "read_file");
+            apply_wander(&mut n, "read");
         }
         assert_eq!(n, 6);
         assert!(!apply_wander(&mut n, "code_explore"));
@@ -253,7 +265,7 @@ mod tests {
     fn other_tools_do_not_move_the_window() {
         let mut n = 0u8;
         apply_wander(&mut n, "grep");
-        assert!(!apply_wander(&mut n, "edit_file"));
+        assert!(!apply_wander(&mut n, "edit"));
         assert!(!apply_wander(&mut n, "repo_map"));
         assert_eq!(n, 1);
     }
@@ -331,14 +343,7 @@ mod tests {
     async fn wander_appends_to_the_tool_result_on_the_eighth_combined_call() {
         let hook = CodeToolsFirstHook::new(true, Some("sess-wander"));
         let names = [
-            "grep",
-            "glob",
-            "read_file",
-            "grep",
-            "glob",
-            "read_file",
-            "grep",
-            "glob",
+            "grep", "glob", "read", "grep", "glob", "read", "grep", "glob",
         ];
         let mut last = String::new();
         for (i, name) in names.iter().enumerate() {
@@ -378,7 +383,7 @@ mod tests {
     async fn code_explore_result_resets_so_later_greps_do_not_nudge_early() {
         let hook = CodeToolsFirstHook::new(true, Some("sess-reset"));
         for _ in 0..6 {
-            after_named(&hook, "read_file", "x").await;
+            after_named(&hook, "read", "x").await;
         }
         let explored = after_named(&hook, "code_explore", "graph").await;
         assert!(!explored.contains(WANDER_NEEDLE), "{explored}");

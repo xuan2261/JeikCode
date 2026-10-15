@@ -38,60 +38,8 @@ export interface LiveLifecycleState {
   terminalConsumed: boolean;
 }
 
-export type LiveLifecycleEvent =
-  | { type: 'snapshot' }
-  | { type: 'input_accepted' }
-  | { type: 'state'; running: boolean; stopReason?: string; message?: string }
-  | { type: 'error'; message: string };
-
-export interface LiveLifecycleTransition {
-  state: LiveLifecycleState;
-  terminal?: ChatDoneDisposition;
-  diagnostic?: string;
-}
-
 export function createLiveLifecycleState(): LiveLifecycleState {
   return { running: false, terminalConsumed: false };
-}
-
-/**
- * Track only authoritative `/live` lifecycle observations.
- *
- * Kernel error events are diagnostics and cannot finish a turn. The following
- * `state { running: false }` owns the terminal, and duplicate idle states are
- * ignored so queue/persistence side effects happen once.
- */
-export function reduceLiveLifecycle(
-  current: LiveLifecycleState,
-  event: LiveLifecycleEvent,
-): LiveLifecycleTransition {
-  switch (event.type) {
-    case 'snapshot':
-      return { state: createLiveLifecycleState() };
-    case 'input_accepted':
-      return { state: { running: true, terminalConsumed: false } };
-    case 'error':
-      return { state: current, diagnostic: event.message };
-    case 'state':
-      if (event.running) {
-        return { state: { running: true, terminalConsumed: false } };
-      }
-      if (current.terminalConsumed) {
-        return { state: { running: false, terminalConsumed: true } };
-      }
-      return {
-        state: { running: false, terminalConsumed: true },
-        terminal: classifyChatDone({
-          stopReason: event.stopReason,
-          message: event.message,
-        }),
-      };
-  }
-}
-
-/** A snapshot is persisted history, not evidence that a turn is active. */
-export function restoreLiveSnapshot<T>(messages: T[]): { messages: T[]; running: false } {
-  return { messages, running: false };
 }
 
 /** Saved transcript is ahead of the canvas. Used while a turn is running so the
@@ -103,17 +51,6 @@ export function shouldAdoptDiskTranscript(input: {
   diskHasUser: boolean;
 }): boolean {
   return input.diskHasUser && input.diskText > input.canvasText;
-}
-
-/** Empty hub projections (view-only “new session”) must not wipe a canvas that
- * already has turns. A reconnect after the first Submit used to paint the
- * landing page over the live transcript. */
-export function keepCanvasOnEmptyLiveSnapshot(
-  snapshotMessageCount: number,
-  canvasMessageCount: number,
-  viewingThisSession: boolean,
-): boolean {
-  return viewingThisSession && snapshotMessageCount === 0 && canvasMessageCount > 0;
 }
 
 /** Keep the existing `/live` SSE when returning to the execution session.
@@ -310,58 +247,15 @@ export function sessionAssignedClaimsLocalTurn(input: {
   return input.ownsOpenStream || input.previousIdIsLocalTurn;
 }
 
-/** Idle snapshot replay of a finished turn repeats the latest user text.
- *  Hold that echo. A running turn whose prompt repeats the previous one
- *  (snapshot still shows the old turn) is released when an unpainted delta
- *  arrives — see `releaseHeldDuplicateUser`. */
-export function holdDuplicateUserEcho(input: {
-  idleSnapshot: boolean;
-  alreadyOnCanvas: boolean;
-  openUserTurn: boolean;
-  canvasInFlight: boolean;
-  turnLive: boolean;
-}): boolean {
-  return (
-    input.idleSnapshot &&
-    input.alreadyOnCanvas &&
-    !input.openUserTurn &&
-    !input.canvasInFlight &&
-    !input.turnLive
-  );
-}
-
-/** True when `incoming` still belongs on the last assistant (replay of this
- *  turn) rather than opening the next one. A brand-new thinking block does
- *  not start with the previous answer, and the previous answer is not a
- *  prefix of it. */
-export function deltaContinuesLastAssistant(
-  messages: Array<{ role: string; parts: ReplayPart[] }>,
-  event: { type: string; content?: string; id?: string },
-): boolean {
-  const last = [...messages].reverse().find((message) => message.role === 'assistant');
-  if (!last) return false;
-  if (event.type === 'tool_start' || event.type === 'tool_output' || event.type === 'tool_result') {
-    return !!event.id && last.parts.some((part) => part.kind === 'tool' && part.tool?.id === event.id);
-  }
-  if (event.type !== 'text' && event.type !== 'reasoning') return false;
-  const kind = event.type === 'reasoning' ? 'reasoning' : 'text';
-  let existing = '';
-  for (const part of last.parts) {
-    if (part.kind === kind && part.text) existing += part.text;
-  }
-  const incoming = event.content ?? '';
-  if (!existing || !incoming) return false;
-  const painted = withoutDisplayTruncation(existing);
-  if (!painted) return false;
-  return incoming.startsWith(painted) || painted.startsWith(incoming);
-}
-
+/** 归属消息优先：多回合 turn 中每一轮都是独立的 assistant 消息；只认“最后一条”
+ *  会把早先回合的日志重放判成新内容（幽灵思考块 / 幽灵正文）。
+ *  先按 message_id 定位回合，再按 tool call id 定位，最后回退到最后一条 assistant。 */
 type ReconcilePart = {
   kind: string;
   text?: string;
   tool?: { id?: string; output?: string; status?: string };
 };
-type ReconcileMessage = { role: string; parts: ReconcilePart[] };
+type ReconcileMessage = { role: string; parts: ReconcilePart[]; id?: string };
 
 function reconcileUserText(message: ReconcileMessage): string {
   const text = message.parts
@@ -402,11 +296,16 @@ function mergeTurnRest<T extends ReconcileMessage>(diskRest: T[], canvasRest: T[
   const canvasText = joinedTurnText(canvasRest);
   const canvasInFlight = transcriptHasInFlightAssistant(canvasRest as unknown as Array<{ role: string; parts: InFlightPart[] }>);
   const canvasAhead = (canvasText.startsWith(diskText) && canvasText.length >= diskText.length) || canvasInFlight;
+  // 上下文压缩：磁盘被摘要替换后**比画布更短**（而且不再是画布的前缀）。
+  // 显示只增不减 —— 画布是权威，绝不能用更短的磁盘去覆盖，
+  // 否则一次刷新就把画布里的历史显示成了压缩版。
+  const diskCompacted =
+    diskText.length > 0 && canvasText.length > diskText.length && !canvasText.startsWith(diskText);
 
   // 1. 若前端画布处于活跃进行中（in-flight）或文本已经领先/包含落盘文本：
   // 画布是正在流式生成的绝对真实源！严禁从落后的 diskRest 抽取旧思考块追加到末尾！
   // 仅将 diskRest 中已结算的 tool 状态同步到 canvasRest 对应的 tool 调用中。
-  if (canvasAhead) {
+  if (canvasAhead || diskCompacted) {
     const diskToolsById = new Map<string, ReconcilePart['tool']>();
     for (const m of diskRest) {
       for (const p of m.parts) {
@@ -479,18 +378,34 @@ export function reconcileRunningTranscript<T extends ReconcileMessage>(canvas: T
     lead = canvas.slice(0, firstCanvasUser);
   }
 
-  // 2. 顺序对齐全局 Turns，杜绝因单向指针错位导致的整段历史重复追加
+  // 2. 顺序对齐全局 Turns，杜绝因单向指针错位导致的整段历史重复追加。
+  // 优先按用户消息的稳定 id 对齐（重复文本/纯图片时唯一无歧义），文本匹配作回退。
   const matches: Array<{ d: number; c: number }> = [];
   let cSearch = 0;
   for (let d = 0; d < diskTurns.length; d++) {
-    const dText = reconcileUserText(diskTurns[d]!.user);
-    for (let c = cSearch; c < canvasTurns.length; c++) {
-      const cText = reconcileUserText(canvasTurns[c]!.user);
-      if (userTextsMatch(dText, cText)) {
-        matches.push({ d, c });
-        cSearch = c + 1;
-        break;
+    const dUser = diskTurns[d]!.user;
+    const dText = reconcileUserText(dUser);
+    const dId = dUser.id;
+    let found = -1;
+    if (dId) {
+      for (let c = cSearch; c < canvasTurns.length; c++) {
+        if (canvasTurns[c]!.user.id === dId) {
+          found = c;
+          break;
+        }
       }
+    }
+    if (found < 0) {
+      for (let c = cSearch; c < canvasTurns.length; c++) {
+        if (userTextsMatch(reconcileUserText(canvasTurns[c]!.user), dText)) {
+          found = c;
+          break;
+        }
+      }
+    }
+    if (found >= 0) {
+      matches.push({ d, c: found });
+      cSearch = found + 1;
     }
   }
 
@@ -649,8 +564,26 @@ export function unpaintedReplaySuffix(existing: string, incoming: string): strin
   if (incoming.startsWith(existing)) return incoming.slice(existing.length);
   const painted = collapseWs(existing);
   const chunk = collapseWs(incoming);
-  if (!chunk) return '';
-  if (painted === chunk || painted.endsWith(chunk) || painted.startsWith(chunk)) return '';
+  if (!chunk) {
+    // 纯空白增量（段落/列表分隔的换行、Markdown 缩进）绝不能当成"已画过"丢弃：
+    // provider 常把 "\n\n" 作为独立 delta 发出，丢了它 live 渲染就会把行/列表
+    // 粘在一起（刷新读全文才恢复）。
+    // 去重只针对"画布末尾已有同类空白"：重放/重复帧不得叠空行，
+    // 但末尾是空格之类非换行空白时，新的换行依然必须画上去。
+    const tail = existing.match(/\s+$/)?.[0] ?? '';
+    if (tail.endsWith(incoming)) return '';
+    if (incoming.includes('\n') && tail.includes('\n')) return '';
+    return incoming;
+  }
+  if (painted === chunk || painted.endsWith(chunk) || painted.startsWith(chunk)) {
+    // 折叠比较会把"非空白内容已画过、但换行骨架不同"的重放也判成已画过：
+    // 画布若已经粘连（旧版本丢过换行），直接丢弃就永远无法自愈。
+    // 安全收尾：非空白内容确实已存在时，只补回缺失的前导空白（不重写正文、不重复文本）。
+    const skeleton = (value: string) => value.replace(/[^\S\n]+/g, '');
+    if (!incoming.includes('\n') || skeleton(existing).endsWith(skeleton(incoming))) return '';
+    const leadingWhitespace = incoming.match(/^\s+/)?.[0] ?? '';
+    return leadingWhitespace && !existing.endsWith(leadingWhitespace) ? leadingWhitespace : '';
+  }
   if (chunk.startsWith(painted) && painted.length > 0) {
     let rest = incoming;
     let seen = 0;
@@ -665,6 +598,29 @@ export function unpaintedReplaySuffix(existing: string, incoming: string): strin
     return rest;
   }
   return incoming;
+}
+
+/**
+ * Id-based tail dedup for snapshot reconciliation.
+ * Drop canvas-tail messages whose stable `id` already exists in the settled
+ * snapshot, so a replayed/echoed message is not appended a second time.
+ *
+ * Optimistic rows carry no stored id yet (just sent, not bound), so an id-only
+ * check re-appends them: after a mid-turn refresh the newest prompt showed up
+ * TWICE at the bottom of the canvas. User text is therefore the fallback
+ * identity — same content on the snapshot means the row is already there.
+ */
+export function dropSnapshotDuplicates<T extends { id?: string; role?: string; parts?: InFlightPart[] }>(
+  snapshot: T[],
+  tail: T[],
+): T[] {
+  const ids = new Set(snapshot.map((m) => m.id).filter((value): value is string => !!value));
+  return tail.filter((m) => {
+    if (m.id && ids.has(m.id)) return false;
+    if (m.role !== 'user') return true;
+    const text = m.parts?.filter((part) => part.kind === 'text').map((part) => part.text || '').join('') ?? '';
+    return !text || !userMessageAlreadyOnCanvas(snapshot as unknown as CanvasMessage[], text);
+  });
 }
 
 type InFlightPart = {
@@ -747,180 +703,8 @@ export function shouldLockSendAsDetached(_input: {
   return false;
 }
 
-/** Events that prove a turn is actually streaming. Idle `/chat/watch` must not
- * upgrade to busy on `runtime_info` / leftover `user` replay / tokens — that
- * painted a stop button and blinking cursor on already-finished sessions. */
-/** After an idle `/live` snapshot, leftover journal events of a finished turn
- *  must not be painted again. A new `user` that is not already on the canvas
- *  (or `state.running=true` that is not stale) starts the next turn.
- *
- *  `turnLive` is the current-turn exception: this tab just submitted, the
- *  canvas already has an empty in-flight assistant, or lifecycle.running is
- *  true. Without it, an idle snapshot followed by our own user echo (already
- *  on the canvas) would swallow every later text/tool event until refresh. */
-export function shouldIgnoreLiveReplayAfterIdleSnapshot(
-  idleSnapshot: boolean,
-  eventType: string,
-  turnLive = false,
-): boolean {
-  if (!idleSnapshot || turnLive) return false;
-  switch (eventType) {
-    case 'text':
-    case 'reasoning':
-    case 'tool_start':
-    case 'tool_output':
-    case 'tool_progress':
-    case 'tool_result':
-    case 'tokens':
-      return true;
-    default:
-      return false;
-  }
-}
-
-/** Snapshot of a finished transcript must not arm the leftover-journal gate
- *  when we are keeping an in-flight canvas or already know a turn is live. */
-export function idleFlagAfterLiveSnapshot(input: {
-  snapshotHasInFlight: boolean;
-  keepCanvas: boolean;
-  canvasHasInFlight: boolean;
-  turnLive: boolean;
-  openUserTurn?: boolean;
-}): boolean {
-  if (input.turnLive || input.openUserTurn) return false;
-  if (input.keepCanvas) return !input.canvasHasInFlight;
-  return !input.snapshotHasInFlight;
-}
-
-/** Own `/live` echo is already on the canvas. Still leave idle-snapshot mode
- *  when that echo belongs to the turn we just started. */
-export function shouldClearIdleLiveSnapshotOnUser(input: {
-  alreadyOnCanvas: boolean;
-  canvasInFlight: boolean;
-  turnLive: boolean;
-  openUserTurn?: boolean;
-}): boolean {
-  if (!input.alreadyOnCanvas) return true;
-  return input.canvasInFlight || input.turnLive || input.openUserTurn === true;
-}
-
-/** Idle hub snapshots report `running: false`. Do not drop a busy cursor that
- *  this tab already armed for an in-flight send. */
-export function shouldKeepLiveBusyAcrossIdleSnapshot(input: {
-  keepCanvas: boolean;
-  canvasInFlight: boolean;
-  turnLive: boolean;
-  openUserTurn?: boolean;
-}): boolean {
-  return input.keepCanvas || input.canvasInFlight || input.turnLive || input.openUserTurn === true;
-}
-
-const SUBSTANTIAL_REPLAY_DELTA = 8;
-
 function collapseWs(value: string): string {
   return value.replace(/\s+/g, '');
-}
-
-/** Opening/closing fence restored from `artifact_*` (e.g. ```` ```text\\n ````). */
-export function isMarkdownFenceDelta(incoming: string): boolean {
-  return /^\s{0,3}(`{3,}|~{3,})[^\n]*\n?$/.test(incoming);
-}
-
-/**
- * True when `incoming` is a journal/replay chunk already painted on the
- * assistant. Sidebar leave → new session → return reconnects `/live`, which
- * snapshot-paints the turn and then replays the same TextDelta/Reasoning
- * window; appending those chunks duplicated 思考过程 / 「正在查看」 blocks.
- *
- * Short streaming tokens (1–4 chars) are not treated as duplicates just
- * because the character appeared earlier in the turn.
- *
- * CRITICAL: Only match at the head (startsWith) or tail (endsWith). Never use
- * includes() in the middle of existing text: a reply can legitimately repeat
- * section templates, headings, code snippets, or list prefixes (e.g. `* **报错输出**：`),
- * and middle includes() swallowed those tokens, corrupting markdown fences and layout.
- */
-export function assistantDeltaAlreadyPainted(existing: string, incoming: string): boolean {
-  if (!incoming) return true;
-  if (!existing) return false;
-  if (existing.endsWith(incoming) || existing.startsWith(incoming)) return true;
-  if (isMarkdownFenceDelta(incoming)) return false;
-  if (incoming.length < SUBSTANTIAL_REPLAY_DELTA) return false;
-  const painted = collapseWs(existing);
-  const chunk = collapseWs(incoming);
-  return chunk.length >= SUBSTANTIAL_REPLAY_DELTA && (painted.startsWith(chunk) || painted.endsWith(chunk));
-}
-
-type ReplayPart = {
-  kind: string;
-  text?: string;
-  tool?: { id?: string; output?: string; status?: string };
-};
-
-function joinedKindText(parts: ReplayPart[], kind: string): string {
-  let out = '';
-  for (const part of parts) {
-    if (part.kind === kind && part.text) out += part.text;
-  }
-  return out;
-}
-
-/** Skip `/live` journal replay that would re-append text, reasoning, or tool
- *  stdout already restored from snapshot/cache after a session switch. */
-export function liveContentDeltaAlreadyOnParts(
-  parts: ReplayPart[],
-  event: { type: string; content?: string; chunk?: string; id?: string },
-): boolean {
-  switch (event.type) {
-    case 'text':
-      return assistantDeltaAlreadyPainted(joinedKindText(parts, 'text'), event.content ?? '');
-    case 'reasoning':
-      return assistantDeltaAlreadyPainted(
-        joinedKindText(parts, 'reasoning'),
-        event.content ?? '',
-      );
-    case 'tool_output': {
-      const chunk = event.chunk ?? '';
-      if (!chunk) return true;
-      const row = event.id
-        ? parts.find((part) => part.kind === 'tool' && part.tool?.id === event.id)
-        : [...parts].reverse().find((part) => part.kind === 'tool');
-      return assistantDeltaAlreadyPainted(row?.tool?.output ?? '', chunk);
-    }
-    default:
-      return false;
-  }
-}
-
-/** After an idle `/live` snapshot, drop only journal replay that is already
- *  on the canvas. A new text/thinking/tool delta means the turn kept going
- *  (a phone refresh mid-stream) and must be painted. */
-export function idleReplayAlreadyPainted(
-  messages: Array<{ role: string; parts: ReplayPart[] }>,
-  event: { type: string; content?: string; chunk?: string; id?: string },
-): boolean {
-  const last = [...messages].reverse().find((message) => message.role === 'assistant');
-  const parts = last?.parts ?? [];
-  switch (event.type) {
-    case 'text':
-    case 'reasoning':
-    case 'tool_output':
-      return liveContentDeltaAlreadyOnParts(parts, event);
-    case 'tool_start':
-      return !!event.id && parts.some((part) => part.kind === 'tool' && part.tool?.id === event.id);
-    case 'tool_result':
-    case 'tool_progress': {
-      if (!event.id) return false;
-      const row = parts.find((part) => part.kind === 'tool' && part.tool?.id === event.id);
-      if (!row || row.kind !== 'tool') return false;
-      const status = row.tool?.status;
-      return status === 'done' || status === 'error' || status === 'incomplete';
-    }
-    case 'tokens':
-      return true;
-    default:
-      return false;
-  }
 }
 
 export function isWatchTurnActivationEvent(type: string): boolean {
@@ -940,26 +724,6 @@ export function isWatchTurnActivationEvent(type: string): boolean {
     default:
       return false;
   }
-}
-
-export type LiveSnapshotQueueDisposition =
-  | { discardQueued: false }
-  | { discardQueued: true; reason: 'terminal_unknown' };
-
-/**
- * A reconnect snapshot contains persisted history but no terminal reason. If
- * the previous connection observed an active turn, the daemon may have already
- * cleared that turn's replay window while the client was disconnected. Queued
- * input therefore cannot be drained safely until a fresh authoritative turn
- * lifecycle is observed.
- */
-export function liveSnapshotQueueDisposition(
-  wasRunning: boolean,
-  queuedCount: number,
-): LiveSnapshotQueueDisposition {
-  return wasRunning && queuedCount > 0
-    ? { discardQueued: true, reason: 'terminal_unknown' }
-    : { discardQueued: false };
 }
 
 export type ChatRecoveryState =
@@ -1020,17 +784,6 @@ export function chatRecoveryPolicy(state: ChatRecoveryState): ChatRecoveryPolicy
     allowQueueDrain: state !== 'terminal_unknown',
     allowStop: true,
   };
-}
-
-export type SyncAttachDisposition =
-  | { allowed: true }
-  | { allowed: false; reason: 'active_chat' | 'unresolved_chat' };
-
-export function syncAttachDisposition(
-  _chatRunning: boolean,
-  _recoveryState: ChatRecoveryState,
-): SyncAttachDisposition {
-  return { allowed: true };
 }
 
 /** Gate every `/chat` event, not only the promise terminal, against replacement. */

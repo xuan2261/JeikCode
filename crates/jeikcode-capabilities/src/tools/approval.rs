@@ -320,7 +320,7 @@ mod tests {
     fn risky_call() -> ToolCall {
         ToolCall {
             id: "1".into(),
-            name: "write_file".into(),
+            name: "write".into(),
             arguments: r#"{"file_path":"a.txt","content":"x"}"#.into(),
         }
     }
@@ -329,7 +329,7 @@ mod tests {
         // risk via a Safe arg? No — write is always Risky. Use ReadFileTool instead.
         ToolCall {
             id: "2".into(),
-            name: "read_file".into(),
+            name: "read".into(),
             arguments: r#"{"file_path":"a.txt"}"#.into(),
         }
     }
@@ -348,36 +348,36 @@ mod tests {
         let edit: Arc<dyn Tool> = Arc::new(EditFileTool);
         let a = ToolCall {
             id: "1".into(),
-            name: "edit_file".into(),
+            name: "edit".into(),
             arguments: r#"{"file_path":"a.rs","old_string":"x","new_string":"y"}"#.into(),
         };
         let b = ToolCall {
             id: "2".into(),
-            name: "edit_file".into(),
+            name: "edit".into(),
             arguments: r#"{"file_path":"b.rs","old_string":"p","new_string":"q"}"#.into(),
         };
         assert_eq!(
             ApprovalMiddleware::grant_key(&a, edit.as_ref()),
             ApprovalMiddleware::grant_key(&b, edit.as_ref()),
-            "edit_file 'Always' must grant the whole tool, not just one exact call"
+            "edit 'Always' must grant the whole tool, not just one exact call"
         );
 
         // bash: two DIFFERENT destructive commands keep DISTINCT grant keys.
         let bash: Arc<dyn Tool> = Arc::new(BashTool);
         let c1 = ToolCall {
             id: "3".into(),
-            name: "bash".into(),
+            name: "run_command".into(),
             arguments: r#"{"command":"rm -rf foo"}"#.into(),
         };
         let c2 = ToolCall {
             id: "4".into(),
-            name: "bash".into(),
+            name: "run_command".into(),
             arguments: r#"{"command":"rm -rf bar"}"#.into(),
         };
         assert_ne!(
             ApprovalMiddleware::grant_key(&c1, bash.as_ref()),
             ApprovalMiddleware::grant_key(&c2, bash.as_ref()),
-            "bash 'Always' must stay per-command so one approval never covers another"
+            "run_command 'Always' must stay per-command so one approval never covers another"
         );
     }
 
@@ -460,19 +460,20 @@ mod tests {
         // Request side: what the middleware emits parses as ApprovalRequest.
         let payload = serde_json::to_value(ApprovalRequest {
             call_id: "call_1".into(),
-            tool: "bash".into(),
+            tool: "run_command".into(),
             args: "{\"cmd\":\"ls\"}".into(),
         })
         .unwrap();
         assert_eq!(
             payload,
-            serde_json::json!({ "call_id": "call_1", "tool": "bash", "args": "{\"cmd\":\"ls\"}" })
+            serde_json::json!({ "call_id": "call_1", "tool": "run_command", "args": "{\"cmd\":\"ls\"}" })
         );
 
         // Older approval payloads without call_id still parse; they simply cannot
         // correlate a pre-execution prompt with a later ToolStarted row.
         let legacy: ApprovalRequest =
-            serde_json::from_value(serde_json::json!({ "tool": "bash", "args": "{}" })).unwrap();
+            serde_json::from_value(serde_json::json!({ "tool": "run_command", "args": "{}" }))
+                .unwrap();
         assert_eq!(legacy.call_id, "");
 
         // Response side: each constructor round-trips through from_value exactly.

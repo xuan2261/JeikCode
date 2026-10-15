@@ -437,9 +437,13 @@ pub(crate) fn summarize_for_goal(messages: &[Message], previous: Option<&str>) -
     let mut files = Vec::new();
     for message in messages {
         for call in &message.tool_calls {
+            // Canonical names first; the legacy ones stay so a replayed pre-rename
+            // transcript still contributes (the same union the write-approval gate keeps).
             if !matches!(
                 call.name.as_str(),
-                "write_file"
+                "write"
+                    | "write_file"
+                    | "edit"
                     | "edit_file"
                     | "global_search_replace"
                     | "search_replace"
@@ -1182,6 +1186,48 @@ mod tests {
         assert!(context.contains("Goal:\nnew goal"));
         assert!(!context.contains("old-goal.rs"));
         assert!(context.contains("no recoverable progress was captured"));
+    }
+
+    #[test]
+    fn goal_summary_collects_files_from_canonical_write_and_edit_calls() {
+        // Regression lock: the rename (`write_file`→`write`, `edit_file`→`edit`) once
+        // left this union legacy-only, so "Files edited this goal" silently went empty
+        // for every new-name call.
+        use jeikcode_kernel::tool::ToolCall;
+        let call_msg = |name: &str, args: &str| {
+            Message::assistant(
+                "",
+                vec![ToolCall {
+                    id: "c1".into(),
+                    name: name.into(),
+                    arguments: args.into(),
+                }],
+            )
+        };
+        let summary = summarize_for_goal(
+            &[
+                call_msg("write", r#"{"file_path":"src/a.rs","content":"x"}"#),
+                call_msg(
+                    "edit",
+                    r#"{"file_path":"src/b.rs","old_string":"a","new_string":"b"}"#,
+                ),
+                call_msg(
+                    "write_file",
+                    r#"{"file_path":"src/legacy.rs","content":"x"}"#,
+                ),
+                call_msg("grep", r#"{"pattern":"x"}"#),
+            ],
+            None,
+        );
+        assert!(summary.contains("Files edited this goal"), "{summary}");
+        assert!(
+            summary.contains("src/a.rs") && summary.contains("src/b.rs"),
+            "canonical write/edit must contribute: {summary}"
+        );
+        assert!(
+            summary.contains("src/legacy.rs"),
+            "the legacy alias must still contribute: {summary}"
+        );
     }
 
     #[test]

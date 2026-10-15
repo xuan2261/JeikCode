@@ -90,31 +90,24 @@ cargo build --release --bin jeikcode --locked
 - **指定特定版本**：支持直接传参，如 `node scripts/bump-version.js 7.1.54-beta.3`。
 
 #### 步骤 2：更新 `CHANGELOG.md`
-在文件顶部追加 `## vX.Y.Z (YYYY-MM-DD)`。发版说明采用**双语分段标准模板**（英文讲完一整段，再插入单独一行的分割线 `---`，后接中文段落；禁止中英混排）：
+在文件顶部追加 `## vX.Y.Z (YYYY-MM-DD)`。发版说明采用**双语分段标准模板**（英文讲完一整段，再插入单独一行的分割线 `---`，后接中文段落；禁止中英混排）。无需展开底层源码机理或内部实现细节，直接记录清晰的功能改进与修复项：
 
 ```markdown
 ## vX.Y.Z (YYYY-MM-DD)
 
 - **[Category/Module in English] Main summary sentence in English**:
-  - **Technical Root Cause / Detail**: Detailed technical explanation...
-  - **Implementation Mechanism**: Affected files, functions, and defensive logic...
-  - **Verification & Testing**: Tests executed and coverage details...
+  - Detailed feature update or bug fix description...
+  - Detailed feature update or bug fix description...
 
 ---
 
 - **[模块分类中文] 中文概述主标题**:
-  - **技术机理 / 现象溯源**: 详细原理解释...
-  - **实现防线 / 核心改动**: 受影响文件、核心函数与端到端防线建设...
-  - **验证与交付**: 运行的单元测试与端到端验证...
+  - 具体新增功能或体验优化说明...
+  - 具体缺陷修复与行为改善说明...
 ```
 
-#### 步骤 3：同步更新 README 文档日志
-将上述更新内容同步更新至以下三份文档的「更新日志 / Changelog」章节（位于 License 之前），仅保留最近 2 个版本的更新记录，并附带 CHANGELOG.md 与 GitHub Releases 链接：
-- `README.zh-CN.md`（同步中文段落）
-- `README.md`（同步英文段落）
-- `README.en.md`（同步英文段落）
-
-> **注**：预发布版本带 `-`（如 `vX.Y.Z-beta.1`）仅需更新 `CHANGELOG.md`。
+#### 步骤 3：确认三份 README 权威引用
+`README.zh-CN.md`、`README.md` 与 `README.en.md` 的更新日志章节已统一收敛为指向 `CHANGELOG.md` 与 GitHub Releases 的单行权威引用，发版时无需向三份 README 重复拷贝版本条目。
 
 #### 步骤 4：提交与推送
 提交上述版本与日志变动，推送到远程仓库对应分支（正式版推 `origin/main`，预发布版推 `origin/beta`），保持工作区干净。
@@ -136,7 +129,7 @@ git tag vX.Y.Z && git push origin vX.Y.Z
 3. **一次 Release，清单不进 git**：
    - `publish` 先验证 checkout HEAD 与触发 Tag 都等于 `GITHUB_SHA`，再用本地六个二进制计算 SHA256 与大小，生成 `latest.json` 并上传；
    - 客户端与 `install.sh` / `install.ps1` 读取 `https://github.com/jeikl/JeikCode/releases/latest/download/latest.json`，下载后仍校验 SHA256；
-   - Release 正文顶部提供稳定的 Release Assets 页面入口；桌面安装包由后续矩阵追加到同一 Release，正文不再提前发布尚未生成的文件直链，避免构建中或失败时出现 404。下方仍采用“英文段落 + 分割线 `---` + 中文段落”的规范结构；
+   - Release 正文顶部提供清晰的直达安装包下载表格（Windows .exe、macOS .dmg、Linux .deb/.AppImage），点击直接下载对应安装包；下方采用“英文段落 + 分割线 `---` + 中文段落”的双语规范结构；
    - **不**修改 `Cargo.toml`、锁文件、README，也**不**再推送 `chore(release)`。下游分支不会因为发版而落后 `main`。
    - 带 `-` 的 Tag 标为 prerelease，不占 `releases/latest`。
 

@@ -26,13 +26,13 @@ import { Select } from './Select';
 // 上下文窗口预设（淘汰 256K 以下选项，保留 256K 及以上主流长窗口）。
 const CONTEXT_WINDOW_PRESETS = [256000, 512000, 1000000, 2000000];
 
-/** 最大输出预算预设选项（淘汰 32768 以下选项，保留 32768 及以上主流输出预算）。 */
-const MAX_OUTPUT_PRESETS = [32768, 65536, 131072];
+/** 最大输出预算预设档位：32K / 64K / 128K / 256K / 384K + 自定义。
+ * 该值只是「模型输出能力声明」，会作为各协议的 max budget 原样下发；
+ * 它不参与上下文统计与压缩水位计算（水位 = 窗口 − 20K 固定缓冲）。 */
+const MAX_OUTPUT_PRESETS = [32000, 64000, 128000, 256000, 384000];
 
 function fmtMaxTokens(v: number): string {
-  if (v === 65536) return '64K (65,536)';
-  if (v === 131072) return '128K (131,072)';
-  return v >= 1024 ? `${Math.round(v / 1024)}K (${v.toLocaleString()})` : String(v);
+  return v >= 1000 ? `${Math.round(v / 1000)}K (${v.toLocaleString()})` : String(v);
 }
 
 /** 与 TUI `/provider` 对齐的可自定义协议 + ollama。 */
@@ -852,7 +852,7 @@ function ProviderFormDialog({
     editing?.context_window ?? 256000,
   );
   const [maxTokens, setMaxTokens] = useState<number | ''>(
-    editing?.max_tokens ?? 65536,
+    editing?.max_tokens ?? 64000,
   );
   const [supportsVision, setSupportsVision] = useState(Boolean(editing?.supports_vision));
   const [reasoningModel, setReasoningModel] = useState(Boolean(editing?.reasoning_model));
@@ -1156,7 +1156,7 @@ function ProviderFormDialog({
                   onChange={(v) => {
                     if (v === 'custom') {
                       if (maxTokens === '' || MAX_OUTPUT_PRESETS.includes(Number(maxTokens))) {
-                        setMaxTokens(65536);
+                        setMaxTokens(64000);
                       }
                     } else {
                       setMaxTokens(Number(v));

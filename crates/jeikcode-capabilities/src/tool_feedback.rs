@@ -517,7 +517,7 @@ mod tests {
     #[test]
     fn missing_field_is_structured() {
         let err = parse_tool_args::<Sample>(
-            "write_file",
+            "write",
             r#"{"file_path":"a"}"#,
             r#"{"file_path","content"}"#,
         )
@@ -532,7 +532,7 @@ mod tests {
     #[test]
     fn type_mismatch_reports_bad_value() {
         let err = parse_tool_args::<Sample>(
-            "write_file",
+            "write",
             r#"{"file_path":1,"content":"x"}"#,
             r#"{"file_path":"<path>","content":"<text>"}"#,
         )
@@ -561,7 +561,7 @@ mod tests {
     #[test]
     fn missing_multiple_root_fields_reports_all() {
         let err = parse_tool_args::<Sample>(
-            "write_file",
+            "write",
             r#"{}"#,
             r#"{"file_path":"<path>","content":"<text>"}"#,
         )
@@ -603,7 +603,7 @@ mod tests {
     #[test]
     fn missing_nested_array_fields_reports_hierarchy() {
         let err = parse_tool_args::<ComplexSample>(
-            "edit_file",
+            "edit",
             r#"{"edits":[{"old_string":"foo"}]}"#,
             r#"{"file_path":"<path>","edits":[{"old_string":"<exact>","new_string":"<replacement>"}]}"#,
         )

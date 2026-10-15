@@ -320,7 +320,8 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     let mut registry = ToolRegistry::new();
     let mut names: Vec<String> = Vec::new();
     let turn_execution_policy = Arc::new(TurnExecutionPolicy::new());
-    let bash_runtime = reuse_bash_runtime.unwrap_or_else(|| Arc::new(BashRuntimeState::new()));
+    let bash_runtime =
+        reuse_bash_runtime.unwrap_or_else(jeikcode_capabilities::tools::legacy_bash_runtime_state);
 
     // Always-on core: neutral fs/bash toolset + codeintel. Vision gating: a VL model
     // (e.g. Qwen3-VL) makes read_file hand image files to the model as pictures. Uses the
@@ -402,17 +403,28 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 false,
                 Arc::clone(&bash_runtime),
             );
+            jeikcode_capabilities::codeintel::register_codeintel_tools_with_mode(
+                &mut child_reg,
+                &codeintel_mode,
+            );
             let child_reg = Arc::new(child_reg);
 
-            let explore_names: Vec<String> = ["read", "grep", "glob"]
+            let explore_names: Vec<String> = ["read", "code_explore", "grep", "glob"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect();
-            let worker_names: Vec<String> =
-                ["read", "edit", "write", "run_command", "grep", "glob"]
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect();
+            let worker_names: Vec<String> = [
+                "read",
+                "code_explore",
+                "edit",
+                "write",
+                "run_command",
+                "grep",
+                "glob",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
 
             let reg_e = child_reg.clone();
             let reg_w = child_reg.clone();
@@ -497,6 +509,12 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     for (dir, ns) in &opts.plugin_skill_dirs {
         skills.load_dir(dir, Some(ns));
     }
+    // Honor the persisted GLOBAL/PROJECT skill disable state: a disabled skill is
+    // dropped from BOTH the prompt catalog and `use_skill`. A capability reload
+    // re-runs `prepare`, so a fresh disable/enable lands in the very next prompt.
+    skills.retain_enabled(&jeikcode_capabilities::skills::controls::load_disabled(
+        &cfg.working_dir,
+    ));
     let skills = Arc::new(skills);
     // Render the catalog BEFORE the registry is moved into the tools; injected as a
     // leading system message by SkillCatalogHook below (without it the model never
@@ -1395,7 +1413,7 @@ pub fn assemble(
     // Must pass cfg.working_dir: the live/WebUI path never std::env::set_current_dir,
     // so falling back to process cwd leaves Block 1 stuck on the launch directory
     // after a path-picker /cd (tools follow the new workspace, the model does not).
-    let (block_1, block_2, block_3) = crate::persona::coding_persona_blocks_with_context(
+    let (block_1, block_2, block_3, block_4) = crate::persona::coding_persona_blocks_with_context(
         &cfg.model,
         cfg.preferred_language,
         parts.todo_enabled,
@@ -1406,7 +1424,7 @@ pub fn assemble(
     let mut builder = Agent::builder()
         .provider(provider)
         .tools(parts.mount())
-        .personas([block_1, block_2, block_3])
+        .personas([block_1, block_2, block_3, block_4])
         // Repair model-produced arguments before any observer or policy gate reads them.
         // Approval must inspect the same bytes that the tool executes.
         .middleware(Arc::new(RepairToolArgsMiddleware));
@@ -1526,7 +1544,8 @@ pub fn assemble(
             ),
         ))
         .compact_threshold(cfg.compact_threshold)
-        .stream_timeout(cfg.stream_timeout)
+        .timeouts(cfg.timeouts)
+        .first_token_timeout_retries(cfg.first_token_timeout_retries)
         .max_continuations(cfg.max_continuations)
         // Ctrl-C semantics: false = UNDO (default), true = PRESERVE the interrupted turn.
         .keep_interrupted_context(cfg.keep_interrupted_context);
@@ -1638,20 +1657,28 @@ pub fn assemble(
     // Artifact spill middleware: intercepts oversized tool results and saves them to disk so
     // the conversation only carries a preview + handle. Only wired when a session is present
     // (no session = no on-disk store; the fetch_output tool is not registered either).
-    // Fold threshold: `cfg.tool_output_max_bytes` (env `JEIKCODE_TOOL_OUTPUT_THRESHOLD_BYTES`
-    // wins over `[tools.tool_output] max_bytes`); `None` → built-in default (64 KiB);
-    // `Some(0)` disables folding.
+    // Compression thresholds: `cfg.tool_output_max_bytes` (env
+    // `JEIKCODE_TOOL_OUTPUT_THRESHOLD_BYTES` wins over `[tools.tool_output]
+    // max_bytes`) for general tools — `None` → built-in default (64 KiB),
+    // `Some(0)` disables compression; `cfg.tool_output_terminal_max_bytes` (env
+    // `JEIKCODE_TOOL_OUTPUT_TERMINAL_THRESHOLD_BYTES` wins over
+    // `terminal_max_bytes`) is the earlier line for terminal tools — `None` →
+    // built-in default (24 KiB), `Some(0)` drops the terminal early line.
     if let Some(store) = artifact_store {
         let threshold = cfg
             .tool_output_max_bytes
             .unwrap_or(jeikcode_capabilities::tools::THRESHOLD_BYTES);
+        let terminal_threshold = cfg
+            .tool_output_terminal_max_bytes
+            .unwrap_or(jeikcode_capabilities::tools::TERMINAL_THRESHOLD_BYTES);
         // Config-driven no-fold whitelist (`[tools.tool_output] no_fold_tools`):
-        // listed tool names skip folding entirely, like the intrinsic
+        // listed tool names skip compression entirely, like the intrinsic
         // `never_truncate_result()` contract (repo_map / code_explore).
         let no_fold = cfg.tool_output_no_fold_tools.clone();
         builder = builder.middleware(Arc::new(
             ArtifactMiddleware::new(store)
                 .with_threshold_bytes(threshold)
+                .with_terminal_threshold_bytes(terminal_threshold)
                 .with_no_fold_tools(no_fold),
         ));
     }
@@ -1673,10 +1700,19 @@ const JEIKCODE_PERSONA_PREFIX: &str =
 const MODEL_CHANGE_CONTEXT_PREFIX: &str = "=== MODEL CHANGE ===";
 
 fn persona_model(text: &str) -> Option<&str> {
+    // Canonical: the machine-readable marker block 1 carries (`coding_persona_blocks_*`).
+    // The identity WORDING is owned by the built-in / env prompt and may not name the
+    // model at all — prose parsing alone silently stopped detecting `/model` switches.
+    if let Some(pos) = text.find(crate::persona::MODEL_MARKER_OPEN) {
+        let rest = &text[pos + crate::persona::MODEL_MARKER_OPEN.len()..];
+        if let Some(end) = rest.find(" -->") {
+            return Some(rest[..end].trim());
+        }
+    }
+    // Legacy snapshots / custom persona templates that still name the model in the prose.
     if let Some(rest) = text.strip_prefix(JEIKCODE_PERSONA_PREFIX) {
         return rest.split_once(" model.").map(|(model, _)| model);
     }
-    // Handle custom persona templates, e.g., "You are JeikCode, an AI coding agent by JeikCode running the {model} model."
     if let Some(pos) = text.find(" running the ") {
         let rest = &text[pos + " running the ".len()..];
         return rest.split_once(" model.").map(|(model, _)| model);
@@ -1691,7 +1727,6 @@ fn is_persona_block_1(message: &Message) -> bool {
     message.text.starts_with("<environment>")
         || message.text.starts_with(JEIKCODE_PERSONA_PREFIX)
         || message.text.starts_with("You are JeikCode")
-        || message.text.starts_with("You are AtomCode")
         || (message.text.contains(" running the ")
             && message.text.contains(" model.")
             && (message.text.contains("## PRECEDENCE:") || message.text.contains("## WORKFLOW:")))
@@ -1719,8 +1754,18 @@ fn is_persona_block_3(message: &Message) -> bool {
     message.text.starts_with("<todo_rules>")
 }
 
+fn is_persona_block_4(message: &Message) -> bool {
+    if message.role != Role::System {
+        return false;
+    }
+    message.text.starts_with("<explore_strategy>")
+}
+
 fn is_persona_message(message: &Message) -> bool {
-    is_persona_block_1(message) || is_persona_block_2(message) || is_persona_block_3(message)
+    is_persona_block_1(message)
+        || is_persona_block_2(message)
+        || is_persona_block_3(message)
+        || is_persona_block_4(message)
 }
 
 /// Legacy drivers persist conversation history without the separately supplied
@@ -1733,7 +1778,7 @@ fn reconcile_coding_persona(
     request_user_input_enabled: bool,
     review_enabled: bool,
 ) {
-    let (block_1, block_2, block_3) = crate::persona::coding_persona_blocks_with_context(
+    let (block_1, block_2, block_3, block_4) = crate::persona::coding_persona_blocks_with_context(
         &cfg.model,
         cfg.preferred_language,
         todo_enabled,
@@ -1788,8 +1833,12 @@ fn reconcile_coding_persona(
             .is_some_and(|message| message.role == Role::System && message.text == block_3)
         && snapshot
             .messages
+            .get(3)
+            .is_some_and(|message| message.role == Role::System && message.text == block_4)
+        && snapshot
+            .messages
             .iter()
-            .skip(3)
+            .skip(4)
             .all(|message| !is_persona(message))
         && snapshot
             .messages
@@ -1805,6 +1854,7 @@ fn reconcile_coding_persona(
         .messages
         .retain(|message| !is_persona(message) && !is_model_change(message));
 
+    snapshot.messages.insert(0, Message::system(block_4));
     snapshot.messages.insert(0, Message::system(block_3));
     snapshot.messages.insert(0, Message::system(block_2));
     snapshot.messages.insert(0, Message::system(full_block_1));
@@ -1954,7 +2004,8 @@ mod tests {
     #[serial_test::serial(jeikcode_home)]
     fn reconcile_persona_embeds_config_working_dir_not_process_cwd() {
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let prompts = home.path().join("prompts");
         std::fs::create_dir_all(&prompts).unwrap();
         std::fs::write(
@@ -2002,8 +2053,8 @@ mod tests {
 
         assert!(snapshot.messages[0]
             .text
-            .contains("running the deepseek-v4-flash model"));
-        assert_eq!(snapshot.messages[3].text, "SESSION CONTEXT");
+            .contains("<!-- jeikcode:model deepseek-v4-flash -->"));
+        assert_eq!(snapshot.messages[4].text, "SESSION CONTEXT");
         assert_eq!(snapshot.cache_epoch, 1);
     }
 
@@ -2017,7 +2068,7 @@ mod tests {
         assert!(!snapshot.messages[1].text.contains("## TASK TRACKING"));
         assert!(snapshot.messages[0]
             .text
-            .contains("running the deepseek-v4-flash model"));
+            .contains("<!-- jeikcode:model deepseek-v4-flash -->"));
     }
 
     #[test]
@@ -2028,7 +2079,7 @@ mod tests {
         // of what other tests may have set concurrently (we hold the serial lock, so this
         // is safe — no other test in this serial group can observe the removal).
         let _rui_guard = std::env::remove_var("JEIKCODE_REQUEST_USER_INPUT");
-        let (b1, b2, b3) = crate::persona::coding_persona_blocks(
+        let (b1, b2, b3, b4) = crate::persona::coding_persona_blocks(
             "old-model",
             crate::persona::todo_switch_enabled(),
             crate::persona::request_user_input_switch_enabled(),
@@ -2037,6 +2088,7 @@ mod tests {
             Message::system(b1),
             Message::system(b2),
             Message::system(b3),
+            Message::system(b4),
             Message::system("SESSION CONTEXT"),
         ]);
 
@@ -2053,16 +2105,16 @@ mod tests {
             .iter()
             .filter(|message| is_persona_message(message))
             .count();
-        assert_eq!(personas, 3);
+        assert_eq!(personas, 4);
         assert!(snapshot.messages[0]
             .text
-            .contains("running the deepseek-v4-flash model"));
+            .contains("<!-- jeikcode:model deepseek-v4-flash -->"));
         assert!(snapshot.messages[0]
             .text
             .contains(MODEL_CHANGE_CONTEXT_PREFIX));
         assert!(snapshot.messages[0].text.contains("old-model"));
         assert!(snapshot.messages[0].text.contains("deepseek-v4-flash"));
-        assert_eq!(snapshot.messages[3].text, "SESSION CONTEXT");
+        assert_eq!(snapshot.messages[4].text, "SESSION CONTEXT");
         assert_eq!(snapshot.cache_epoch, 1);
     }
 
@@ -2071,7 +2123,7 @@ mod tests {
     fn repeated_model_switch_keeps_one_current_transition_boundary() {
         jeikcode_config::config::offline::reset_offline_verdict_for_test();
         let _rui_guard = std::env::remove_var("JEIKCODE_REQUEST_USER_INPUT");
-        let (b1, b2, b3) = crate::persona::coding_persona_blocks(
+        let (b1, b2, b3, b4) = crate::persona::coding_persona_blocks(
             "model-a",
             crate::persona::todo_switch_enabled(),
             crate::persona::request_user_input_switch_enabled(),
@@ -2080,6 +2132,7 @@ mod tests {
             Message::system(b1),
             Message::system(b2),
             Message::system(b3),
+            Message::system(b4),
             Message::user("what model are you?"),
             Message::assistant("I am model-a", vec![]),
         ]);
@@ -2104,7 +2157,7 @@ mod tests {
         // is safe.
         let _rui_guard = std::env::remove_var("JEIKCODE_REQUEST_USER_INPUT");
         let cfg = agent_config("deepseek-v4-flash");
-        let (b1, b2, b3) = crate::persona::coding_persona_blocks_with_context(
+        let (b1, b2, b3, b4) = crate::persona::coding_persona_blocks_with_context(
             "deepseek-v4-flash",
             cfg.preferred_language,
             crate::persona::todo_switch_enabled(),
@@ -2116,6 +2169,7 @@ mod tests {
             Message::system(b1.clone()),
             Message::system(b2.clone()),
             Message::system(b3.clone()),
+            Message::system(b4.clone()),
             Message::system("SESSION CONTEXT"),
         ]);
 
@@ -2124,6 +2178,7 @@ mod tests {
         assert_eq!(snapshot.messages[0].text, b1);
         assert_eq!(snapshot.messages[1].text, b2);
         assert_eq!(snapshot.messages[2].text, b3);
+        assert_eq!(snapshot.messages[3].text, b4);
         assert_eq!(snapshot.cache_epoch, 0);
     }
 
@@ -2142,7 +2197,7 @@ mod tests {
 
         assert!(snapshot.messages[0]
             .text
-            .contains("running the model-a model"));
+            .contains("<!-- jeikcode:model model-a -->"));
         assert!(!snapshot
             .messages
             .iter()
@@ -2183,7 +2238,8 @@ mod tests {
     async fn prepare_does_not_wait_for_mcp_network_readiness() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         #[cfg(unix)]
         let (command, args) = ("sh", vec!["-c", "sleep 5"]);
         #[cfg(windows)]
@@ -2422,7 +2478,8 @@ mod tests {
 
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
         let manager = SessionManager::for_project(project.path());
         let snapshot = SessionSnapshot::new(vec![Message::user("persisted")]);
@@ -2496,7 +2553,8 @@ mod tests {
 
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
         let manager = SessionManager::for_project(project.path());
         let id = "incomplete-reassemble";
@@ -2528,7 +2586,8 @@ mod tests {
 
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
         let manager = SessionManager::for_project(project.path());
 
@@ -2550,7 +2609,8 @@ mod tests {
     async fn external_snapshot_must_match_the_canonical_native_snapshot() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
         let manager = SessionManager::for_project(project.path());
         let id = "divergent-external";
@@ -2575,7 +2635,8 @@ mod tests {
     async fn external_snapshot_accepts_a_matching_complete_native_aggregate() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
         let manager = SessionManager::for_project(project.path());
         let id = "matching-external";
@@ -2647,7 +2708,8 @@ mod tests {
     async fn prepare_injects_checkpoint_only_for_persistent_sessions() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
 
         let mut persistent = io_free_opts();
@@ -2670,7 +2732,8 @@ mod tests {
     async fn runtime_prepare_keeps_fresh_session_staged_until_publish() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
         let mut opts = io_free_opts();
         opts.session = SessionMode::Fresh;
@@ -2694,7 +2757,8 @@ mod tests {
     async fn runtime_reprepare_reuses_injected_bash_runtime_state() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
         let bash_runtime = Arc::new(BashRuntimeState::new());
 
@@ -2717,7 +2781,8 @@ mod tests {
     async fn first_submit_seeds_provisional_title_and_message_count() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
         let mut opts = io_free_opts();
         opts.session = SessionMode::Fresh;
@@ -2746,7 +2811,8 @@ mod tests {
     async fn pinned_protocol_user_title_survives_first_submit_seed() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let mut cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
         cfg.session_display_name = Some("alice_a".into());
         let mut opts = io_free_opts();
@@ -2774,7 +2840,8 @@ mod tests {
     async fn prepare_rejects_a_second_binding_until_the_first_drops() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
         let snapshot = SessionSnapshot::new(vec![Message::user("persisted")]);
         let manager = SessionManager::for_project(project.path());
@@ -2819,7 +2886,8 @@ mod tests {
     #[serial_test::serial(jeikcode_home)]
     async fn prepare_wires_cc_external_hooks_only_when_present() {
         let home = tempfile::tempdir().unwrap(); // empty → no user-level hooks
-        std::env::set_var("JEIKCODE_HOME", home.path());
+                                                 // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
 
         // No project hooks → nothing wired.
         let bare = tempfile::tempdir().unwrap();
@@ -2887,7 +2955,8 @@ mod tests {
     #[serial_test::serial(jeikcode_home)]
     async fn code_review_tool_is_unmounted() {
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
 
         let proj = tempfile::tempdir().unwrap();
         let cfg = CodingAgentConfig::new("k", "http://localhost", "m", proj.path());
@@ -2902,6 +2971,77 @@ mod tests {
         );
     }
 
+    /// Ensure subagent registries mount `code_explore` in explore and worker profiles.
+    #[tokio::test]
+    #[serial_test::serial(jeikcode_home)]
+    async fn subagent_registry_mounts_code_explore() {
+        let home = tempfile::tempdir().unwrap();
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
+        std::env::remove_var("JEIKCODE_SUBAGENT");
+
+        let proj = tempfile::tempdir().unwrap();
+        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", proj.path());
+
+        let parts = prepare(&cfg, io_free_opts()).await.unwrap();
+        assert!(
+            parts.tool_names.contains(&"task".to_string()),
+            "task tool must be registered in primary parts"
+        );
+        assert!(
+            parts.subagent_provider.is_some(),
+            "subagent provider slot must be present when subagent is enabled"
+        );
+
+        let bash_runtime = Arc::new(BashRuntimeState::new());
+        let mut child_reg = ToolRegistry::new();
+        register_coding_tools_with_vision_and_bash_state(&mut child_reg, false, bash_runtime);
+        let codeintel_mode =
+            jeikcode_capabilities::codeintel::CodeIntelMode::from_env_or_config(None, None);
+        jeikcode_capabilities::codeintel::register_codeintel_tools_with_mode(
+            &mut child_reg,
+            &codeintel_mode,
+        );
+
+        let explore = child_reg.mount(&["read", "code_explore", "grep", "glob"]);
+        let explore_defs = explore.defs();
+        let defs: Vec<&str> = explore_defs.iter().map(|d| d.name.as_str()).collect();
+        assert!(
+            defs.contains(&"code_explore"),
+            "explore subagent must have code_explore"
+        );
+        assert!(defs.contains(&"read"), "explore subagent must have read");
+        assert!(defs.contains(&"grep"), "explore subagent must have grep");
+        assert!(defs.contains(&"glob"), "explore subagent must have glob");
+
+        let worker = child_reg.mount(&[
+            "read",
+            "code_explore",
+            "edit",
+            "write",
+            "run_command",
+            "grep",
+            "glob",
+        ]);
+        let worker_mounted_defs = worker.defs();
+        let worker_defs: Vec<&str> = worker_mounted_defs
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        assert!(
+            worker_defs.contains(&"code_explore"),
+            "worker subagent must have code_explore"
+        );
+        assert!(
+            worker_defs.contains(&"edit"),
+            "worker subagent must have edit"
+        );
+        assert!(
+            worker_defs.contains(&"write"),
+            "worker subagent must have write"
+        );
+    }
+
     /// A `/login` or `/model` swap updates `cfg.model` and re-runs `assemble` ONLY
     /// (never `prepare`). The primary turn-level `TelemetryHook` must therefore be
     /// (re)built at `assemble` so its `LlmChat` envelope reports the CURRENTLY active
@@ -2913,7 +3053,8 @@ mod tests {
     async fn primary_telemetry_hook_tracks_model_swapped_at_assemble() {
         use jeikcode_kernel::agent::AutoRespond;
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
 
         let (tel, captured) = jeikcode_telemetry::Telemetry::in_memory("test".into());
         let proj = tempfile::tempdir().unwrap();
@@ -2949,7 +3090,8 @@ mod tests {
         use jeikcode_kernel::agent::AutoRespond;
 
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let project = tempfile::tempdir().unwrap();
         let datalog_root = home.path().join("custom-datalog");
         let mut cfg =
@@ -2996,7 +3138,8 @@ mod tests {
         use jeikcode_kernel::agent::AutoRespond;
 
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let project = tempfile::tempdir().unwrap();
         let mut cfg = CodingAgentConfig::new("k", "http://localhost", "model-a", project.path());
         cfg.provider_name = "provider-a".into();
@@ -3167,7 +3310,8 @@ mod tests {
     async fn no_session_means_no_fetch_output_tool() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
         // Disabled session: no artifact store, so fetch_output must not be mounted.
         let mut parts = prepare(&cfg, io_free_opts()).await.unwrap();
@@ -3190,7 +3334,8 @@ mod tests {
     async fn session_presence_mounts_fetch_output_tool() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
         let mut opts = io_free_opts();
         opts.session = SessionMode::Fresh;

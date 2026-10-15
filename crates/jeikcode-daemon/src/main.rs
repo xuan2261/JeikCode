@@ -147,6 +147,9 @@ fn parse_daemon_args() -> (String, u16, CliOverride, u64, SessionMode, Option<St
 
 #[tokio::main]
 async fn main() {
+    // Before anything spawns a child process: a Git-Bash launch leaves TMP/TEMP/TMPDIR as
+    // POSIX paths, which native tools resolve as `<drive>:\tmp`.
+    jeikcode_capabilities::special_dirs::sanitize_process_temp_env();
     // On Windows, when built as a GUI-subsystem binary (windows_subsystem = "windows"),
     // there is no default console. If launched from a terminal (cmd.exe / PowerShell),
     // re-attach to the parent's console so eprintln!/tracing output is visible.

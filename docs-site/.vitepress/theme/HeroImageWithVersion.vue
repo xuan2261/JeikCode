@@ -1,19 +1,30 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
 
-const version = ref('v7.2.1-beta.8')
+// 两个独立的兜底版本号：一个正式版，一个 beta 版
+const stableVersion = ref('v7.2.4')
+const betaVersion = ref('v7.2.5-beta.1')
 
 onMounted(async () => {
   try {
-    const res = await fetch('https://api.github.com/repos/jeikl/JeikCode/releases/latest')
+    // 优先从本站 Cloudflare 边缘缓存接口获取最新全量发布列表（零限流、毫秒响应）
+    const res = await fetch('https://jeikcode.top/api/releases')
     if (res.ok) {
       const data = await res.json()
-      if (data && typeof data.tag_name === 'string' && data.tag_name) {
-        version.value = data.tag_name.startsWith('v') ? data.tag_name : `v${data.tag_name}`
+      if (Array.isArray(data)) {
+        // 分别解析出最新的正式版和最新的 Beta 预发布版
+        const stable = data.find((r: any) => !r.prerelease)
+        if (stable?.tag_name) {
+          stableVersion.value = stable.tag_name.startsWith('v') ? stable.tag_name : `v${stable.tag_name}`
+        }
+        const beta = data.find((r: any) => r.prerelease)
+        if (beta?.tag_name) {
+          betaVersion.value = beta.tag_name.startsWith('v') ? beta.tag_name : `v${beta.tag_name}`
+        }
       }
     }
   } catch {
-    // 离线或 API 限流时静默降级为构建期确定的最新静态版本号
+    // 离线或异常时静默降级为构建期确定的最新静态版本号
   }
 })
 </script>
@@ -22,16 +33,31 @@ onMounted(async () => {
   <div class="hero-image-box">
     <img src="/logo.svg" alt="JeikCode Logo" class="hero-main-logo" />
     <div class="hero-version-tag-wrapper">
+      <!-- 1. 正式稳定版徽章 -->
       <a
-        href="https://github.com/jeikl/JeikCode/releases"
+        :href="`https://github.com/jeikl/JeikCode/releases/tag/${stableVersion}`"
         target="_blank"
         rel="noopener noreferrer"
-        class="hero-version-badge"
-        title="查看最新版本发布说明"
+        class="hero-version-badge badge-stable"
+        title="查看最新正式版发布说明"
       >
-        <span class="badge-dot"></span>
-        <span class="badge-label">Latest</span>
-        <span class="badge-ver">{{ version }}</span>
+        <span class="badge-dot dot-stable"></span>
+        <span class="badge-label">Stable</span>
+        <span class="badge-ver">{{ stableVersion }}</span>
+      </a>
+
+      <!-- 2. Beta 预览版徽章 -->
+      <a
+        v-if="betaVersion"
+        :href="`https://github.com/jeikl/JeikCode/releases/tag/${betaVersion}`"
+        target="_blank"
+        rel="noopener noreferrer"
+        class="hero-version-badge badge-beta"
+        title="查看最新 Beta 预览版发布说明"
+      >
+        <span class="badge-dot dot-beta"></span>
+        <span class="badge-label">Beta</span>
+        <span class="badge-ver">{{ betaVersion }}</span>
       </a>
     </div>
   </div>
@@ -75,10 +101,13 @@ onMounted(async () => {
 }
 
 .hero-version-tag-wrapper {
-  margin-top: 8px;
+  margin-top: 10px;
   margin-bottom: 16px;
   display: flex;
   justify-content: center;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
 }
 
 .hero-version-badge {
@@ -98,23 +127,45 @@ onMounted(async () => {
 }
 
 .hero-version-badge:hover {
-  border-color: var(--vp-c-brand-1);
-  background: var(--vp-c-default-soft);
-  color: var(--vp-c-brand-1);
   transform: translateY(-2px);
-  box-shadow: 0 6px 20px rgba(56, 189, 248, 0.4);
+}
+
+.badge-stable:hover {
+  border-color: #00f2fe;
+  color: #00f2fe;
+  box-shadow: 0 6px 20px rgba(0, 242, 254, 0.35);
+}
+
+.badge-beta:hover {
+  border-color: #f59e0b;
+  color: #f59e0b;
+  box-shadow: 0 6px 20px rgba(245, 158, 11, 0.35);
 }
 
 .badge-dot {
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background-color: #00f2fe;
-  box-shadow: 0 0 8px #00f2fe;
-  animation: pulseDot 2s infinite ease-in-out;
 }
 
-@keyframes pulseDot {
+.dot-stable {
+  background-color: #00f2fe;
+  box-shadow: 0 0 8px #00f2fe;
+  animation: pulseStable 2s infinite ease-in-out;
+}
+
+.dot-beta {
+  background-color: #f59e0b;
+  box-shadow: 0 0 8px #f59e0b;
+  animation: pulseBeta 2s infinite ease-in-out;
+}
+
+@keyframes pulseStable {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.35; transform: scale(0.85); }
+}
+
+@keyframes pulseBeta {
   0%, 100% { opacity: 1; transform: scale(1); }
   50% { opacity: 0.35; transform: scale(0.85); }
 }
@@ -130,5 +181,9 @@ onMounted(async () => {
 .badge-ver {
   font-weight: 700;
   color: var(--vp-c-brand-1);
+}
+
+.badge-beta .badge-ver {
+  color: #f59e0b;
 }
 </style>

@@ -145,9 +145,9 @@ impl OpenAiCompatConfig {
             thinking_type: None,
             thinking_keep: None,
             thinking_budget: None,
-            idle_timeout: Duration::from_secs(120),
-            open_timeout: Duration::from_secs(90),
-            connect_timeout: Duration::from_secs(30),
+            idle_timeout: jeikcode_kernel::timeouts::TimeoutPolicy::production().idle_watchdog(),
+            open_timeout: jeikcode_kernel::timeouts::TimeoutPolicy::production().open,
+            connect_timeout: jeikcode_kernel::timeouts::TimeoutPolicy::production().connect,
             retry: RetryPolicy::default(),
             request_signer: None,
             user_agent: None,
@@ -726,25 +726,17 @@ async fn open_stream(
         // TTFB watchdog for THIS attempt. `send()` resolves as soon as the response
         // HEAD arrives, so wrapping it never truncates a slow streaming body — it only
         // bounds the wait for a gateway that accepted the connection then went silent.
-        let sent = match tokio::time::timeout(open_timeout, req.send()).await {
-            Ok(r) => r,
-            Err(_elapsed) => {
-                // A TTFB timeout is the same class as a transient transport failure:
-                // spend one attempt and retry.
+        let sent = match retry::send_with_ttfb(req, open_timeout).await {
+            retry::OpenSend::Timeout => {
                 if attempt < policy.max_attempts {
                     tokio::time::sleep(retry::compute_backoff(attempt, policy)).await;
                     attempt += 1;
                     continue;
                 }
-                return Err(ProviderError {
-                    retryable: true,
-                    message: format!(
-                        "open failed: 等待首字节超过 {}s(网关无响应)",
-                        open_timeout.as_secs()
-                    ),
-                    ..Default::default()
-                });
+                return Err(retry::ttfb_timeout_error(open_timeout));
             }
+            retry::OpenSend::Transport(e) => Err(e),
+            retry::OpenSend::Response(resp) => Ok(resp),
         };
         match sent {
             Ok(resp) => {
@@ -2354,7 +2346,7 @@ mod tests {
             "",
             vec![ToolCall {
                 id: "c1".into(),
-                name: "write_file".into(),
+                name: "write".into(),
                 // raw string: contains a single backslash before each segment.
                 arguments:
                     r#"{"file_path":"C:\Users\fgv70\Downloads\deepseek.yaml","content":"app"}"#
@@ -3924,10 +3916,6 @@ mod tests {
         assert!(
             head.contains("x-session-id: sess-abc-123"),
             "gateway cache-affinity header must be forwarded: {head}"
-        );
-        assert!(
-            !head.contains("x-atomcode-session-id"),
-            "legacy atomcode session header must not be sent: {head}"
         );
         assert!(
             head.contains("user-agent: jeikcode/9.9.9"),

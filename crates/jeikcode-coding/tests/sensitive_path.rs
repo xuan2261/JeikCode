@@ -1,4 +1,4 @@
-//! Sensitive-path read gating through the FULL assembly: a read_file of `~/.ssh/id_rsa`
+//! Sensitive-path read gating through the FULL assembly: a read of `~/.ssh/id_rsa`
 //! is Safe (would skip approval) but must be gated, and with no driver answering the
 //! approval it fails closed — the secret is never read.
 
@@ -20,10 +20,10 @@ fn _isolate_jeikcode_home() {
 async fn sensitive_read_is_gated_and_fails_closed_through_full_assembly() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
-    std::env::set_var("JEIKCODE_HOME", home.path());
+    let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
 
     let mut cfg = CodingAgentConfig::new("k", "http://unused", "test-model", project.path());
-    cfg.stream_timeout = Duration::from_secs(5);
+    cfg.timeouts = cfg.timeouts.with_content_liveness(Duration::from_secs(5));
     // A driver-approval wait this short degrades the un-answered round-trip to Deny fast.
     cfg.request_timeout = Some(Duration::from_millis(100));
     let opts = PrepareOptions {
@@ -46,7 +46,7 @@ async fn sensitive_read_is_gated_and_fails_closed_through_full_assembly() {
         vec![
             StreamEvent::ToolCall(ToolCall {
                 id: "c1".into(),
-                name: "read_file".into(),
+                name: "read".into(),
                 arguments: r#"{"file_path":"/home/u/.ssh/id_rsa"}"#.into(),
             }),
             StreamEvent::Done { truncated: false },
@@ -76,7 +76,7 @@ async fn sensitive_read_is_gated_and_fails_closed_through_full_assembly() {
     h.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = h.task.await;
 
-    let (is_error, content) = blocked.expect("read_file must produce a (blocked) tool result");
+    let (is_error, content) = blocked.expect("read must produce a (blocked) tool result");
     assert!(is_error, "a denied sensitive read must be an error result");
     assert!(
         content.to_lowercase().contains("sensitive path"),

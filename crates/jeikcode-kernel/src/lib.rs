@@ -18,6 +18,7 @@ pub mod provider;
 pub mod request;
 pub mod stream;
 pub mod testkit;
+pub mod timeouts;
 pub mod tool;
 
 /// Test-only `JEIKCODE_HOME` isolation ([`test_support::isolate_home`]), shared by

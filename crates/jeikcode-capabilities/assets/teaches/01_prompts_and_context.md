@@ -42,6 +42,8 @@ environment:
     - Platform: {os_platform} (Command habit: {command_habit})
     - Project working directory: {working_dir}
     - Git branch: {git_branch}
+    - Temp files: use `"$TMPDIR"` instead of a hardcoded `/tmp` — it works for shell-internal paths AND as an ARGUMENT to native Windows programs (python / node / curl / …); `"$TMPDIR_WIN"` is the same path under a second name for nested non-bash shells.
+    - Desktop: use `"$DESKTOP"` instead of assuming `~/Desktop` — it honors a relocated / redirected desktop; `"$DESKTOP_WIN"` is the equivalent alias.
     </environment>
 ```
 

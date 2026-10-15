@@ -2,7 +2,7 @@
 
 import { stripExtendedPathPrefix } from './lib/displayPath.ts';
 import {
-  parseRepairCapability, parseRepairInfo, parseRepairPreview, parseRepairExport,
+  isAbsoluteRepairPath, parseRepairCapability, parseRepairInfo, parseRepairPreview, parseRepairExport,
 } from './lib/repairEvidence.ts';
 
 // Serve / webui bootstrap: `/?token=<uuid>` is handed off via HttpOnly cookie
@@ -157,6 +157,16 @@ export async function getHealth(): Promise<HealthInfo> {
   return resp.json() as Promise<HealthInfo>;
 }
 
+/**
+ * 断点续传游标：只有「回放帧」带 `seq`（回合缓冲序号）；实时帧不带。
+ *
+ * 前端把收到的最大 seq 存起来，重连时当作 `after_seq` 带回去，服务器只补之后的
+ * 帧 —— 收到的每一帧都是新的，不再需要靠内容猜「这条画过没有」。
+ */
+export interface SeqTaggedFrame {
+  seq?: number;
+}
+
 // Repair endpoints require an authenticated host with an explicitly supplied backend.
 export async function getRepairCapability() {
   const resp = await apiFetch('/repair/capability', { cache: 'no-store' });
@@ -193,10 +203,13 @@ export async function exportRepairPacket(body: {
 export type SSEEvent =
   | { type: 'runtime_info'; provider: string; model: string }
   | { type: 'session_assigned'; session_id: string }
-  | { type: 'user'; content: string; session_id?: string; created_at?: number }
-  | { type: 'text'; content: string }
-  | { type: 'reasoning'; content: string }
-  | { type: 'tool_start'; id: string; name: string; arguments: unknown }
+  /** `after_seq = -1`（新会话）的握手帧：不补发，只告知起始游标。 */
+  | { type: 'session_start'; session_id?: string; cursor: number }
+  | { type: 'user'; content: string; session_id?: string; created_at?: number; message_id?: string; order?: number; turn_ordinal?: number }
+  | { type: 'user_identified'; message_id: string; turn_ordinal?: number }
+  | { type: 'text'; content: string; message_id?: string; part_id?: string; part_seq?: number }
+  | { type: 'reasoning'; content: string; message_id?: string; part_id?: string; part_seq?: number }
+  | { type: 'tool_start'; id: string; name: string; arguments: unknown; message_id?: string }
   | { type: 'tool_output'; id?: string; chunk: string }
   | { type: 'tool_progress'; id: string; progress: string }
   | { type: 'tool_result'; id: string; name: string; output: string; success: boolean; duration_ms: number }
@@ -204,21 +217,22 @@ export type SSEEvent =
   | { type: 'permission_request'; session_id: string; approval_id: string; tool_name: string; reason: string; call_id: string; arguments: unknown }
   | UserInputRequestEvent
   | { type: 'user_input_resolved'; request_id: number }
-  | { type: 'steered'; count: number; inputs: { text: string; images?: ImageData[] }[] }
+  | { type: 'steered'; count: number; inputs: { text: string; images?: ImageData[]; message_id?: string }[]; client_input_ids?: Array<string | null> }
   | { type: 'done'; tokens: unknown; tool_calls: unknown; session_id: string; stop_reason?: string; message?: string }
   | { type: 'stopped' }
   | { type: 'error'; message: string }
-  | { type: 'warning'; message: string }
+  | { type: 'warning'; message: string; message_id?: string }
   | { type: 'persistence_warning'; message: string }
   | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean; server_message?: string | null }
   // Artifact events: the daemon's ArtifactDetector strips fenced code blocks from
   // TextDelta and emits them as separate artifact_start / artifact_content / artifact_end
   // events (see ArtifactDetector in crates/jeikcode-daemon/src/lib.rs). Without handling
   // these, code block content is silently lost in the WebUI while the TUI sees it fine.
-  | { type: 'artifact_start'; id: string; artifact_type: string; language?: string | null; title?: string | null }
+  | { type: 'artifact_start'; id: string; artifact_type: string; language?: string | null; title?: string | null; fence_len?: number | null }
   | { type: 'artifact_content'; id: string; content: string }
   | { type: 'artifact_end'; id: string }
   | { type: 'session_renamed'; session_id: string; name: string }
+  | { type: 'session_status'; session_id?: string; status: string }
   | { type: 'command_output'; text: string }
   | SessionMutationEvent;
 
@@ -313,11 +327,16 @@ export async function postChatPrompt(
 
   if (!resp.ok) {
     let errText = '';
+    let errCode = '';
     try {
       const errJson = await resp.json();
       errText = errJson.error || errJson.message || '';
+      errCode = errJson.code || '';
     } catch {}
-    throw new Error(errText || `HTTP ${resp.status} ${resp.statusText}`);
+    const err = new Error(errText || `HTTP ${resp.status} ${resp.statusText}`);
+    (err as any).status = resp.status;
+    (err as any).code = errCode;
+    throw err;
   }
 
   try {
@@ -327,13 +346,37 @@ export async function postChatPrompt(
   }
 }
 
-export async function stopChat(requestId: string): Promise<void> {
+export interface StopChatResult {
+  success: boolean;
+  /**
+   * 权威释放结论：目标槽位已确认空闲，调用方可以紧接着投递一个新回合。
+   * 旧版 daemon 缺该字段时按 true 兼容处理（保持旧行为）。
+   */
+  released: boolean;
+}
+
+/**
+ * Stop the running turn of a session (or of a raw request alias).
+ *
+ * `released` is the daemon's verdict — not a guess: the compat registry slot is
+ * free and no native-runtime turn still occupies the session. "Send now" only
+ * delivers after `released`, which is what removes the 409-then-requeue flash.
+ */
+export async function stopChat(requestId: string): Promise<StopChatResult> {
   const resp = await apiFetch('/chat/stop', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ session_id: requestId }),
   });
   if (!resp.ok) throw new Error(`stop chat failed: ${resp.status}`);
+  try {
+    const body = (await resp.json()) as Partial<StopChatResult>;
+    return { success: body.success !== false, released: body.released !== false };
+  } catch {
+    // Older daemons answered without a body field set; keep the optimistic
+    // contract so a stale binary cannot wedge send-now into never delivering.
+    return { success: true, released: true };
+  }
 }
 
 /** Fold a queued follow-up into the running `/chat` turn at the next step. */
@@ -341,6 +384,7 @@ export async function postChatSteer(
   sessionId: string,
   message: string,
   images?: ImageData[],
+  clientInputId?: string,
 ): Promise<void> {
   const resp = await apiFetch('/chat/steer', {
     method: 'POST',
@@ -349,6 +393,7 @@ export async function postChatSteer(
       session_id: sessionId,
       message,
       ...(images && images.length ? { images } : {}),
+      ...(clientInputId ? { client_input_id: clientInputId } : {}),
     }),
   });
   let body: { accepted?: boolean; error?: string } = {};
@@ -530,12 +575,14 @@ export async function getChatPending(sessionId: string): Promise<ChatPendingInte
  */
 export async function watchChatSession(
   sessionId: string,
-  onEvent: (event: SSEEvent) => void,
+  /** 回放帧带 `seq` 游标，调用方据此推进断点续传游标（见 `SeqTaggedFrame`）。 */
+  onEvent: (event: SSEEvent & SeqTaggedFrame) => void,
   signal?: AbortSignal,
-  opts?: { standbyOnly?: boolean },
+  opts?: { standbyOnly?: boolean; afterSeq?: number },
 ): Promise<void> {
   const params = new URLSearchParams({ session_id: sessionId });
   if (opts?.standbyOnly) params.set('standby', 'true');
+  if (opts?.afterSeq !== undefined) params.set('after_seq', String(opts.afterSeq));
   const resp = await apiFetch(
     `/chat/watch?${params.toString()}`,
     { headers: authHeaders(), signal },
@@ -761,6 +808,9 @@ export interface ToolResultInfo {
 export interface SessionMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
+  /** Stable per-message identity from the pipeline (`Message.id`). Absent on
+   *  older daemons; UI then falls back to positional identity. */
+  id?: string;
   /** Model reasoning/thinking for assistant messages (persisted losslessly;
    *  previously dropped at the API boundary so a reload lost all earlier
    *  thinking). Rendered as a collapsible thinking block before the text. */
@@ -956,6 +1006,7 @@ export async function patchSessionMessage(
     images?: ImageData[];
     expected_text?: string;
     expected_message_id?: string;
+    expected_role?: 'user' | 'assistant';
   },
 ): Promise<{ success: boolean; revision: number; source_index: number }> {
   const resp = await apiFetch(
@@ -977,12 +1028,14 @@ export async function deleteSessionMessage(
     delete_turn?: boolean;
     expected_text?: string;
     expected_message_id?: string;
+    expected_role?: 'user' | 'assistant';
   },
 ): Promise<{ success: boolean; revision: number; source_index?: number; notFound?: boolean }> {
   const q = new URLSearchParams();
   if (params?.delete_turn) q.set('delete_turn', 'true');
   if (params?.expected_text) q.set('expected_text', params.expected_text);
   if (params?.expected_message_id) q.set('expected_message_id', params.expected_message_id);
+  if (params?.expected_role) q.set('expected_role', params.expected_role);
   const qs = q.toString() ? `?${q.toString()}` : '';
   const resp = await apiFetch(
     `/projects/${encodeURIComponent(projectHash)}/sessions/${encodeURIComponent(sessionId)}/messages/${index}${qs}`,
@@ -1001,6 +1054,7 @@ export async function truncateSession(
     target_index: number;
     target_message_id?: string;
     expected_text?: string;
+    expected_role?: 'user' | 'assistant';
     inclusive?: boolean;
   },
 ): Promise<{ success: boolean; revision: number; target_index?: number; notFound?: boolean }> {
@@ -1055,6 +1109,8 @@ export interface ConfigInfo {
   accounts?: AccountInfo[];
   /** "en", "vi-VN", or "zh-CN". Missing on older servers. */
   language?: string;
+  /** Whether to display the GitHub repository logo in the UI. Defaults to true. */
+  github_logo?: boolean;
 }
 
 export async function getConfig(): Promise<ConfigInfo> {
@@ -1177,7 +1233,7 @@ function getSidebarBroadcastChannel(): BroadcastChannel | null {
   return sidebarBroadcastChannel;
 }
 
-/** Same-browser tabs plus a refetch hint. Other machines pick this up on the sidebar poll. */
+/** Same-browser tabs plus a refetch hint. Other machines follow `/events` `sidebar_projects`. */
 export function broadcastSidebarProjects(): void {
   if (typeof window === 'undefined') return;
   window.dispatchEvent(new CustomEvent('jeikcode:sidebar_projects'));
@@ -1192,9 +1248,13 @@ export async function getSidebarProjects(): Promise<SidebarProjects> {
   const resp = await apiFetch('/projects/sidebar', { headers: authHeaders() });
   if (!resp.ok) throw new Error(`sidebar projects failed: ${resp.status}`);
   const body = await resp.json() as Partial<SidebarProjects>;
+  return parseSidebarProjects(body);
+}
+
+function parseSidebarProjects(body: Partial<SidebarProjects> | null | undefined): SidebarProjects {
   return {
-    hidden: Array.isArray(body.hidden) ? body.hidden.filter((h) => typeof h === 'string') : [],
-    pinned: Array.isArray(body.pinned) ? body.pinned : [],
+    hidden: Array.isArray(body?.hidden) ? body.hidden.filter((h) => typeof h === 'string') : [],
+    pinned: Array.isArray(body?.pinned) ? body.pinned : [],
   };
 }
 
@@ -1205,9 +1265,9 @@ export async function hideSidebarProject(hash: string): Promise<SidebarProjects>
     body: JSON.stringify({ hash }),
   });
   if (!resp.ok) throw new Error(`hide project failed: ${resp.status}`);
-  const body = await resp.json() as SidebarProjects;
+  const body = await resp.json() as Partial<SidebarProjects>;
   broadcastSidebarProjects();
-  return body;
+  return parseSidebarProjects(body);
 }
 
 /** Pin a directory into the shared sidebar and clear any hide flag. */
@@ -1228,14 +1288,16 @@ export async function showSidebarProject(path: string): Promise<ProjectInfo> {
 }
 
 /** Put a hidden project back. Used when a session in it is still running. */
-export async function revealSidebarProject(hash: string): Promise<void> {
+export async function revealSidebarProject(hash: string): Promise<SidebarProjects> {
   const resp = await apiFetch('/projects/sidebar/reveal', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ hash }),
   });
   if (!resp.ok) throw new Error(`reveal project failed: ${resp.status}`);
+  const body = await resp.json() as Partial<SidebarProjects>;
   broadcastSidebarProjects();
+  return parseSidebarProjects(body);
 }
 
 // --- Current project state ---
@@ -1308,6 +1370,58 @@ export interface SkillInfo {
 
 export async function getSkills(): Promise<SkillInfo[]> {
   const resp = await apiFetch('/skills', { headers: authHeaders() });
+  return resp.json();
+}
+
+// --- Unified capabilities (MCP servers + skills, GLOBAL + PROJECT scopes) ---
+
+export type CapKind = 'mcp' | 'skill';
+export type CapScope = 'global' | 'project';
+
+export interface CapabilityItem {
+  kind: CapKind;
+  /** Stable identity for the toggle endpoint (MCP server name / skill registry name). */
+  id: string;
+  /** Human-facing name (skills show the bare name). */
+  name: string;
+  description: string;
+  global_disabled: boolean;
+  project_disabled: boolean;
+  /** The state the runtime applies (disabled at EITHER scope). */
+  effective_disabled: boolean;
+  /** MCP only: connection status (connected / connecting / error / disconnected). */
+  status?: string;
+  /** MCP only: tool count when connected. */
+  tool_count?: number;
+  /** MCP only: connection error. */
+  error?: string;
+  /** Skills only: the folder that owns the skill (for "reveal in explorer"). */
+  dir?: string;
+}
+
+/** GET /capabilities — one unified list for the sidebar's MCP + skills menus. */
+export async function getCapabilities(): Promise<CapabilityItem[]> {
+  const resp = await apiFetch('/capabilities', { headers: authHeaders() });
+  if (!resp.ok) throw new Error(`capabilities failed: ${resp.status}`);
+  const body = await resp.json() as { items?: CapabilityItem[] };
+  return body.items ?? [];
+}
+
+/**
+ * POST /capabilities/toggle — persist a capability's disabled flag at one scope and
+ * rebuild capabilities so the change lands in the very next prompt.
+ */
+export async function toggleCapability(
+  kind: CapKind,
+  id: string,
+  scope: CapScope,
+  disabled: boolean,
+): Promise<{ ok: boolean; error?: string; runtime_reloaded?: boolean }> {
+  const resp = await apiFetch('/capabilities/toggle', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ kind, id, scope, disabled }),
+  });
   return resp.json();
 }
 
@@ -1503,6 +1617,23 @@ export async function listDir(path: string): Promise<FsListResult> {
   return body;
 }
 
+/** Local-only repair folder browser. Reject non-absolute and network paths
+ * before invoking generic /fs/list (which might otherwise contact SMB).
+ */
+export async function listLocalRepairDir(path: string): Promise<FsListResult> {
+  if (!isAbsoluteRepairPath(path)) {
+    throw new Error('Repair browsing requires a local absolute directory');
+  }
+  const result = await listDir(path);
+  // The generic endpoint returns its canonical directory. A local-looking
+  // request may resolve through host aliases to a nonlocal namespace.
+  // Reject that response rather than making it a selectable repair root.
+  if (!isAbsoluteRepairPath(result.path)) {
+    throw new Error('Repair directory listing returned a nonlocal directory');
+  }
+  return result;
+}
+
 // --- Create directory ---
 
 export async function mkdir(path: string): Promise<{ path: string }> {
@@ -1692,62 +1823,86 @@ export interface ApprovalModeResponse {
   mode: ApprovalMode;
 }
 
+/**
+ * 跨实例增量事件（`GET /events`）。
+ *
+ * 与「失效信号→整表重拉」不同，每条都自带 payload：客户端按 id 就地 upsert/
+ * 删除自己的缓存；`sync` 只是冷启动对齐信号（客户端仍只做一次既有拉取）。
+ */
+export type GlobalWireEvent =
+  | { type: 'sync' }
+  | { type: 'session_upsert'; session: SessionMetaWithProject }
+  | { type: 'session_deleted'; session_id: string; project_hash: string }
+  | { type: 'activity'; session_id: string; running: boolean; terminal?: 'completed' | 'stopped' | 'failed'; status?: string }
+  /** 该会话弹出了审批/提问卡：对该会话做一次定向 pending 拉取（单会话小请求）。 */
+  | { type: 'review_asked'; session_id: string }
+  /** 待交互已解决：按 id 就地从所有实例的通知卡片中移除。 */
+  | { type: 'review_resolved'; session_id: string; approval_id?: string; request_id?: number }
+  /** 全局配置热重载信号（如 CLI 执行 jeikcode ghimg 或后台配置更新）。 */
+  | { type: 'config_reloaded' }
+  /** 侧栏项目可见性（隐藏/钉住/运行中自动恢复），跨实例就地对齐。 */
+  | { type: 'sidebar_projects'; hidden: string[]; pinned?: ProjectInfo[] };
+
+/** 跨实例增量流。断线由调用方重连；本函数只在 abort/流关闭时返回。 */
+export async function streamGlobalEvents(
+  onEvent: (event: GlobalWireEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const resp = await apiFetch('/events', { headers: authHeaders(), signal });
+  if (!resp.ok) {
+    throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
+  }
+  const reader = resp.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const parts = buffer.split('\n\n');
+    buffer = parts.pop() ?? '';
+    for (const part of parts) {
+      const dataLine = part.split('\n').find((line) => line.startsWith('data:'));
+      if (!dataLine) continue;
+      const jsonStr = dataLine.slice('data:'.length).trim();
+      if (!jsonStr) continue;
+      try {
+        onEvent(JSON.parse(jsonStr) as GlobalWireEvent);
+      } catch {
+        /* keep-alive / malformed frame */
+      }
+    }
+  }
+}
+
 export type LiveWireEvent =
   | { type: 'snapshot'; messages: SessionMessage[]; session_id: string; session_name?: string; project_hash: string; provider: string; mode: ApprovalMode; working_dir?: string }
   | { type: 'provider'; provider: string }
   | { type: 'mode'; mode: ApprovalMode }
-  | { type: 'user'; text: string; images?: ImageData[]; client_input_id?: string }
-  | { type: 'text'; content: string }
-  | { type: 'reasoning'; content: string }
-  | { type: 'tool_start'; id: string; name: string; arguments: string }
+  | { type: 'user'; text: string; images?: ImageData[]; client_input_id?: string; message_id?: string }
+  | { type: 'user_identified'; message_id: string; turn_ordinal?: number }
+  | { type: 'text'; content: string; message_id?: string; part_id?: string; part_seq?: number }
+  | { type: 'reasoning'; content: string; message_id?: string; part_id?: string; part_seq?: number }
+  | { type: 'tool_start'; id: string; name: string; arguments: string; message_id?: string }
   | { type: 'tool_output'; id: string; chunk: string }
   | { type: 'tool_progress'; id: string; progress: string }
   | { type: 'tool_result'; id: string; name: string; output: string; success: boolean; duration_ms: number }
   | { type: 'tokens'; prompt: number; completion: number; total: number; cached?: number }
   | { type: 'state'; running: boolean; stop_reason?: string; message?: string }
   | { type: 'error'; message: string }
-  | { type: 'warning'; message: string }
+  | { type: 'warning'; message: string; message_id?: string }
   | { type: 'persistence_warning'; message: string }
   | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean; server_message?: string | null }
   | { type: 'permission_request'; session_id?: string; runtime_instance_id: string; generation: number; request_id: number; tool_name: string; reason: string; call_id: string; arguments: string }
   | { type: 'user_input_request'; session_id?: string; request_id: number; header: string; question: string; mode: 'single' | 'multiple' | 'text'; options: { label: string; description?: string }[] }
   | { type: 'user_input_resolved'; request_id: number }
-  | { type: 'steered'; count: number; inputs: { text: string; images: ImageData[] }[]; client_input_ids: Array<string | null> }
+  | { type: 'steered'; count: number; inputs: { text: string; images: ImageData[]; message_id?: string }[]; client_input_ids: Array<string | null> }
   | { type: 'session_switched'; session_id: string }
   | { type: 'session_renamed'; session_id: string; name: string }
+  | { type: 'session_status'; session_id?: string; status: string }
   | { type: 'working_dir'; working_dir: string }
   | { type: 'command_output'; text: string };
 
-export async function streamLive(
-  onEvent: (e: LiveWireEvent) => void,
-  signal?: AbortSignal,
-  sessionId?: string | null,
-  // Called on every chunk received (events AND the 15s keepalive ping) so the
-  // caller can run a staleness watchdog that reconnects a silently-dead stream.
-  onActivity?: () => void,
-): Promise<void> {
-  const params = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : '';
-  const resp = await apiFetch(`/live${params}`, { headers: authHeaders(), signal });
-  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-  const reader = resp.body!.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    onActivity?.();
-    buffer += decoder.decode(value, { stream: true });
-    const parts = buffer.split('\n\n');
-    buffer = parts.pop() ?? '';
-    for (const part of parts) {
-      const line = part.split('\n').find((l) => l.startsWith('data:'));
-      if (!line) continue;
-      const json = line.slice('data:'.length).trim();
-      if (!json) continue;
-      try { onEvent(JSON.parse(json) as LiveWireEvent); } catch { /* ignore keepalive */ }
-    }
-  }
-}
 
 export async function postLiveMessage(
   message: string,
@@ -2378,6 +2533,12 @@ export async function gitAction(options: {
 
 // --- Update & Config Sync API ---
 
+export interface UpdateVersionEntry {
+  version: string;
+  notes?: string | null;
+  released_at?: string | null;
+}
+
 export interface UpdateCheckResponse {
   current_version: string;
   latest_version: string;
@@ -2387,6 +2548,8 @@ export interface UpdateCheckResponse {
   download_url?: string | null;
   released_at?: string | null;
   channel?: 'stable' | 'beta';
+  /** Channel history, newest first. */
+  versions?: UpdateVersionEntry[];
 }
 
 export interface UpdateStatus {
@@ -2439,6 +2602,7 @@ export async function executeUpdate(payload?: {
   channel?: string;
   version?: string;
   download_url?: string;
+  force?: boolean;
 }): Promise<{ success: boolean; message: string }> {
   const resp = await apiFetch('/api/update/execute', {
     method: 'POST',
@@ -2491,6 +2655,3 @@ export async function dismissUpgradeDiffs(): Promise<{ success: boolean }> {
   }
   return resp.json();
 }
-
-
-

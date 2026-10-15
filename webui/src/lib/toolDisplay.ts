@@ -108,13 +108,8 @@ export function toolRendersAsDiff(name: string): boolean {
 /** True only for a real unified diff (`diff --git` or `@@ -n,n +n,n @@`).
  *  A leading `-` bullet (`- F3 'memory/…'`) is not a deletion. */
 export function looksLikeUnifiedDiff(text: string): boolean {
-  const lines = text.replace(/\r\n/g, '\n').split('\n');
-  const n = Math.min(lines.length, 80);
-  for (let i = 0; i < n; i++) {
-    const line = lines[i]!;
-    if (line.startsWith('diff --git ') || /^@@ -\d+/.test(line)) return true;
-  }
-  return false;
+  if (!text) return false;
+  return text.includes('diff --git ') || /(?:^|\n)@@ -\d+/.test(text);
 }
 
 function parseHunkStarts(header: string): { oldStart: number; newStart: number } | null {
@@ -215,7 +210,7 @@ export function resolveToolDiffPreview(
   if (!oldStr && !newStr) return null;
   const lines = buildEditArgsDiff(oldStr, newStr);
   if (!lines.some((l) => l.kind === 'add' || l.kind === 'del')) return null;
-  return { lines, raw: formatEditArgsDiffRaw(oldStr, newStr), source: 'args' };
+  return { lines, raw: formatEditArgsDiffRaw(oldStr, newStr), source: isSuccessfulEdit ? 'output' : 'args' };
 }
 
 export type ToolDiffStats = {

@@ -2,20 +2,86 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <title>JeikCode Desktop</title>
-    <script type="module" src="./startup-i18n.mjs"></script>
+    <title>Jeikcode</title>
     <style>
-      html, body { height: 100%; margin: 0; background: #0f1115; color: #e8eaed; font: 16px/1.5 sans-serif; }
-      main { height: 100%; display: flex; align-items: center; justify-content: center; }
-      p { opacity: 0.8; }
+      html, body {
+        height: 100%;
+        margin: 0;
+        background: #0f1115;
+        color: #e8eaed;
+        font: 16px/1.5 "Segoe UI", sans-serif;
+      }
+      main {
+        height: 100%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .boot {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 22px;
+      }
+      h1 {
+        margin: 0;
+        font-size: 32px;
+        font-weight: 620;
+        letter-spacing: -0.04em;
+      }
+      .spin {
+        width: 36px;
+        height: 36px;
+        animation: boot-spin 0.85s linear infinite;
+      }
+      .spin circle.track {
+        fill: none;
+        stroke: rgba(232, 234, 237, 0.14);
+        stroke-width: 3;
+      }
+      .spin circle.arc {
+        fill: none;
+        stroke: #3b82f6;
+        stroke-width: 3;
+        stroke-linecap: round;
+        stroke-dasharray: 26 88;
+        filter: drop-shadow(0 0 6px rgba(59, 130, 246, 0.55));
+      }
+      #status {
+        margin: 0;
+        font-size: 14px;
+        letter-spacing: 0.04em;
+        opacity: 0.72;
+      }
+      @keyframes boot-spin {
+        to { transform: rotate(360deg); }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .spin { animation: none; }
+      }
     </style>
   </head>
   <body>
     <main>
-      <div>
-        <h1>JeikCode</h1>
-        <p id="status">Starting…</p>
+      <div class="boot">
+        <h1>Jeikcode</h1>
+        <svg id="spinner" class="spin" viewBox="0 0 48 48" aria-hidden="true">
+          <circle class="track" cx="24" cy="24" r="18"></circle>
+          <circle class="arc" cx="24" cy="24" r="18"></circle>
+        </svg>
+        <p id="status">Starting</p>
       </div>
     </main>
+    <script>
+      const status = document.getElementById('status');
+      const spinner = document.getElementById('spinner');
+      const sync = () => {
+        if (!status || !spinner) return;
+        spinner.hidden = (status.textContent || '').trim() !== 'Starting';
+      };
+      if (status) {
+        new MutationObserver(sync).observe(status, { childList: true, characterData: true, subtree: true });
+      }
+    </script>
   </body>
 </html>

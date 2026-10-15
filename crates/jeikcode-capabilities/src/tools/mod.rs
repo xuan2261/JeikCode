@@ -39,6 +39,7 @@ pub mod approval;
 pub mod ast_grep;
 pub mod bash;
 pub mod bash_ctl;
+pub mod bash_log;
 pub mod bash_runtime;
 pub mod bash_workspace_gate;
 pub mod edit;
@@ -65,7 +66,10 @@ pub mod write;
 pub mod write_approval;
 pub mod write_state;
 
-pub use crate::shell_names::{is_shell_tool_name, SHELL_TOOL_ALIASES, SHELL_TOOL_NAME};
+pub use crate::shell_names::{
+    extract_shell_command, is_shell_tool_name, SHELL_COMMAND_ALIASES, SHELL_COMMAND_KEY,
+    SHELL_TOOL_ALIASES, SHELL_TOOL_NAME,
+};
 pub use approval::{
     parse_permission_decision, request_approval_decision, ApprovalMiddleware, ApprovalRequest,
     ApprovalResponse, InMemoryPermissionStore, PermissionDecision, PermissionStore, APPROVAL_KIND,
@@ -76,6 +80,7 @@ pub use bash::{
     ShellOutcome,
 };
 pub use bash_ctl::LongBashKeywordActionsTool;
+pub use bash_log::{cleanup_session_logs, BackgroundLogWriter};
 pub use bash_runtime::{bind_session_long_keywords, legacy_bash_runtime_state, BashRuntimeState};
 pub use bash_workspace_gate::BashWorkspaceGate;
 pub use edit::EditFileTool;
@@ -84,7 +89,7 @@ pub use grep::GrepTool;
 pub use jeikcode_config_guide::{JeikcodeConfigGuideTool, JeikcodeConfigTool};
 pub use output_artifact::{
     artifact_id, ArtifactMiddleware, ArtifactStore, FetchOutputTool,
-    ARTIFACT_TRUNCATION_MARKER_PREFIX, THRESHOLD_BYTES,
+    ARTIFACT_TRUNCATION_MARKER_PREFIX, TERMINAL_THRESHOLD_BYTES, THRESHOLD_BYTES,
 };
 pub use read::ReadFileTool;
 pub use repair::{repair_tool_args, RepairToolArgsMiddleware};
@@ -125,13 +130,13 @@ pub fn coding_tool_names() -> &'static [&'static str] {
 }
 
 /// Register the full neutral coding toolset into `reg` (then `mount` the subset a
-/// given specialization should expose to the model). Vision support OFF — `read_file`
+/// given specialization should expose to the model). Vision support OFF — `read`
 /// reports images as binary (use [`register_coding_tools_with_vision`] for a VL model).
 pub fn register_coding_tools(reg: &mut ToolRegistry) {
     register_coding_tools_with_vision(reg, false);
 }
 
-/// Like [`register_coding_tools`], but `vision` gates whether `read_file` hands an
+/// Like [`register_coding_tools`], but `vision` gates whether `read` hands an
 /// image file back to the model as an actual picture (a VISION model SEES it) instead
 /// of the "binary, cannot display" text. The caller decides the flag from the model
 /// using [`crate::provider::model_suggests_vision`], the same detector used by the
@@ -208,14 +213,6 @@ pub fn register_coding_tools_with_vision_and_bash_state(
     }
 }
 
-/// Apply `CREATE_NO_WINDOW` on Windows so a spawned child does not pop a console window;
-/// no-op elsewhere. Critical in headless/daemon mode (e.g. the WeChat clawbot / OpenClaw
-/// bridge): with no console to inherit, each `cmd.exe` spawn would otherwise allocate a
-/// NEW console window — the "一对话桌面就闪" flash the user reported. Re-exported from the
-/// crate-shared [`crate::process_utils`] so there is ONE implementation (this module's
-/// local copy was deduped into that home, which also carries the `std` `_sync` variant).
-pub(crate) use crate::process_utils::suppress_console_window;
-
 /// Outcome of waiting on a spawned command capped by `[tools.bash] max_timeout_secs`.
 #[derive(Debug)]
 pub(crate) enum CappedCommandOutput {
@@ -273,6 +270,35 @@ pub(crate) async fn output_with_timeout_secs(
 
 /// Resolve a model-supplied path. Shared with `codeintel` via [`crate::pathutil`].
 pub(crate) use crate::pathutil::{is_absolute_path, resolve_path};
+
+/// Names every name-keyed gate must treat as a FILE MUTATION: the canonical tools first, then
+/// the aliases that still dispatch. `create_file` is a long-recognised spelling (the daemon,
+/// tuix and goal-summary layers already accept it), and the purged bulk-edit names stay listed
+/// so a hallucinated call can never skip a gate. Single source: adding an alias here covers the
+/// write-approval gate AND the worker scope gate at once.
+pub const FILE_MUTATION_TOOLS: &[&str] = &[
+    "edit",
+    "edit_file",
+    "write",
+    "write_file",
+    "create_file",
+    "search_replace",
+    "global_search_replace",
+    "parallel_edit_files",
+];
+
+/// Case-insensitive membership test over [`FILE_MUTATION_TOOLS`].
+pub fn is_file_mutation_tool(name: &str) -> bool {
+    FILE_MUTATION_TOOLS
+        .iter()
+        .any(|t| name.eq_ignore_ascii_case(t))
+}
+
+/// The bulk-edit tools whose "target" is a search ROOT (a directory), not a single file.
+pub fn is_search_replace_tool(name: &str) -> bool {
+    name.eq_ignore_ascii_case("search_replace")
+        || name.eq_ignore_ascii_case("global_search_replace")
+}
 
 /// Max entries listed in a not-found hint before it is truncated.
 const HINT_MAX_ENTRIES: usize = 40;
@@ -373,7 +399,7 @@ fn render_dir_hint(dir: &Path) -> String {
 
 /// Coerce every line ending in `s` to `eol` (`"\n"` or `"\r\n"`): collapse any `\r\n`
 /// to `\n`, then expand to the target. Idempotent for `"\n"`. Used by the editors so a
-/// model that copied LF text from `read_file` (which strips `\r` via `str::lines()`) can
+/// model that copied LF text from `read` (which strips `\r` via `str::lines()`) can
 /// still match — and not corrupt — a CRLF file on disk.
 pub(crate) fn coerce_eol(s: &str, eol: &str) -> String {
     if eol == "\r\n" {
@@ -414,7 +440,7 @@ pub(crate) fn is_skip_dir(name: &str) -> bool {
 }
 
 /// WebUI user-upload store. Gitignored so it stays out of project VCS, but
-/// `read` / `grep` / `glob` / `list_directory` must still see it — these files
+/// `read` / `grep` / `glob` must still see it — these files
 /// are attachments the model is expected to open, not project source.
 pub const USER_UPLOAD_STORE_DIR: &str = ".jeikcode_store";
 
@@ -528,6 +554,13 @@ pub(crate) fn for_each_project_entry(
         .git_ignore(git_ignore_active)
         .git_global(git_ignore_active)
         .git_exclude(git_ignore_active);
+    // The shipped/user ignore list is applied AS A WHOLE on purpose: its dir rules
+    // (`obj/`, `bin/Debug/`, …) and its file-level negations (`!bin/*.js`,
+    // `!src/bin/`) only work together — filtering it down to "dirs only" hides
+    // `bin/` and with it the negations that rescue `bin/cli.js` (see
+    // `shipped_ignore_keeps_source_bins_in_glob`). Consequently the list itself must
+    // never hide files an explicit search is asked for; that is why `.env*` was
+    // removed from the asset (it silently hid `.env.local` from `glob`/`grep`).
     if git_ignore_active {
         add_codegraph_ignores(&mut main);
     }
@@ -569,7 +602,7 @@ pub(crate) fn ok(content: impl Into<String>) -> ToolResult {
     }
 }
 /// A successful tool result that also carries inline `images` for a VISION model to
-/// SEE (e.g. `read_file` returning a picture). The agent loop lifts these onto a
+/// SEE (e.g. `read` returning a picture). The agent loop lifts these onto a
 /// follow-up `Role::User` message — the only role a provider serializes images on.
 pub(crate) fn ok_with_images(
     content: impl Into<String>,
@@ -1069,6 +1102,16 @@ mod tests {
         );
         assert_eq!(mounted.get("todowrite").unwrap().name(), TODO_TOOL_NAME);
         assert_eq!(mounted.get("todo").unwrap().name(), TODO_TOOL_NAME);
+    }
+
+    #[test]
+    fn write_tool_registered_with_aliases_and_create_file() {
+        let mut reg = ToolRegistry::new();
+        register_coding_tools(&mut reg);
+        let mounted = reg.mount(coding_tool_names());
+        assert_eq!(mounted.get("write").unwrap().name(), "write");
+        assert_eq!(mounted.get("write_file").unwrap().name(), "write");
+        assert_eq!(mounted.get("create_file").unwrap().name(), "write");
     }
 
     #[test]

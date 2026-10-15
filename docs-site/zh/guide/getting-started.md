@@ -135,6 +135,7 @@ jeikcode init --force
 
 ## 5. 下一步建议
 
+- 更新、回退与卸载：[更新与卸载](/zh/guide/updates)
 - 了解代码图谱与深度语义探索：[代码图谱](/zh/usage/codegraph)
 - 了解核心配置与自动配置机制：[AI快速配置](/zh/guide/configuration)
 - 了解如何配置各大主流模型与 API Key：[模型配置](/zh/guide/login)

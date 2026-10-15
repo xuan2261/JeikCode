@@ -14,17 +14,19 @@ use jeikcode_kernel::hook::LifecycleHooks;
 use jeikcode_kernel::tool::Tool;
 
 // Redirect JEIKCODE_HOME to a throwaway temp dir before any test in this binary runs,
-// so tests that persist without setting their own JEIKCODE_HOME never write into the
-// developer's real home. Tests that set their own JEIKCODE_HOME still win (isolate_home
-// is a no-op when the var is already set).
+// so tests that persist without setting their own home never write into the developer's
+// real home. Tests that install their own thread-local home
+// (`jeikcode_config::test_util::isolated_home`) override it for that thread only.
 #[ctor::ctor]
 fn _isolate_jeikcode_home() {
     jeikcode_kernel::test_support::isolate_home();
 }
 
+/// 线程级 home 守卫（带跨模块锁，避免同一进程内写入互相干扰）。
+/// 旧实现负责还原进程级 `JEIKCODE_HOME`；现在由 `IsolatedHome` 在 drop 时还原。
 struct JeikcodeHomeGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
-    prev: Option<std::ffi::OsString>,
+    _home: jeikcode_config::test_util::IsolatedHome,
 }
 
 impl JeikcodeHomeGuard {
@@ -32,17 +34,10 @@ impl JeikcodeHomeGuard {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         let lock = LOCK.get_or_init(|| Mutex::new(()));
         let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var_os("JEIKCODE_HOME");
-        std::env::set_var("JEIKCODE_HOME", path);
-        Self { _lock: guard, prev }
-    }
-}
-
-impl Drop for JeikcodeHomeGuard {
-    fn drop(&mut self) {
-        match self.prev.take() {
-            Some(v) => std::env::set_var("JEIKCODE_HOME", v),
-            None => std::env::remove_var("JEIKCODE_HOME"),
+        let home = jeikcode_config::test_util::IsolatedHome::at(path);
+        Self {
+            _lock: guard,
+            _home: home,
         }
     }
 }

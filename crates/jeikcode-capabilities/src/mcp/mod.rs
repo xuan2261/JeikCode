@@ -15,7 +15,7 @@
 //! The embedding runtime may connect in the background and atomically publish a new
 //! per-turn tool catalog; non-interactive surfaces may instead await readiness.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use jeikcode_kernel::tool::{Tool, ToolRegistry};
@@ -60,6 +60,51 @@ pub use types::*;
 pub async fn shutdown_all_mcp_pools() {
     ProjectMcpPool::global().shutdown_all().await;
     SessionMcpPool::global().shutdown_all().await;
+    kill_all_mcp_children_now();
+}
+
+/// Weak handles to EVERY live MCP client, whatever registry owns it (session pool /
+/// project pool / schema probe). A child spawned by ANY path must be reaped before a host
+/// tears its runtime down — see [`kill_all_mcp_children_now`].
+static LIVE_MCP_CLIENTS: OnceLock<Mutex<Vec<Weak<dyn McpClient>>>> = OnceLock::new();
+
+fn live_mcp_clients() -> &'static Mutex<Vec<Weak<dyn McpClient>>> {
+    LIVE_MCP_CLIENTS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Remember a freshly connected client so a later global teardown can kill its child.
+/// Called by `McpRegistry` at every `servers` insert; dead entries are pruned by the killer.
+pub fn register_mcp_client(client: &Arc<dyn McpClient>) {
+    let mut live = live_mcp_clients().lock().unwrap_or_else(|e| e.into_inner());
+    live.retain(|weak| weak.strong_count() > 0);
+    live.push(Arc::downgrade(client));
+}
+
+/// Synchronously kill the child process of EVERY live MCP client (best-effort, idempotent,
+/// no awaits — callable from `Drop`).
+///
+/// Why GLOBAL: `SessionMcpLease`'s last-owner teardown only knows its OWN registry, but a
+/// child may belong to the project pool or the schema probe (a session-less assembly spawns
+/// through those). Leaving any of them alive both leaks the npx/cmd/node tree AND deadlocks
+/// `Runtime::drop` forever on the still-open stdout pipe — empirically: killing the lone
+/// child is exactly what unblocks `tests/full_assembly.rs`'s teardown hang.
+pub fn kill_all_mcp_children_now() {
+    let clients: Vec<Arc<dyn McpClient>> = {
+        let mut live = live_mcp_clients().lock().unwrap_or_else(|e| e.into_inner());
+        let mut alive = Vec::with_capacity(live.len());
+        let mut upgraded = Vec::with_capacity(live.len());
+        for weak in live.drain(..) {
+            if let Some(client) = weak.upgrade() {
+                upgraded.push(client.clone());
+                alive.push(Arc::downgrade(&client));
+            }
+        }
+        *live = alive;
+        upgraded
+    };
+    for client in clients {
+        client.kill_now();
+    }
 }
 
 /// Default bound used by callers that explicitly require initial MCP readiness

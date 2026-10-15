@@ -1,4 +1,4 @@
-//! `write_file` — create or overwrite a file (auto-creating parent dirs). Mutates
+//! `write` — create or overwrite a file (auto-creating parent dirs). Mutates
 //! the filesystem ⇒ always `Risky`. Neutral core ported from the production writer,
 //! minus the coding enrichments (file_history backup, file_store/read_cache
 //! invalidation, LSP notify).
@@ -25,7 +25,7 @@ impl Tool for WriteFileTool {
         "write"
     }
     fn aliases(&self) -> &'static [&'static str] {
-        &["write_file"]
+        &["write_file", "create_file"]
     }
     fn description(&self) -> &str {
         "Write content to a file. Creates file and parent directories if absent, or overwrites existing file content."
@@ -60,6 +60,13 @@ impl Tool for WriteFileTool {
                 args,
                 r#"{"path":"<path>","content":"<text>"}"#,
             )
+        })
+        .or_else(|_| {
+            parse_tool_args(
+                "create_file",
+                args,
+                r#"{"path":"<path>","content":"<text>"}"#,
+            )
         }) {
             Ok(a) => a,
             Err(e) => return e.into_tool_result(),
@@ -86,7 +93,7 @@ impl Tool for WriteFileTool {
         if let Some(parent) = path.parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
                 return err(format!(
-                    "write_file: failed to create parent directory {}: {e}",
+                    "write: failed to create parent directory {}: {e}",
                     crate::pathnorm::to_display(parent)
                 ));
             }
@@ -94,7 +101,7 @@ impl Tool for WriteFileTool {
         let new_lines = a.content.lines().count();
         let bytes = a.content.len();
         if let Err(e) = tokio::fs::write(&path, &a.content).await {
-            return err(format!("write_file: failed to write {disp}: {e}"));
+            return err(format!("write: failed to write {disp}: {e}"));
         }
 
         crate::tools::write_state::record_write_success(&path);
@@ -285,7 +292,7 @@ mod tests {
             r.content
         );
         assert!(
-            r.content.contains("尚有 100 行未读取。请全部读取完（使用 `read_file` 配合 offset=1501, limit=1500）确认后再写入！"),
+            r.content.contains("尚有 100 行未读取。请全部读取完（使用 `read` 配合 offset=1501, limit=1500）确认后再写入！"),
             "{}",
             r.content
         );
@@ -455,5 +462,21 @@ mod tests {
             )
             .await;
         assert!(!r2.is_error, "{}", r2.content);
+    }
+
+    #[tokio::test]
+    async fn create_file_alias_creates_new_file() {
+        let d = tempfile::tempdir().unwrap();
+        let tool = WriteFileTool;
+        assert!(tool.aliases().contains(&"create_file"));
+        let r = tool
+            .execute(
+                r#"{"path":"created.txt","content":"hello from create_file\n"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        let on_disk = std::fs::read_to_string(d.path().join("created.txt")).unwrap();
+        assert_eq!(on_disk, "hello from create_file\n");
     }
 }

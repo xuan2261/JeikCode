@@ -76,13 +76,22 @@ impl ArtifactStore {
     }
 }
 
-/// Default fold threshold: results larger than this (bytes) are replaced by an
-/// adaptive preview and spilled to an artifact. 32 KiB — bash/grep and other
-/// unbounded tools fold here. `read_file` self-caps at 65 KiB and opts out via
-/// `never_truncate_result()`, so a default page is not folded into fetch_output.
-/// Configurable per instance via [`ArtifactMiddleware::with_threshold_bytes`];
-/// `0` disables folding.
+/// Default compression threshold: results larger than this (bytes) are replaced
+/// by a head/tail preview plus an artifact-backed retrieval handle. This const
+/// is only the FALLBACK when no config value is present — the shipped config
+/// default is 64 KiB (`[tools.tool_output] max_bytes`). `read_file` self-caps at
+/// 65 KiB and opts out via `never_truncate_result()`, so a default page is not
+/// folded into fetch_output. Configurable per instance via
+/// [`ArtifactMiddleware::with_threshold_bytes`]; `0` disables compression.
 pub const THRESHOLD_BYTES: usize = 32 * 1024;
+/// Fallback for the terminal (shell) early line: console streams are the
+/// noisiest class, so they compress sooner. The shipped config default is
+/// `[tools.tool_output] terminal_max_bytes` (24 KiB); the effective line is
+/// `min(max_bytes, terminal_max_bytes)` so lowering either tightens the class.
+pub const TERMINAL_THRESHOLD_BYTES: usize = 24 * 1024;
+/// Uniform preview kept from each end of a compressed result (bytes).
+const PREVIEW_HEAD_BYTES: usize = 1500;
+const PREVIEW_TAIL_BYTES: usize = 2200;
 /// Stable prefix embedded in a conversation-visible result when the complete
 /// tool output was replaced by an artifact-backed head/tail preview.
 pub const ARTIFACT_TRUNCATION_MARKER_PREFIX: &str = "[jeikcode: output truncated";
@@ -106,14 +115,6 @@ fn is_failure_outcome(result: &jeikcode_kernel::tool::ToolResult) -> bool {
     false
 }
 
-/// Preview half-size for a result above the fold threshold. Scales WITH the
-/// threshold (`threshold/2` on each side, so a 64 KiB threshold keeps 64 KiB
-/// of head+tail = 100% retention instead of a fixed tiny window) — matching
-/// grok-build's "head half + tail half, retention ≈ limit" design.
-fn preview_half(threshold_bytes: usize) -> usize {
-    (threshold_bytes / 2).clamp(8 * 1024, 256 * 1024)
-}
-
 /// Largest char-boundary index ≤ n.
 fn head_boundary(s: &str, n: usize) -> usize {
     let mut i = n.min(s.len());
@@ -134,12 +135,18 @@ fn tail_start(s: &str, n: usize) -> usize {
 
 pub struct ArtifactMiddleware {
     store: Arc<ArtifactStore>,
-    /// Fold threshold for THIS instance. `0` disables folding entirely.
+    /// Compression threshold for THIS instance. `0` disables compression.
     threshold_bytes: usize,
-    /// Tool names whose output must reach the model verbatim (never folded),
-    /// configured via `[tools.tool_output] no_fold_tools`. Batch-friendly:
-    /// every listed tool name opts out of folding, on top of the intrinsic
-    /// `Tool::never_truncate_result()` contract.
+    /// Earlier line for terminal (shell) tools — their effective line is
+    /// `min(threshold_bytes, this)`. `0` drops the terminal early line
+    /// (terminal tools then follow `threshold_bytes`). Wired from
+    /// `[tools.tool_output] terminal_max_bytes`; defaults to
+    /// [`TERMINAL_THRESHOLD_BYTES`].
+    terminal_threshold_bytes: usize,
+    /// Tool names whose output must reach the model verbatim (never
+    /// compressed), configured via `[tools.tool_output] no_fold_tools`.
+    /// Batch-friendly: every listed tool name opts out of compression, on top
+    /// of the intrinsic `Tool::never_truncate_result()` contract.
     no_fold_tools: std::collections::HashSet<String>,
 }
 
@@ -148,14 +155,22 @@ impl ArtifactMiddleware {
         Self {
             store,
             threshold_bytes: THRESHOLD_BYTES,
+            terminal_threshold_bytes: TERMINAL_THRESHOLD_BYTES,
             no_fold_tools: std::collections::HashSet::new(),
         }
     }
 
-    /// Override the fold threshold for this instance (bytes). `0` disables
-    /// folding — every result passes through verbatim.
+    /// Override the compression threshold for this instance (bytes). `0`
+    /// disables compression — every result passes through verbatim.
     pub fn with_threshold_bytes(mut self, bytes: usize) -> Self {
         self.threshold_bytes = bytes;
+        self
+    }
+
+    /// Override the terminal early line for this instance (bytes). `0` drops
+    /// the early line — terminal tools then follow the general threshold.
+    pub fn with_terminal_threshold_bytes(mut self, bytes: usize) -> Self {
+        self.terminal_threshold_bytes = bytes;
         self
     }
 
@@ -179,12 +194,11 @@ impl jeikcode_kernel::middleware::ToolMiddleware for ArtifactMiddleware {
         tool: Option<&dyn jeikcode_kernel::tool::Tool>,
     ) -> jeikcode_kernel::middleware::AfterOutcome {
         let total = result.content.len();
-        // Never fold when:
+        // Exempt from compression entirely:
         // 1. the tool declares its result must reach the model verbatim
-        //    (intrinsic contract, e.g. code_explore), OR
-        // 2. the tool is in the config-driven no-fold whitelist, OR
-        // 3. threshold_bytes == 0 (folding disabled for this instance), OR
-        // 4. the result fits within the threshold.
+        //    (intrinsic contract, e.g. code_explore / read_file), OR
+        // 2. the tool is in the config-driven whitelist (`no_fold_tools`), OR
+        // 3. threshold_bytes == 0 (compression disabled for this instance).
         let in_whitelist = tool.is_some_and(|t| self.no_fold_tools.contains(t.name()));
         if tool.is_some_and(|t| t.never_truncate_result())
             || in_whitelist
@@ -193,10 +207,23 @@ impl jeikcode_kernel::middleware::ToolMiddleware for ArtifactMiddleware {
             return jeikcode_kernel::middleware::AfterOutcome::Proceed;
         }
 
+        // Effective line: terminal (shell) tools compress at their earlier
+        // configured line, but never ABOVE the general one — lowering
+        // `[tools.tool_output] max_bytes` tightens every class. `0` on the
+        // terminal line drops the early cut entirely. Alias-compatible: the
+        // model may call `bash`, the registry resolves `run_command`; both
+        // classify as terminal (`is_shell_tool_name`).
+        let threshold = match tool.map(|t| t.name()) {
+            Some(name) if crate::is_shell_tool_name(name) && self.terminal_threshold_bytes > 0 => {
+                self.threshold_bytes.min(self.terminal_threshold_bytes)
+            }
+            _ => self.threshold_bytes,
+        };
+
         let is_failure = is_failure_outcome(result);
 
-        // Pre-spill original content to artifact store so streamlining and folding
-        // can reference the exact artifact ID and guarantee 100% lossless recall.
+        // Pre-spill original content to the artifact store so the marker can
+        // reference the exact artifact ID and guarantee 100% lossless recall.
         let artifact_id = if total > 1024 && total <= MAX_ARTIFACT_BYTES {
             self.store.put(result.content.as_bytes()).ok()
         } else {
@@ -215,31 +242,22 @@ impl jeikcode_kernel::middleware::ToolMiddleware for ArtifactMiddleware {
         }
 
         let new_total = result.content.len();
-        if new_total <= self.threshold_bytes {
+        if new_total <= threshold {
             return jeikcode_kernel::middleware::AfterOutcome::Proceed;
         }
 
-        // Adaptive dual-state folding:
-        // - Success state (exit 0): aggressive compact preview (keeps ~3KB summary, eliding 95%+ redundant compiler roll).
-        // - Failure state (exit != 0): bounded diagnostic focus (keeps up to 16KB for error trace & line numbers).
-        let (head_budget, tail_budget, status_label) = if is_failure {
-            let total_budget = self.threshold_bytes.clamp(8 * 1024, 16 * 1024);
-            let head_part = (total_budget / 4).clamp(2 * 1024, 4 * 1024);
-            let tail_part = total_budget.saturating_sub(head_part);
-            (head_part, tail_part, "failure diagnostics focused")
-        } else {
-            (1500, 2500, "success output condensed")
-        };
-
-        let head_end = head_boundary(&result.content, head_budget);
-        let tail_begin = tail_start(&result.content, tail_budget);
+        // Unified preview: first 1500 + last 2200 bytes with the retrieval
+        // handle. ONE shape for every class (terminal or not, success or
+        // failure) — callers only vary the threshold.
+        let head_end = head_boundary(&result.content, PREVIEW_HEAD_BYTES);
+        let tail_begin = tail_start(&result.content, PREVIEW_TAIL_BYTES);
         let head = &result.content[..head_end];
         let tail = &result.content[tail_begin..];
 
         if new_total > MAX_ARTIFACT_BYTES {
             // Too large to store; inline-truncate only.
             let marker = format!(
-                "\n\n[jeikcode: output truncated ({status_label}) — {new_total} bytes total, showing first {} + last {} bytes. \
+                "\n\n[jeikcode: output truncated — {new_total} bytes total, showing first {} + last {} bytes. \
 Full output unavailable (exceeds {MAX_ARTIFACT_BYTES}-byte artifact ceiling).]\n\n",
                 head.len(),
                 tail.len()
@@ -250,13 +268,13 @@ Full output unavailable (exceeds {MAX_ARTIFACT_BYTES}-byte artifact ceiling).]\n
 
         let marker = match artifact_id.or_else(|| self.store.put(result.content.as_bytes()).ok()) {
             Some(id) => format!(
-                "\n\n[jeikcode: output truncated ({status_label}) — {new_total} bytes total, showing first {} + last {} bytes. \
+                "\n\n[jeikcode: output truncated — {new_total} bytes total, showing first {} + last {} bytes. \
 Full output saved as artifact {id}. To read more: fetch_output(artifact_id=\"{id}\", offset, limit).]\n\n",
                 head.len(),
                 tail.len()
             ),
             None => format!(
-                "\n\n[jeikcode: output truncated ({status_label}) — {new_total} bytes total, showing first {} + last {} bytes. \
+                "\n\n[jeikcode: output truncated — {new_total} bytes total, showing first {} + last {} bytes. \
 Full output unavailable (could not be saved).]\n\n",
                 head.len(),
                 tail.len()
@@ -506,6 +524,178 @@ mod tests {
         assert_eq!(r.content, huge);
         assert!(!r.content.contains("output truncated"));
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    /// A named tool with NO intrinsic opt-out — drives the terminal-class
+    /// threshold split through the alias-compatible name check.
+    struct NamedProbe(&'static str);
+
+    #[async_trait::async_trait]
+    impl jeikcode_kernel::tool::Tool for NamedProbe {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "probe that carries only a name"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            _args: &str,
+            _ctx: &jeikcode_kernel::tool::ToolContext,
+        ) -> jeikcode_kernel::tool::ToolResult {
+            jeikcode_kernel::tool::ToolResult {
+                call_id: String::new(),
+                content: String::new(),
+                is_error: false,
+                images: vec![],
+            }
+        }
+    }
+
+    /// Terminal tools (both `run_command` and its `bash` alias) compress at
+    /// `min(configured, 24 KiB)` — 30 KiB folds even with 64 KiB configured,
+    /// and the emitted handle resolves to the full text in the store.
+    #[tokio::test]
+    async fn terminal_tool_compresses_at_the_24k_line() {
+        use jeikcode_kernel::middleware::ToolMiddleware;
+        use jeikcode_kernel::tool::ToolResult;
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(super::ArtifactStore::new(dir.path()));
+        let mw = super::ArtifactMiddleware::new(store.clone()).with_threshold_bytes(64 * 1024);
+        let mid = "m".repeat(30 * 1024);
+        for probe in [NamedProbe("run_command"), NamedProbe("bash")] {
+            let mut r = ToolResult {
+                call_id: "c".into(),
+                content: mid.clone(),
+                is_error: false,
+                images: vec![],
+            };
+            mw.after(&mut r, Some(&probe)).await;
+            assert!(
+                r.content.contains("output truncated"),
+                "{} must compress above the 24 KiB terminal line",
+                probe.0
+            );
+            assert!(r.content.contains("showing first 1500 + last 2200"));
+            assert!(r.content.contains("fetch_output"), "must carry the handle");
+            // The handle resolves: the full text is in the artifact store.
+            let id = super::artifact_id(mid.as_bytes());
+            assert!(r.content.contains(&id));
+            assert_eq!(
+                store.get(&id, 0, mid.len()).unwrap().unwrap(),
+                mid.as_bytes()
+            );
+        }
+    }
+
+    /// Non-terminal tools keep the configured line: 30 KiB sits under 64 KiB.
+    #[tokio::test]
+    async fn non_terminal_tool_keeps_the_configured_line() {
+        use jeikcode_kernel::middleware::ToolMiddleware;
+        use jeikcode_kernel::tool::ToolResult;
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(super::ArtifactStore::new(dir.path()));
+        let mw = super::ArtifactMiddleware::new(store).with_threshold_bytes(64 * 1024);
+        let mid = "m".repeat(30 * 1024);
+        let mut r = ToolResult {
+            call_id: "c".into(),
+            content: mid.clone(),
+            is_error: false,
+            images: vec![],
+        };
+        mw.after(&mut r, Some(&NamedProbe("grep"))).await;
+        assert_eq!(
+            r.content, mid,
+            "non-terminal 30 KiB sits under the 64 KiB line"
+        );
+    }
+
+    /// A terminal result under its 24 KiB line is untouched.
+    #[tokio::test]
+    async fn terminal_result_under_the_24k_line_is_untouched() {
+        use jeikcode_kernel::middleware::ToolMiddleware;
+        use jeikcode_kernel::tool::ToolResult;
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(super::ArtifactStore::new(dir.path()));
+        let mw = super::ArtifactMiddleware::new(store).with_threshold_bytes(64 * 1024);
+        let small = "s".repeat(20 * 1024);
+        let mut r = ToolResult {
+            call_id: "c".into(),
+            content: small.clone(),
+            is_error: false,
+            images: vec![],
+        };
+        mw.after(&mut r, Some(&NamedProbe("bash"))).await;
+        assert_eq!(r.content, small, "20 KiB is under the 24 KiB terminal line");
+    }
+
+    /// A user who lowers `max_bytes` below the terminal cap tightens terminal
+    /// tools too: `min(8 KiB, 24 KiB)` folds a 10 KiB console stream.
+    #[tokio::test]
+    async fn configured_threshold_below_the_terminal_cap_wins() {
+        use jeikcode_kernel::middleware::ToolMiddleware;
+        use jeikcode_kernel::tool::ToolResult;
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(super::ArtifactStore::new(dir.path()));
+        let mw = super::ArtifactMiddleware::new(store).with_threshold_bytes(8 * 1024);
+        let mid = "t".repeat(10 * 1024);
+        let mut r = ToolResult {
+            call_id: "c".into(),
+            content: mid.clone(),
+            is_error: false,
+            images: vec![],
+        };
+        mw.after(&mut r, Some(&NamedProbe("run_command"))).await;
+        assert!(
+            r.content.len() < mid.len(),
+            "the configured 8 KiB line must beat the 24 KiB terminal cap"
+        );
+    }
+
+    /// The terminal early line is itself configurable (both directions):
+    /// raising it lets more console output through; `0` drops the early cut.
+    #[tokio::test]
+    async fn terminal_line_follows_its_own_configuration() {
+        use jeikcode_kernel::middleware::ToolMiddleware;
+        use jeikcode_kernel::tool::ToolResult;
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(super::ArtifactStore::new(dir.path()));
+        let mid = "m".repeat(30 * 1024);
+
+        // Raised to 48 KiB: 30 KiB now passes untouched.
+        let mw = super::ArtifactMiddleware::new(store.clone())
+            .with_threshold_bytes(64 * 1024)
+            .with_terminal_threshold_bytes(48 * 1024);
+        let mut r = ToolResult {
+            call_id: "c".into(),
+            content: mid.clone(),
+            is_error: false,
+            images: vec![],
+        };
+        mw.after(&mut r, Some(&NamedProbe("bash"))).await;
+        assert_eq!(
+            r.content, mid,
+            "30 KiB sits under the raised 48 KiB terminal line"
+        );
+
+        // 0 drops the early line: terminal follows the 64 KiB general line.
+        let mw = super::ArtifactMiddleware::new(store)
+            .with_threshold_bytes(64 * 1024)
+            .with_terminal_threshold_bytes(0);
+        let mut r = ToolResult {
+            call_id: "c".into(),
+            content: mid.clone(),
+            is_error: false,
+            images: vec![],
+        };
+        mw.after(&mut r, Some(&NamedProbe("run_command"))).await;
+        assert_eq!(
+            r.content, mid,
+            "terminal line 0 → terminal follows the general line"
+        );
     }
 }
 

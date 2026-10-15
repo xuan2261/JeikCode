@@ -6,6 +6,51 @@ use std::time::Duration;
 
 use jeikcode_config::locale::Locale;
 use jeikcode_kernel::agent::ToolLoopPolicy;
+use jeikcode_kernel::timeouts::TimeoutPolicy;
+
+/// Env > `[coding]` > production defaults. `0` on a content field disables that arm.
+pub fn resolve_timeout_policy(coding: &jeikcode_config::config::CodingConfig) -> TimeoutPolicy {
+    fn env_secs(keys: &[&str]) -> Option<u64> {
+        keys.iter().find_map(|key| {
+            std::env::var(key)
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+        })
+    }
+    fn transport_secs(keys: &[&str], configured: u64, default: u64) -> Duration {
+        let secs = env_secs(keys).unwrap_or(configured);
+        Duration::from_secs(if secs == 0 { default } else { secs })
+    }
+    fn content_secs(keys: &[&str], configured: u64) -> Option<Duration> {
+        let secs = env_secs(keys).unwrap_or(configured);
+        if secs == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(secs))
+        }
+    }
+    TimeoutPolicy {
+        connect: transport_secs(
+            &["JEIKCODE_CONNECT_TIMEOUT_SECS"],
+            coding.connect_timeout_secs,
+            TimeoutPolicy::DEFAULT_CONNECT_SECS,
+        ),
+        open: transport_secs(
+            &["JEIKCODE_OPEN_TIMEOUT_SECS"],
+            coding.open_timeout_secs,
+            TimeoutPolicy::DEFAULT_OPEN_SECS,
+        ),
+        ttft: content_secs(
+            &["JEIKCODE_TTFT_SECS", "JEIKCODE_FIRST_TOKEN_TIMEOUT_SECS"],
+            coding.ttft_secs,
+        ),
+        transition: content_secs(&["JEIKCODE_TRANSITION_SECS"], coding.transition_secs),
+        streaming: content_secs(
+            &["JEIKCODE_STREAMING_SECS", "JEIKCODE_STREAM_TIMEOUT_SECS"],
+            coding.streaming_sliding_secs,
+        ),
+    }
+}
 
 /// Resolve the immutable price snapshot for one runtime generation.
 ///
@@ -90,19 +135,9 @@ pub struct CodingAgentConfig {
     pub working_dir: PathBuf,
     /// Model context window in tokens (forwarded to the provider). Default 128k.
     pub context_window: u32,
-    /// Liveness: max byte-idle wait for the next stream event (first-token + inter-token).
-    /// Default 300s, override via `JEIKCODE_STREAM_TIMEOUT_SECS`. Thinking models go quiet
-    /// for a long stretch after a large (~200K) prompt before the first reasoning byte; the
-    /// old 120s cut them off mid-think and surfaced as a spurious "stream timeout".
-    pub stream_timeout: Duration,
-    /// Liveness: max wall-clock wait for the FIRST stream token of a round
-    /// (the model emits nothing — high latency / silent hidden reasoning).
-    /// Complementary to `stream_timeout` (which bounds EVERY inter-token gap).
-    /// Default 60s, override via config `[coding] first_token_timeout_secs`
-    /// (env `JEIKCODE_FIRST_TOKEN_TIMEOUT_SECS` wins). On timeout BEFORE any
-    /// token, the round is retried up to `first_token_timeout_retries`, then
-    /// the turn fails with "模型延迟过高,请稍后再试". `0` disables the arm.
-    pub first_token_timeout: Duration,
+    /// Unified transport + three-phase content clocks (TTFT / transition / sliding).
+    /// Resolved from `[coding]` + env by [`resolve_timeout_policy`].
+    pub timeouts: jeikcode_kernel::timeouts::TimeoutPolicy,
     /// How many times the round is re-issued after a first-token timeout.
     /// Config `[coding] first_token_timeout_retries`; env
     /// `JEIKCODE_FIRST_TOKEN_RETRIES` wins. Default 3.
@@ -185,10 +220,15 @@ pub struct CodingAgentConfig {
     pub thinking_type: Option<String>,
     /// Kimi K2.6 preserved thinking: `thinking.keep`. `None` ⇒ omit.
     pub thinking_keep: Option<String>,
-    /// Auto-compaction trigger as a fraction of the context window (real utilization
-    /// from the provider's reported prompt tokens). At/above this, the task-boundary
-    /// trigger runs [`StubCompaction`] to stub old tool results. Default `0.7` (the
-    /// normal-path threshold ported from core). Set `>= 1.0` to effectively disable.
+    /// Auto-compaction trigger as a fraction of the model's WATERMARK input budget
+    /// (`window − min(20K, the round's output budget)`; the usage side is the provider's
+    /// reported prompt tokens). At/above this, the task-boundary trigger runs
+    /// [`StubCompaction`] and — past the high-water mark — escalates to a drain+summary.
+    /// Default `0.9`. The denominator is the watermark budget, NOT the raw window and NOT
+    /// `[models.X] max_tokens`: a declared output ceiling (e.g. 384K) caps the per-call
+    /// budget but must never shrink the usable context (that conflation made a 1M-window
+    /// session warn "near the limit" at 49% while never auto-compacting). Set `>= 1.0` to
+    /// effectively disable.
     ///
     /// [`StubCompaction`]: jeikcode_capabilities::compaction::StubCompaction
     pub compact_threshold: f32,
@@ -235,12 +275,18 @@ pub struct CodingAgentConfig {
     pub subagent_fast_provider: Option<Arc<TierProvider>>,
     /// Swap-aware, lazily-built CAPABLE-tier provider (same contract as above).
     pub subagent_capable_provider: Option<Arc<TierProvider>>,
-    /// Tool-result fold threshold in bytes. `None` → built-in default
-    /// (64 KiB); `Some(0)` disables folding entirely. Sourced from
+    /// Tool-result compression threshold in bytes. `None` → built-in default
+    /// (64 KiB); `Some(0)` disables compression entirely. Sourced from
     /// `[tools.tool_output] max_bytes` (config) / `JEIKCODE_TOOL_OUTPUT_THRESHOLD_BYTES` (env,
     /// wins).
     pub tool_output_max_bytes: Option<usize>,
-    /// Tool names exempt from output folding (config `[tools.tool_output]
+    /// Terminal (shell) compression threshold in bytes — the earlier line for
+    /// console streams. `None` → built-in default (24 KiB); `Some(0)` drops the
+    /// terminal early line (terminal tools then follow `tool_output_max_bytes`).
+    /// Sourced from `[tools.tool_output] terminal_max_bytes` (config) /
+    /// `JEIKCODE_TOOL_OUTPUT_TERMINAL_THRESHOLD_BYTES` (env, wins).
+    pub tool_output_terminal_max_bytes: Option<usize>,
+    /// Tool names exempt from output compression (config `[tools.tool_output]
     /// no_fold_tools`). Their results reach the model verbatim regardless of
     /// size, like the intrinsic `never_truncate_result()` contract.
     pub tool_output_no_fold_tools: Vec<String>,
@@ -277,9 +323,8 @@ pub struct CodingRuntimeConfig {
     pub skip_tls_verify: bool,
     pub loop_max_rounds: u32,
     pub turn_max_rounds: u32,
-    /// Liveness: max wall-clock wait for the FIRST model token of a round
-    /// (high latency / silent hidden reasoning). `0` disables the arm.
-    pub first_token_timeout: Duration,
+    /// Unified transport + three-phase content clocks.
+    pub timeouts: jeikcode_kernel::timeouts::TimeoutPolicy,
     /// How many times the round is re-issued after a first-token timeout.
     pub first_token_timeout_retries: u32,
     pub subagent_config: Option<Arc<jeikcode_config::config::Config>>,
@@ -303,10 +348,14 @@ pub struct CodingRuntimeConfig {
     /// user_title). Applied only when the native runtime creates the session meta;
     /// existing sessions keep their stored name.
     pub session_display_name: Option<String>,
-    /// Tool-result fold threshold in bytes (`[tools.tool_output] max_bytes`).
-    /// `None` → built-in default (64 KiB); `Some(0)` disables folding.
+    /// Tool-result compression threshold in bytes (`[tools.tool_output] max_bytes`).
+    /// `None` → built-in default (64 KiB); `Some(0)` disables compression.
     pub tool_output_max_bytes: Option<usize>,
-    /// Tool names exempt from output folding (`[tools.tool_output] no_fold_tools`).
+    /// Terminal (shell) compression threshold in bytes (`[tools.tool_output]
+    /// terminal_max_bytes`). `None` → built-in default (24 KiB); `Some(0)` drops
+    /// the terminal early line (terminal tools then follow `tool_output_max_bytes`).
+    pub tool_output_terminal_max_bytes: Option<usize>,
+    /// Tool names exempt from output compression (`[tools.tool_output] no_fold_tools`).
     pub tool_output_no_fold_tools: Vec<String>,
     /// Optional shared, pre-warmed MCP registry (e.g. from daemon AppState cache).
     /// When provided and `mcp == true`, the runtime reuses this pre-connected
@@ -382,14 +431,7 @@ impl CodingRuntimeConfig {
                 config.coding.max_rounds,
                 std::env::var("JEIKCODE_TURN_MAX_ROUNDS").ok().as_deref(),
             ),
-            // First-token liveness: env overrides `[coding]`, else defaults.
-            first_token_timeout: {
-                let secs = std::env::var("JEIKCODE_FIRST_TOKEN_TIMEOUT_SECS")
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u64>().ok())
-                    .unwrap_or(config.coding.first_token_timeout_secs);
-                Duration::from_secs(secs)
-            },
+            timeouts: resolve_timeout_policy(&config.coding),
             first_token_timeout_retries: {
                 std::env::var("JEIKCODE_FIRST_TOKEN_RETRIES")
                     .ok()
@@ -410,6 +452,13 @@ impl CodingRuntimeConfig {
                 .ok()
                 .and_then(|v| v.trim().parse::<usize>().ok())
                 .or(config.tools.tool_output.max_bytes),
+            // Same env-wins rule for the terminal early line.
+            tool_output_terminal_max_bytes: std::env::var(
+                "JEIKCODE_TOOL_OUTPUT_TERMINAL_THRESHOLD_BYTES",
+            )
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .or(config.tools.tool_output.terminal_max_bytes),
             tool_output_no_fold_tools: config.tools.tool_output.no_fold_tools.clone(),
             shared_mcp_registry: None,
         }
@@ -451,9 +500,7 @@ impl CodingRuntimeConfig {
         config.session_display_name = self.session_display_name.clone();
         config.loop_max_rounds = self.loop_max_rounds;
         config.max_rounds = self.turn_max_rounds;
-        // First-token liveness: propagate the config/env-resolved value down to
-        // the agent config (so `[coding]`/env actually governs the kernel).
-        config.first_token_timeout = self.first_token_timeout;
+        config.timeouts = self.timeouts;
         config.first_token_timeout_retries = self.first_token_timeout_retries;
         config.subagent_config = self.subagent_config.clone();
         if self.interactive {
@@ -464,6 +511,7 @@ impl CodingRuntimeConfig {
         config.next_prompt_suggestions = self.next_prompt_suggestions;
         config.pricing = self.pricing;
         config.tool_output_max_bytes = self.tool_output_max_bytes;
+        config.tool_output_terminal_max_bytes = self.tool_output_terminal_max_bytes;
         config.tool_output_no_fold_tools = self.tool_output_no_fold_tools.clone();
         config
     }
@@ -606,26 +654,6 @@ impl TierProvider {
     }
 }
 
-/// The default byte-idle stream timeout: `JEIKCODE_STREAM_TIMEOUT_SECS` if set to a valid
-/// positive integer, else 300s. Ported from core's env-configurable liveness knob.
-fn default_stream_timeout() -> Duration {
-    std::env::var("JEIKCODE_STREAM_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .filter(|n| *n > 0)
-        .map(Duration::from_secs)
-        .unwrap_or_else(|| Duration::from_secs(300))
-}
-
-/// Default first-token liveness timeout: `JEIKCODE_FIRST_TOKEN_TIMEOUT_SECS`
-/// if a valid positive integer, else 60s. `0` disables the first-token arm.
-fn default_first_token_timeout() -> Duration {
-    std::env::var("JEIKCODE_FIRST_TOKEN_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .unwrap_or_else(|| Duration::from_secs(60))
-}
 /// Share of the CodingPlan 5h rolling `call_limit` a single `/goal` may consume
 /// (percent). A goal that eats more than this starves the user's interactive work
 /// and other controllers within the same rolling window.
@@ -763,8 +791,7 @@ impl CodingAgentConfig {
             todo: Default::default(),
             working_dir: working_dir.into(),
             context_window: 128_000,
-            stream_timeout: default_stream_timeout(),
-            first_token_timeout: default_first_token_timeout(),
+            timeouts: TimeoutPolicy::production(),
             first_token_timeout_retries: 3,
             request_timeout: Some(Duration::from_secs(300)),
             max_continuations: 50,
@@ -785,7 +812,7 @@ impl CodingAgentConfig {
             thinking_budget: None,
             thinking_type: None,
             thinking_keep: None,
-            compact_threshold: 0.7,
+            compact_threshold: 0.9,
             web_search_provider: None,
             keep_interrupted_context: false,
             user_agent: None,
@@ -800,6 +827,7 @@ impl CodingAgentConfig {
             subagent_fast_provider: None,
             subagent_capable_provider: None,
             tool_output_max_bytes: None,
+            tool_output_terminal_max_bytes: None,
             tool_output_no_fold_tools: Vec::new(),
         }
     }
@@ -1183,7 +1211,7 @@ impl std::fmt::Debug for CodingAgentConfig {
             .field("provider_name", &self.provider_name)
             .field("working_dir", &self.working_dir)
             .field("context_window", &self.context_window)
-            .field("stream_timeout", &self.stream_timeout)
+            .field("timeouts", &self.timeouts)
             .field("request_timeout", &self.request_timeout)
             .field("max_continuations", &self.max_continuations)
             .field("max_rounds", &self.max_rounds)

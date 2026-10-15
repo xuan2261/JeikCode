@@ -53,28 +53,14 @@ pub fn real_home_dir() -> Option<PathBuf> {
 
 /// Return the JeikCode data directory, respecting the `JEIKCODE_HOME`
 /// environment variable. When `JEIKCODE_HOME` is set, it IS the data root
-/// (no `.jeikcode` suffix is appended). Otherwise falls back to
-/// `$HOME/.jeikcode`, or `./.jeikcode` when `$HOME` cannot be resolved.
-///
-/// This mirrors the logic in `jeikcode_core::config::Config::config_dir()`
-/// but is implemented independently to avoid a circular dependency between
-/// the `jeikcode-telemetry` and `jeikcode-core` crates.
+/// (no `.jeikcode` suffix is appended). Otherwise `$HOME/.jeikcode`, or
+/// `./.jeikcode` when `$HOME` cannot be resolved.
 pub fn default_jeikcode_dir() -> PathBuf {
     if let Some(p) = env::var("JEIKCODE_HOME").ok().filter(|s| !s.is_empty()) {
         PathBuf::from(p)
-    } else if let Some(p) = env::var("ATOMCODE_HOME").ok().filter(|s| !s.is_empty()) {
-        PathBuf::from(p)
     } else {
         let home = real_home_dir().unwrap_or_else(|| PathBuf::from("."));
-        let jeik = home.join(".jeikcode");
-        if jeik.exists() {
-            return jeik;
-        }
-        let legacy_dir = home.join(".atomcode");
-        if legacy_dir.exists() {
-            return legacy_dir;
-        }
-        jeik
+        home.join(".jeikcode")
     }
 }
 

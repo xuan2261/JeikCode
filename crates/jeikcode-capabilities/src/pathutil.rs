@@ -43,14 +43,22 @@ pub(crate) fn expand_tilde(raw: &str) -> Option<PathBuf> {
     expand_tilde_with_home(raw, home_dir().as_deref())
 }
 
-/// Resolve a model-supplied path on every platform: leading `~`/`~/` → home;
-/// POSIX `/…` and Windows drive/UNC → absolute (never joined onto `working_dir`);
-/// relative → joined to `working_dir`.
+/// Resolve a model-supplied path on every platform: `$VAR`/`${VAR}` (and `%VAR%`
+/// on Windows) expanded FIRST — against the very values the `bash` tool exports to
+/// shell children, so `"$TMPDIR/x"` resolves identically in a shell and in a tool
+/// call; then leading `~`/`~/` → home; POSIX `/…` and Windows drive/UNC → absolute
+/// (never joined onto `working_dir`); relative → joined to `working_dir`.
 ///
 /// On Windows, Git-Bash POSIX forms (`/tmp/foo`, `/c/Users/foo`) are mapped to the
 /// native location so they do not become `{cwd_drive}:\tmp\foo`. On Unix those
 /// strings are already native absolute paths and are left unchanged.
 pub(crate) fn resolve_path(raw: &str, working_dir: &Path) -> PathBuf {
+    // Env expansion runs BEFORE the tilde/absolute tests so a variable holding a
+    // `~` form still expands, and a prompt-quoted `"$TMPDIR/x"` still resolves.
+    // Undefined names stay verbatim (`special_dirs::expand`), leaving the
+    // relative-join path below exactly as it was.
+    let expanded = crate::special_dirs::expand(raw);
+    let raw = expanded.as_deref().unwrap_or(raw);
     if let Some(home) = expand_tilde(raw) {
         return home;
     }
@@ -98,7 +106,11 @@ pub(crate) fn maybe_translate_posix_absolute(raw: &str) -> Option<PathBuf> {
     if !cfg!(windows) {
         return None;
     }
-    translate_posix_absolute_for_windows(raw, &std::env::temp_dir())
+    // Target the NORMALIZED temp dir, not `std::env::temp_dir()`: when the host process was
+    // launched from Git Bash its TMP/TEMP hold `/tmp/`, and mapping `/tmp/x` onto that
+    // polluted value would hand the caller a POSIX path again (the very shape this
+    // translation exists to remove). `special_dirs::temp_dir()` is the single sane source.
+    translate_posix_absolute_for_windows(raw, &crate::special_dirs::temp_dir())
 }
 
 /// Pure mapper used by [`maybe_translate_posix_absolute`]. `temp_dir` is injected so
@@ -427,7 +439,12 @@ mod tests {
         let tmp = resolve_path("/tmp/submit_comment.md", wd);
         #[cfg(windows)]
         {
-            assert_eq!(tmp, std::env::temp_dir().join("submit_comment.md"));
+            // POSIX `/tmp` maps onto the NORMALIZED temp dir (a Git-Bash launch pollutes
+            // `std::env::temp_dir()` with `/tmp/` itself, which must not be the target).
+            assert_eq!(
+                tmp,
+                crate::special_dirs::temp_dir().join("submit_comment.md")
+            );
             assert_ne!(
                 tmp,
                 wd.join("/tmp/submit_comment.md"),
@@ -461,5 +478,45 @@ mod tests {
             PathBuf::from(r"\\server\share\f")
         );
         assert_eq!(resolve_path("src/main.rs", wd), wd.join("src/main.rs"));
+    }
+
+    #[test]
+    fn env_vars_expand_before_relative_join() {
+        let wd = Path::new("/work/proj");
+        let tmp = std::env::temp_dir();
+        assert_eq!(resolve_path("$TMPDIR/out.md", wd), tmp.join("out.md"));
+        assert_eq!(resolve_path("${TMPDIR}/out.md", wd), tmp.join("out.md"));
+        // The quoted form is exactly what copying the prompt's environment facts produces.
+        assert_eq!(resolve_path("\"$TMPDIR/out.md\"", wd), tmp.join("out.md"));
+        // Undefined names stay verbatim: silently deleting `$NOPE` would turn
+        // `$NOPE/x` into the absolute `/x` and escape the workspace.
+        assert_eq!(
+            resolve_path("$JEIKCODE_UNSET_DIR/keep.md", wd),
+            wd.join("$JEIKCODE_UNSET_DIR/keep.md")
+        );
+        // A `$` that does not introduce a variable name stays literal.
+        assert_eq!(
+            resolve_path("price$/note.md", wd),
+            wd.join("price$/note.md")
+        );
+    }
+
+    #[test]
+    fn env_home_agrees_with_the_tilde_home() {
+        let Some(home) = home_dir() else {
+            return;
+        };
+        let wd = Path::new("/work/proj");
+        let via_env = resolve_path("$HOME/x", wd);
+        match std::env::var_os("HOME") {
+            // The process env wins when set (`$HOME` is just a variable), subject to
+            // the same POSIX/MSYS translation every other absolute path gets.
+            Some(value) if !value.is_empty() => {
+                let expected = Path::new(&value).join("x");
+                assert_eq!(via_env, resolve_path(&expected.to_string_lossy(), wd));
+            }
+            // With no process `HOME`, the special-dir fallback uses the same home as `~`.
+            _ => assert_eq!(via_env, home.join("x")),
+        }
     }
 }

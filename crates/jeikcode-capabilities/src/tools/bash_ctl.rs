@@ -3,6 +3,10 @@
 //! `action=add` with `global=false` (default) writes the session sidecar
 //! (`<id>.bashkw.json`) so a JeikCode restart + `/resume` still sees it.
 //! `global=true` also appends `[tools.bash] long_bash_command_keyword`.
+//!
+//! The background-task START MESSAGE is where a task's stop recipe is printed
+//! (`bash.rs` reports the workload's WinPID + MSYS pid), so this module stays
+//! keyword-only — no extra kill tool on the model surface.
 
 use super::bash_runtime::{legacy_bash_runtime_state, BashRuntimeState};
 use super::{err, ok};

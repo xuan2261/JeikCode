@@ -276,7 +276,7 @@ pub(crate) async fn create_provider(Json(req): Json<CreateProviderRequest>) -> i
         }) {
             Ok(config) => config,
             Err(error) => {
-                return json_error(StatusCode::INTERNAL_SERVER_ERROR, error).into_response()
+                return json_error(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
             }
         };
 
@@ -629,14 +629,14 @@ pub(crate) async fn patch_provider(
                 StatusCode::NOT_FOUND,
                 format!("Provider '{}' not found", name),
             )
-            .into_response()
+            .into_response();
         }
         Err(_) if conflict => {
             return json_error(
                 StatusCode::CONFLICT,
                 format!("Provider '{}' already exists", final_name),
             )
-            .into_response()
+            .into_response();
         }
         Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
     };
@@ -720,7 +720,7 @@ pub(crate) async fn delete_provider(Path(name): Path<String>) -> impl IntoRespon
                 StatusCode::NOT_FOUND,
                 format!("Provider '{}' not found", name),
             )
-            .into_response()
+            .into_response();
         }
         Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
     };
@@ -789,7 +789,7 @@ pub(crate) async fn set_default_provider(Path(name): Path<String>) -> impl IntoR
                 StatusCode::NOT_FOUND,
                 format!("Provider '{}' not found", name),
             )
-            .into_response()
+            .into_response();
         }
         Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
     };
@@ -847,7 +847,7 @@ pub(crate) async fn patch_thinking(
                 StatusCode::NOT_FOUND,
                 format!("Provider '{}' not found", name),
             )
-            .into_response()
+            .into_response();
         }
         Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
     };
@@ -1022,7 +1022,7 @@ pub(crate) async fn delete_provider_account(Path(id): Path<String>) -> impl Into
         Ok(c) => c,
         Err(_) if missing => {
             return json_error(StatusCode::NOT_FOUND, format!("Account '{}' not found", id))
-                .into_response()
+                .into_response();
         }
         Err(e) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
@@ -1327,6 +1327,8 @@ mod upstream_tests {
     #[test]
     #[serial_test::serial]
     fn resolve_upstream_inherits_account_api_key() {
+        // 并行测试隔离：本线程用私有 config.toml（否则会与其它测试互写全局配置）。
+        let _cfg = jeikcode_config::test_util::isolated_config();
         update_config(|config| {
             config.provider_accounts.insert(
                 "my-gemini".into(),
@@ -1363,6 +1365,8 @@ mod upstream_tests {
     #[test]
     #[serial_test::serial]
     fn resolve_upstream_fills_base_url_from_account_when_blank() {
+        // 并行测试隔离：本线程用私有 config.toml（否则会与其它测试互写全局配置）。
+        let _cfg = jeikcode_config::test_util::isolated_config();
         update_config(|config| {
             config.provider_accounts.insert(
                 "ds".into(),
@@ -1399,6 +1403,8 @@ mod upstream_tests {
     #[test]
     #[serial_test::serial]
     fn resolve_upstream_falls_back_to_provider_name() {
+        // 并行测试隔离：本线程用私有 config.toml（否则会与其它测试互写全局配置）。
+        let _cfg = jeikcode_config::test_util::isolated_config();
         update_config(|config| {
             config.provider_accounts.insert(
                 "acc".into(),
@@ -1461,6 +1467,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn patch_provider_works_on_new_schema_model() {
+        // 并行测试隔离：本线程用私有 config.toml（否则会与其它测试互写全局配置）。
+        let _cfg = jeikcode_config::test_util::isolated_config();
         update_config(|config| {
             config.provider_accounts.insert(
                 "gemini".into(),

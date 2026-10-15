@@ -641,7 +641,7 @@ fn adopt_unconfirmed_native(
                     snapshot: snapshot.clone(),
                     meta,
                     presentation,
-                })
+                });
             }
             NativeImportCommitOutcome::Conflict {
                 meta,

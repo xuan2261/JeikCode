@@ -6,22 +6,853 @@
 1. 先写完整英文段落（English Section）；
 2. 插入分割线 `---`；
 3. 再写完整中文段落（Chinese Section）。
-模型与维护者直接按此结构填入内容即可。
+禁止中英混排。无需陈述底层技术机理与源码函数，直接列出清晰的更新内容、功能改进与修复项即可。
 
 ## vX.Y.Z (YYYY-MM-DD)
 
 - **[Module/Category in English] Main summary sentence in English**:
-  - **Technical Root Cause / Detail**: Detailed technical explanation...
-  - **Implementation Mechanism**: Affected files, functions, and defensive logic...
-  - **Verification & Testing**: Tests executed and coverage details...
+  - Detailed feature update or bug fix description...
+  - Detailed feature update or bug fix description...
 
 ---
 
 - **[模块分类中文] 中文概述主标题**:
-  - **技术机理 / 现象溯源**: 详细原理解释...
-  - **实现防线 / 核心改动**: 受影响文件、核心函数与端到端防线建设...
-  - **验证与交付**: 运行的单元测试与端到端验证...
+  - 具体新增功能或体验优化说明...
+  - 具体缺陷修复与行为改善说明...
 -->
+
+## v7.2.5-beta.1 (2026-10-15)
+
+- **[Rendering] Prevent blockquote code blocks and quoted closures from swallowing document headings**:
+  - Code fences inside Markdown blockquotes and code blocks closed with quote prefixes (such as `> ``` `) now close accurately across both streaming responses and static message renders.
+  - Subsequent headings, horizontal rules, and document sections are no longer swallowed into open code blocks.
+  - Streaming unclosed code blocks automatically heal when encountering distinct document outline headings.
+- **[Capabilities] Isolate shell environment detection from terminal foreground process group**:
+  - Login shell environment probe now safely preserves terminal process group ownership, preventing CLI input hangs.
+
+---
+
+- **[渲染] 修复引用块内代码块及带引用闭合标记吞噬后续大纲标题与正文的问题**:
+  - Markdown 引用块内部的代码块以及带有引用前缀（如 `> ``` `）的闭合标记，无论在实时流式推送还是静态消息渲染中均能精准识别并正常闭合。
+  - 代码块后的分割线、大纲标题与正文内容不再被反向吞入代码块。
+  - 遇到模型漏关代码块并输出明确文档大纲标题时，自动触发结构性终结自愈。
+- **[运行时] 修复登录 shell 环境探测篡夺终端前台进程组导致输入卡死的问题**:
+  - 探测用户登录 shell 环境变量时安全保留终端前台进程组所有权，彻底避免命令行交互卡死。
+
+## v7.2.4 (2026-10-14)
+
+- **[Updates] Desktop, a remote browser, and a headless CLI share one update flow**:
+  - All three can install another version or roll back. In the desktop app or WebUI, use the update control at the top right. When the update finishes, the page reloads onto the new version. Clicking Finish and waiting do the same thing.
+  - Release notes open for the selected version. The history lists every version on that channel, newest first. Force Update stays only when the running build is already that latest version.
+  - An in-place upgrade replaces the running program and restarts the same service, including the access token. If the new process cannot start, the old one keeps serving.
+  - The desktop window opens sooner. The service still listens on 0.0.0.0, so other devices can reach it with the same port and token.
+
+- **[CLI] List, install, and roll back a version**:
+  - `jeikcode list` and `jeikcode list main` show stable history. `jeikcode list beta` shows beta history.
+  - `up`, `update`, and `upgrade` install a newer build. `up main` and `up beta` choose the channel, and a version after them installs that release. `down main` and `down beta` install a specific or older release. `rollback` returns to the previous program kept on disk. `-y` applies configuration changes without a prompt, including on a headless server.
+  - Tutorial: https://jeikcode.top/guide/updates.html
+
+- **[Uninstall] A guided removal, or a prompt-free removal for scripts**:
+  - `jeikcode uninstall` asks whether to keep user configuration. The program and its PATH entry are always removed.
+  - `jeikcode uninstall simple` removes only the program and keeps configuration. `jeikcode uninstall all` removes both. Neither command asks a question.
+  - Prompts follow Simplified Chinese, English, or Vietnamese. Windows, macOS, Linux, and HarmonyOS PC use the same commands.
+  - Tutorial: https://jeikcode.top/guide/updates.html
+
+- **[Long tasks] Five-stage waits, shell commands, and cards that stay open**:
+  - A long model reply is watched in five stages: connecting, waiting for the response to begin, waiting for the first token, waiting for text or a tool after thinking, and gaps between later tokens.
+  - When the model returns only thinking, with no reply text and no tool call, the first retry is immediate. Later retries wait, up to five times.
+  - Quiet shell waits such as `sleep` run until they finish or reach the 30-minute cap. On macOS those waits are no longer stopped for a model decision.
+  - `git log`, `git show`, `git diff`, and similar output commands are allowed, including `-p` and `-i`. Truly interactive git commands such as `git add -p` and `git rebase -i` stay blocked.
+  - An approval card and a question card stay until you answer or stop the turn.
+
+- **[API] Conversations stay in the directory where the server started**:
+  - OpenAI and Anthropic endpoints keep using the directory where `jeikcode serve` was started. Switching projects in the sidebar no longer moves those sessions.
+  - New Chat creates a session in the current workspace. Hiding or showing a project stays in sync across tabs and desktop windows.
+
+---
+
+- **[更新] 桌面版、异地浏览器和无头命令行共用一套更新**:
+  - 这三种环境都可以安装其他版本或回退。桌面版和 WebUI 点击右上角更新。更新完成后页面自动刷新到新版本。点「完成」和继续等待是同一行为。
+  - 可以打开所选版本的更新说明。历史列表按通道列出全部版本，最新在前。仅当正在运行的版本已是该最新版时，才显示「强制更新」。
+  - 就地升级会替换正在运行的程序并重启同一服务，访问 token 保持不变。新进程无法启动时，旧进程继续提供服务。
+  - 桌面窗口打开更快。服务仍监听 0.0.0.0，其他设备仍可用同一端口和 token 访问。
+
+- **[命令行] 查看、安装和回退版本**:
+  - 更新命令更加完善：`jeikcode list` 与 `jeikcode list main` 列出正式版，`jeikcode list beta` 列出测试版。`up`、`update`、`upgrade` 安装较新版本。`up main` 与 `up beta` 选择通道，后面可跟版本号。`down main` 与 `down beta` 安装指定或更旧的版本。`rollback` 回到磁盘上的上一版。`-y` 不询问直接应用配置变更，无头服务器同样可用。
+  - 详细教程：https://jeikcode.top/zh/guide/updates.html
+
+- **[卸载] 交互引导，或给脚本用的无提问卸载**:
+  - `jeikcode uninstall` 询问是否保留用户配置。程序和 PATH 项一定会移除。
+  - `jeikcode uninstall simple` 只删除程序并保留配置。`jeikcode uninstall all` 两者都删除。这两条命令都不提问。
+  - 提示跟随简体中文、英文或越南文。Windows、macOS、Linux、HarmonyOS PC 使用同一套命令。
+  - 详细教程：https://jeikcode.top/zh/guide/updates.html
+
+- **[长任务] 五阶段等待、终端命令，以及一直留着的卡片**:
+  - 较长的模型回复按五个阶段观察：建立连接、等待响应开始、等待第一个 token、思考之后等待正文或工具，以及后续 token 之间的间隔。
+  - 模型只返回思考、没有正文也没有工具时，第一次立即重试。之后的重试才等待，最多 5 次。
+  - `sleep` 这类安静等待会一直跑到结束，或达到 30 分钟上限。在 macOS 上，这类等待不再交给模型决定是否停掉。
+  - `git log`、`git show`、`git diff` 以及同类输出命令可以运行，包括 `-p` 和 `-i`。`git add -p`、`git rebase -i` 这类真正的交互命令仍然拦截。
+  - 审批卡和提问卡会留到你作答或停止这一回合。
+
+- **[API] 对话留在服务启动时的目录**:
+  - OpenAI 与 Anthropic 端点继续使用 `jeikcode serve` 启动时所在目录。侧栏切换项目不再把这些会话送走。
+  - 「新建对话」在当前工作区创建会话。项目的隐藏和显示会在多个标签页和桌面窗口之间保持同步。
+
+## v7.2.4-beta.13 (2026-10-14)
+
+- **[Updates] Desktop, a remote browser, and a headless CLI share one update flow**:
+  - All three can install another version or roll back. In the desktop app or WebUI, use the update control at the top right. When the update finishes, the page reloads onto the new version. Clicking Finish and waiting do the same thing.
+  - Release notes open for the selected version. The history lists every version on that channel, newest first. Force Update stays only when the running build is already that latest version.
+  - An in-place upgrade replaces the running program and restarts the same service, including the access token. If the new process cannot start, the old one keeps serving.
+  - The desktop window opens sooner. The service still listens on 0.0.0.0, so other devices can reach it with the same port and token.
+
+- **[CLI] List, install, and roll back a version**:
+  - `jeikcode list` and `jeikcode list main` show stable history. `jeikcode list beta` shows beta history.
+  - `up`, `update`, and `upgrade` install a newer build. `up main` and `up beta` choose the channel, and a version after them installs that release. `down main` and `down beta` install a specific or older release. `rollback` returns to the previous program kept on disk. `-y` applies configuration changes without a prompt, including on a headless server.
+  - Tutorial: https://jeikcode.top/guide/updates.html
+
+- **[Uninstall] A guided removal, or a prompt-free removal for scripts**:
+  - `jeikcode uninstall` asks whether to keep user configuration. The program and its PATH entry are always removed.
+  - `jeikcode uninstall simple` removes only the program and keeps configuration. `jeikcode uninstall all` removes both. Neither command asks a question.
+  - Prompts follow Simplified Chinese, English, or Vietnamese. Windows, macOS, Linux, and HarmonyOS PC use the same commands.
+  - Tutorial: https://jeikcode.top/guide/updates.html
+
+- **[Long tasks] Five-stage waits, shell commands, and cards that stay open**:
+  - A long model reply is watched in five stages: connecting, waiting for the response to begin, waiting for the first token, waiting for text or a tool after thinking, and gaps between later tokens.
+  - When the model returns only thinking, with no reply text and no tool call, the first retry is immediate. Later retries wait, up to five times.
+  - Quiet shell waits such as `sleep` run until they finish or reach the 30-minute cap. On macOS those waits are no longer stopped for a model decision.
+  - `git log`, `git show`, `git diff`, and similar output commands are allowed, including `-p` and `-i`. Truly interactive git commands such as `git add -p` and `git rebase -i` stay blocked.
+  - An approval card and a question card stay until you answer or stop the turn.
+
+- **[API] Conversations stay in the directory where the server started**:
+  - OpenAI and Anthropic endpoints keep using the directory where `jeikcode serve` was started. Switching projects in the sidebar no longer moves those sessions.
+  - New Chat creates a session in the current workspace. Hiding or showing a project stays in sync across tabs and desktop windows.
+
+---
+
+- **[更新] 桌面版、异地浏览器和无头命令行共用一套更新**:
+  - 这三种环境都可以安装其他版本或回退。桌面版和 WebUI 点击右上角更新。更新完成后页面自动刷新到新版本。点「完成」和继续等待是同一行为。
+  - 可以打开所选版本的更新说明。历史列表按通道列出全部版本，最新在前。仅当正在运行的版本已是该最新版时，才显示「强制更新」。
+  - 就地升级会替换正在运行的程序并重启同一服务，访问 token 保持不变。新进程无法启动时，旧进程继续提供服务。
+  - 桌面窗口打开更快。服务仍监听 0.0.0.0，其他设备仍可用同一端口和 token 访问。
+
+- **[命令行] 查看、安装和回退版本**:
+  - 更新命令更加完善：`jeikcode list` 与 `jeikcode list main` 列出正式版，`jeikcode list beta` 列出测试版。`up`、`update`、`upgrade` 安装较新版本。`up main` 与 `up beta` 选择通道，后面可跟版本号。`down main` 与 `down beta` 安装指定或更旧的版本。`rollback` 回到磁盘上的上一版。`-y` 不询问直接应用配置变更，无头服务器同样可用。
+  - 详细教程：https://jeikcode.top/zh/guide/updates.html
+
+- **[卸载] 交互引导，或给脚本用的无提问卸载**:
+  - `jeikcode uninstall` 询问是否保留用户配置。程序和 PATH 项一定会移除。
+  - `jeikcode uninstall simple` 只删除程序并保留配置。`jeikcode uninstall all` 两者都删除。这两条命令都不提问。
+  - 提示跟随简体中文、英文或越南文。Windows、macOS、Linux、HarmonyOS PC 使用同一套命令。
+  - 详细教程：https://jeikcode.top/zh/guide/updates.html
+
+- **[长任务] 五阶段等待、终端命令，以及一直留着的卡片**:
+  - 较长的模型回复按五个阶段观察：建立连接、等待响应开始、等待第一个 token、思考之后等待正文或工具，以及后续 token 之间的间隔。
+  - 模型只返回思考、没有正文也没有工具时，第一次立即重试。之后的重试才等待，最多 5 次。
+  - `sleep` 这类安静等待会一直跑到结束，或达到 30 分钟上限。在 macOS 上，这类等待不再交给模型决定是否停掉。
+  - `git log`、`git show`、`git diff` 以及同类输出命令可以运行，包括 `-p` 和 `-i`。`git add -p`、`git rebase -i` 这类真正的交互命令仍然拦截。
+  - 审批卡和提问卡会留到你作答或停止这一回合。
+
+- **[API] 对话留在服务启动时的目录**:
+  - OpenAI 与 Anthropic 端点继续使用 `jeikcode serve` 启动时所在目录。侧栏切换项目不再把这些会话送走。
+  - 「新建对话」在当前工作区创建会话。项目的隐藏和显示会在多个标签页和桌面窗口之间保持同步。
+
+## v7.2.4-beta.12 (2026-10-14)
+
+- **[Updates] Finish lands on the new version**:
+  - Clicking Finish and waiting after an update both reload the page once the new build is serving. The version in the sidebar updates with that reload.
+
+- **[Prompts] Approval and question cards wait**:
+  - An approval card and a question card stay until you answer or stop the turn. Leaving them open no longer auto-denies the tool, picks an answer, or tells the model that no answer was provided.
+
+---
+
+- **[更新] 完成后进入新版本**:
+  - 更新结束后，点「完成」和继续等待都会在新版本已经可访问时刷新页面。侧栏版本号随这次刷新更新。
+
+- **[提问] 审批卡和提问卡一直等待**:
+  - 审批卡和提问卡会留到你作答或停止这一回合。放着不点不再自动拒绝、自动选一项，也不会告诉模型没有答案。
+
+## v7.2.4-beta.11 (2026-10-14)
+
+- **[Updates] Notes, restart, and desktop startup**:
+  - Release notes still show when the edge list has versions but empty text. The history dropdown no longer adds a latest suffix; the first row is the latest.
+  - After an update restarts, Finish opens the new version. Waiting for the restart no longer leaves the page loading as if it were signed out, or stuck on Updating.
+  - The desktop splash shows Jeikcode, a spinning mark, and Starting.
+  - The desktop window opens sooner. The service still listens on 0.0.0.0, so other devices can reach it with the same port and token.
+
+---
+
+- **[更新] 更新说明、重启后的页面和桌面启动**:
+  - 边缘列表有版本但正文为空时，更新说明仍会显示。历史下拉不再附加「最新」，第一项就是最新版。
+  - 更新重启后，点「完成」进入新版本。不等待完成时，页面不再像未登录一样停在加载中，也不会卡在「正在更新」。
+  - 桌面启动页显示 Jeikcode、转圈图标和 Starting。
+  - 桌面窗口打开更快。服务仍监听 0.0.0.0，其他设备仍可用同一端口和 token 访问。
+
+## v7.2.4-beta.10 (2026-10-14)
+
+- **[Updates] Channel history and release notes**:
+  - The update dialog lists every version on the selected channel, newest first. Force Update stays only when that latest matches the running version. Choosing another version installs it with Update Now.
+  - Release notes for the selected version open in a dialog, with copy, on desktop and phone, in light and dark.
+  - `jeikcode list` shows stable history. `jeikcode list beta` shows beta history. `update` and `up` work like `upgrade`. `jeikcode up main|beta [version]` and `jeikcode down main|beta <version>` install a specific version. `-y` still auto-applies config diffs.
+  - Version lists and notes come from jeikcode.top. A check does not call the GitHub API when that edge list is already available.
+
+---
+
+- **[更新] 通道历史版本与更新说明**:
+  - 更新对话框按所选通道列出全部历史版本，最新在前。仅当该最新版等于当前版本时仍显示「强制更新」。选择其他版本则按「立即更新」安装。
+  - 所选版本的更新说明在弹窗中打开，支持复制，手机和电脑、亮色和暗色都可用。
+  - `jeikcode list` 显示正式版历史。`jeikcode list beta` 显示测试版历史。`update` 与 `up` 和 `upgrade` 相同。`jeikcode up main|beta [version]` 与 `jeikcode down main|beta <version>` 安装指定版本。`-y` 仍自动应用配置差异。
+  - 版本列表和更新说明来自 jeikcode.top。边缘列表已经返回时，检查更新不会再请求 GitHub API。
+
+## v7.2.4-beta.9 (2026-10-14)
+
+- **[Updates] Force reinstall and dual-copy CLI swap**:
+  - When the channel latest equals the running version, the WebUI button becomes Force Update (zh / en / vi) and re-downloads the binary. A newer latest still shows Update Now.
+  - An in-place upgrade replaces the running binary, `~/.local/bin`, PATH copies, and the desktop bundled `cli-bin`, then restarts with the original argv so `--token` stays the same.
+  - Desktop launch keeps a newer `~/.local/bin` instead of copying an older installer resource over it.
+
+---
+
+- **[更新] 强制更新与双份 CLI 替换**:
+  - 当前版本与通道最新版相同时，WebUI 按钮变为「强制更新」（中/英/越）并重新下载二进制。有更新版本时仍显示「立即更新」。
+  - 就地升级会替换正在运行的二进制、`~/.local/bin`、PATH 副本以及桌面安装包里的 `cli-bin`，然后用原 argv 重启，带 `--token` 时秘钥保持不变。
+  - 桌面启动时若 `~/.local/bin` 更新，不再用安装包里的旧资源盖回去。
+
+## v7.2.4-beta.8 (2026-10-14)
+
+- **[Updates] In-place upgrade no longer kills remote WebUI**:
+  - After replacing the binary, a detached successor waits for the old process to exit and then binds the same port. Windows no longer uses a `cmd` helper that died with the parent.
+  - If the successor cannot start, the old process keeps serving so a remote browser is not left with connection refused.
+
+---
+
+- **[更新] 就地升级不再把异地 WebUI 杀停**:
+  - 替换二进制后，脱离的后继进程会等旧进程退出再绑定同一端口。Windows 不再使用会随父进程一起退出的 `cmd` 助手。
+  - 后继进程拉不起来时，旧进程继续提供服务，避免异地浏览器刷出「无法访问」。
+
+## v7.2.4-beta.7 (2026-10-14)
+
+- **[Agent Shell] Quiet waits finish on macOS**:
+  - After output, a silent `sleep` or delay script keeps running until it exits. macOS cannot sample CPU, so those waits no longer pause for a model decision.
+
+---
+
+- **[Agent 终端] macOS 上安静等待可以跑完**:
+  - 已有输出后的 `sleep` 或延迟脚本会一直跑到自己结束。macOS 无法采样 CPU，这类等待不再弹出要模型决定是否停掉的提示。
+
+## v7.2.4-beta.6 (2026-10-13)
+
+- **[Updates] Beta channel and remote in-place upgrades**:
+  - `jeikcode upgrade beta -y` and `--beta` install the latest prerelease. `--main` and omitting the channel stay on stable. `-y` still auto-applies config diffs.
+  - The WebUI update button (including remote browsers) replaces the running `jeikcode` binary in place and restarts the service. It no longer opens a host-side installer wizard. The page reloads after the swap.
+
+---
+
+- **[更新] Beta 通道与异地就地升级**:
+  - `jeikcode upgrade beta -y` 与 `--beta` 安装最新预发布版。`--main` 和不填通道仍走正式版。`-y` 仍自动应用配置差异。
+  - WebUI 更新按钮（含异地浏览器）就地替换正在运行的 `jeikcode` 并重启服务，不再在宿主机上打开安装向导。替换完成后页面自动刷新。
+
+## v7.2.4-beta.5 (2026-10-13)
+
+- **[Agent Shell] Silent delay tasks finish; git log -p is allowed**:
+  - Sleep and other quiet waits keep running until they complete or hit the 30-minute hard cap. Every 60 seconds the shell only rechecks: pagers, REPLs, full-screen TUIs, and foreground servers are still stopped.
+  - `git log -p`, `git show -p`, `git diff -p`, and `git log -i` / `git grep -i` run as normal output commands. Interactive git such as `git add -p` and `git rebase -i` remains blocked.
+- **[Protocol API & WebUI] Conversations stay in the serve workspace**:
+  - OpenAI Chat Completions, Responses, and Anthropic endpoints keep using the directory where `jeikcode serve --host --port` was started. Switching projects in the sidebar no longer moves those sessions into the first project.
+  - The top New Chat button creates a session in the current workspace.
+
+---
+
+- **[Agent 终端] 安静等待任务可以跑完；git log -p 不再被拦截**:
+  - `sleep` 以及没有输出的延迟脚本会一直跑到自己结束，或达到 30 分钟硬顶。每 60 秒只做体检：pager、REPL、全屏 TUI 和前台常驻服务仍会终止。
+  - `git log -p`、`git show -p`、`git diff -p` 以及 `git log -i` / `git grep -i` 按普通输出命令放行。`git add -p`、`git rebase -i` 等真正交互命令继续拦截。
+- **[协议 API 与 WebUI] 对话留在启动工作区**:
+  - OpenAI Chat Completions、Responses、Anthropic 端点继续使用 `jeikcode serve --host --port` 启动时所在目录。侧栏切换项目不再把这些会话送进第一个项目。
+  - 顶部「新建对话」在当前工作区创建会话。
+
+## v7.2.4-beta.4 (2026-10-13)
+
+- **[Liveness & Stream Timeout Architecture] Three-phase timeout policy, thinking stall detection, and retry hardening**:
+  - Refactored stream liveness monitoring with a unified `TimeoutPolicy` covering first-token arrival (default 180s), inter-token idle bounds, and transport timeouts.
+  - Added dedicated detection for thinking-only output stalls, presenting clear user diagnostics when models emit reasoning without generating subsequent text or tool calls across retries.
+  - Standardized timeout propagation across all provider integrations (Anthropic, Gemini, Ollama, OpenAI-compatible, and Responses).
+- **[Sidebar Projects Synchronization & Real-time State] Event-driven project visibility across instances**:
+  - Implemented `sidebar_projects` event broadcasting over the global SSE bus, keeping project hide and reveal states synchronized across all tabs and desktop windows.
+  - Optimized pending hide/reveal state tracking to prevent race conditions during rapid project visibility changes.
+- **[Documentation & Presets] Synchronized timeout configuration guides**:
+  - Updated tool and timeout documentation alongside default configuration templates to reflect the updated timeout structure.
+
+---
+
+- **[保活监控与流式超时架构] 三阶段流式超时策略、纯思考卡死检测与重试加固**:
+  - 重构模型流式连接与保活超时架构，引入统一的 `TimeoutPolicy`，涵盖首字到达超时（默认 180 秒）、分块闲置与传输层超时控制。
+  - 针对大模型仅输出深度思考却未生成正文或工具调用的停滞卡死场景提供专用检测与清晰的排障指引。
+  - 在全系提供商接入（Anthropic、Gemini、Ollama、OpenAI 兼容协议、Responses）中统一步调与超时参数传递。
+- **[侧栏项目实时同步与状态收敛] 跨实例多窗口项目显示状态即时协同**:
+  - 通过全局事件总线广播 `sidebar_projects` 变更，实现多标签页与桌面端窗口之间项目隐藏与显示状态的毫秒级同步。
+  - 优化隐藏与展示状态的竞态防护，防止快速切换项目时状态不一致或幽灵项目残留。
+- **[文档与配置预设同步] 更新超时配置指南与默认模版**:
+  - 同步更新工具与超时指南文档，并在全仓默认配置文件模版中补齐最新超时架构定义。
+
+## v7.2.3 (2026-10-13)
+
+- **[WebUI Live Streaming & Content Integrity] Eliminate live stream truncation, missing background code blocks, and sequential reasoning display**:
+  - Fixed an issue where repeated URLs, common domain prefixes (`https://github.com`), or repeated code identifiers were erroneously truncated during live LLM streaming.
+  - Substring deduplication is now strictly isolated to replay frames, with real-time stream deltas appended reliably via monotonic sequence cursors.
+  - Fixed missing Markdown code blocks and Mermaid diagrams when switching back to a session that completed in the background by properly buffering `artifact_*` events in the background session cache.
+  - Resolved steer card state desync, stuck queues, and ghost duplicate bubbles during cross-session switching by folding steered inputs into target session caches.
+  - Fixed an issue where successive reasoning / thinking blocks across tool boundaries were improperly coalesced into the initial block; subsequent thinking blocks now render cleanly in sequential order.
+  - Introduced live `Compacting...` shimmer placeholder synchronized across all tabs and instances when background context compaction is underway.
+  - Restored context compaction notices (`format_compaction_mark`) in the native live architecture, rendering amber advisories in-stream as ordered notice parts.
+  - Added official GitHub badge to the sidebar footer with `config.toml` toggle and `jeikcode ghimg [on|off]` live hot-reloading CLI.
+  - Refined ambiguous match error messages in the edit tool from Rust range syntax to clear 1-based index instructions (`1 to N`).
+  - Eliminated contradictory "not applied" diff banner on successfully completed file edits.
+- **[Task List Lifecycle & Workspace Stability] Fix premature checklist clearing and synchronize persona rules**:
+  - Fixed premature clearing of active in-progress checklists in `apply_actions_batch` when appending multiple new tasks alongside existing status updates.
+  - Aligned checklist auto-clearing lifecycle to trigger strictly upon terminal turn completion via `LifecycleHooks::turn_complete` when all tasks are finished.
+  - Streamlined `<todo_rules>` persona guidelines with concise terminal-clearing timing and "Do not proactively remove or clear task items" guard.
+- **[WebUI Modern Modals, Toast System & Git Controls] Modern theme-adaptive dialogs, VSCode-style discard all, and page zoom**:
+  - Replaced all legacy browser dialogs (`window.confirm`, `window.alert`, `window.prompt`) featuring `127.0.0.1:port` popups with beautiful, theme-adaptive modals and floating toast capsules matching light and dark themes.
+  - Added a dedicated "Discard All Changes" (`↺`) action in GitPanel unstaged changes header with secondary confirmation and full i18n support matching VSCode workflow.
+  - Replaced file discard, branch deletion, merge, revert, and cherry-pick native popups with responsive modern confirm modals.
+  - Implemented Chrome-like `Ctrl + Mouse Wheel` (and `Ctrl + +/-/0`) page zoom scaling with persistent zoom levels in `localStorage` and a floating percentage indicator pill.
+- **[Update Relay & Release Infrastructure] Zero-rate-limit Cloudflare edge relay and streamlined release matrices**:
+  - Deployed an official Cloudflare Pages edge function (`/api/releases`) with Atom feed parsing and 70s edge caching, eliminating GitHub API 60 req/hr rate limits for overseas VPN and proxy users.
+  - Release installer links now connect directly to downloadable binaries (Windows `.exe`, macOS `.dmg`, Linux `.deb`/`.AppImage`), completely removing obsolete `.rpm` references.
+  - Streamlined desktop release and portability test matrices, preserving 100% of headless CLI builds across x86_64 and ARM64.
+- **[Documentation & Portal Experience] Dual-channel version indicators and clean quickstart guides**:
+  - The documentation homepage now presents independent Stable and Beta version badges linked directly to respective releases.
+  - Unified Quick Start and Documentation navigation across all README files with direct links to the official portal (`jeikcode.top`).
+
+---
+
+- **[WebUI 实时流式传输与内容完整度] 彻底根除实时流式吞字、后台代码块丢失、思考块倒流叠加与压缩状态同步**:
+  - 修复大模型流式输出过程中因误判重复帧导致连续相同 URL、域名公共前缀（`https://github.com`）或重复代码标识符被吞字残缺的问题。
+  - 所有子串级去重严格隔离在重放分支，实时流式输出完全依赖单调递增游标可靠就地追加。
+  - 修复在后台会话生成 Markdown 或 Mermaid 图表时切回会话出现内容缺失的缺陷，将 `artifact_*` 代码块事件全量实时同步至后台会话缓存。
+  - 解决跨会话切换时 steer 转向卡片未能及时出队、状态卡死或重现双份气泡的缓存脱节缺陷，使后台转向与正文状态单调对齐。
+  - 彻底根治连续多个思考块跨越工具调用时被异常倒灌、错误叠加进第一个思考块的问题，使思考块严格按照产生时序独立渲染。
+  - 引入全实例全局同步的 `Compacting...` 流光状态，在上下文压缩提炼请求发送与执行期间为各端实时展示平滑过渡提示。
+  - 修复全新 Live 架构下上下文压缩通知（`Compacted`）被吞未发送的缺陷，将压缩与异常提示作为独立顺序部件在画布中端正渲染黄色警告条。
+  - 在侧栏底部新增官方 GitHub 仓库徽章，支持 `config.toml` 配置与 `jeikcode ghimg [on|off]` 命令行实时免重启热重载切换。
+  - 优化 edit 工具多处歧义匹配时的报错指引，由 Rust 区间语法改为通俗清晰的 1-based 序号提示（`1 to N`）。
+  - 消除文件编辑成功（已完成）时因行数截断误报“预期替换（未写入，仅供参考）”的语义矛盾。
+- **[任务清单生命周期与全目标编译修复] 修复待办列表早熟清空缺陷、精简提示词与 CI 编译全绿**:
+  - 彻底修复 `apply_actions_batch` 在向进行中清单追加多个新任务时因 `add_count >= 2` 误判导致列表被暴力清空的重大缺陷，保持任务 ID 连续性。
+  - 将任务清单自动清空时机严格绑定至终态回复完成（`LifecycleHooks::turn_complete`），仅在所有任务全部完成时才自动归档清空。
+  - 精简 `<todo_rules>` 人设提示词，去除冗余修饰，严格对齐终态清空与“不主动删除任务项”安全法则。
+- **[WebUI 现代主题提示框、全局 Toast 与 Git 撤销控制] 告别老旧浏览器原生弹窗、VSCode 风格放弃全部更改与滚轮缩放**:
+  - 全面替换所有带有 `127.0.0.1:port` 的老旧浏览器原生弹窗（`window.confirm`、`window.alert`、`window.prompt`），升级为完美适配亮色与暗色模式的现代卡片式 `ConfirmDialog` 与磨砂胶囊 `Toast`。
+  - 在 GitPanel 代码更改标题栏新增 VSCode 风格的“放弃所有更改”（`↺` 拐弯撤销图标）按钮，配备二次确认保护弹窗与全套多语言适配。
+  - 将单文件修改放弃、分支删除、分支合并、提交回滚（Revert）与拣选（Cherry-pick）全部接入现代确认弹窗。
+  - 引入仿 Google Chrome 的 `Ctrl + 鼠标滚轮`（以及 `Ctrl + +/-/0`）页面缩放能力，支持 50%~300% 步进调节、`localStorage` 持久化记忆与右上角实时百分比气泡展示。
+  - 深度优化移动端与窄窗口自适应布局，确保弹窗自适应视口宽度、居中展示且无任何横向溢出。
+- **[更新中继与发布工程基建] Cloudflare 边缘零限流发布中继与发布矩阵瘦身**:
+  - 部署官方 Cloudflare Pages 边缘服务（`/api/releases`），通过 Atom 订阅流拉取元数据并执行 70 秒全球 CDN 缓存，彻底终结 GitHub API 60次/小时导致的海外 VPN 与代理出口 IP 限流。
+  - Release 说明下载表格直接提供 Windows `.exe`、macOS `.dmg`、Linux `.deb`/`.AppImage` 安装包直链下载，并彻底移除无用的 `.rpm` 格式。
+  - 精简桌面安装包与跨平台兼容性测试矩阵，同时 100% 完整保留 x86_64 与 ARM64 无头设备 CLI 核心产物。
+- **[文档中心与门户体验] 官网首页双版本指示器与精简上手指南**:
+  - 官网首页并排展示独立的正式版（Stable）与测试版（Beta）版本胶囊，支持动态数据获取与 bump 脚本双兜底同步。
+  - 全面精简中英双语 README，收揽统一为“快速上手与官方文档”，核心教程与高级指南统一收拢至官方文档站点（`jeikcode.top`）。
+
+## v7.2.2 (2026-10-12)
+
+- **[Chat Streaming & Session Continuity] Single event bus, resumable cursors, and idempotent rendering across refresh, switching, and multi-instance viewing**:
+  - Cache performance and canvas data consistency are comprehensively improved, preventing duplicate replays, message rendering misalignment, and related issues.
+  - All chat streaming now flows through one broadcast event bus triggered by a stateless `/chat` RPC; the legacy replay machinery is retired.
+  - Monotonic session cursors let reconnects resume exactly where they left off — refreshing, blurring, or switching sessions never duplicates or loses prompts, thinking, or answers.
+  - Fixed multi-round output after tool calls, mid-stream thinking/answer fragmentation, and the disappearance of the latest prompt after refresh; repeated replays render strictly idempotently.
+  - Stable message/part identities span kernel, daemon, and WebUI, backed by a cross-instance incremental event channel for live multi-tab and multi-device synchronization.
+  - Session streams are isolated per session; warm switching reconciles settled disk state automatically; sidebar running indicators self-heal and reconnect loop storms are eliminated.
+
+- **[Chat History & Interaction] Inline editing, rollback & regeneration, reliable steering, and precise stop controls**:
+  - History bubbles support inline editing with multi-image drop-back: "Rewrite History" (in-place, no regeneration) and "Rollback & Submit" (branch a fresh generation), plus per-turn temporary model overrides; assistant replies gain "Regenerate" and "Delete".
+  - All history mutations are atomic on disk and broadcast differentially to every open tab.
+  - Steer cards survive refresh and cancellation clears the kernel buffer; the turn clock resumes real elapsed time after reconnects.
+  - "Send now" reliably stops the running turn and delivers immediately; stop waits for real release without arbitrary timeouts; 409 conflicts fold back into the queue gracefully; the stop button responds instantly with an anti-bounce guard.
+
+- **[Performance & Cold Start] Instant first paint, tiered caching, and zero idle polling**:
+  - A two-tier session cache (memory + IndexedDB) with idle prefetch restores the full canvas instantly after refresh — including question outline, todo checklist, and token usage.
+  - Embedded assets use tiered HTTP cache headers; heavy panels are lazy-loaded (main bundle reduced by over 70 kB) and non-critical startup checks are deferred.
+  - Aggressive background polling (500 ms – 5 s timers) is eliminated in favor of event-driven updates, with a manual model refresh button; idle network traffic drops to zero.
+
+- **[WebUI Experience & Visual Polish] Git panel, canvas search, Mermaid, Markdown, media, and theming**:
+  - Git panel rebuilt with a project-level single-flight cache, commit-graph caching bound to HEAD, and DOM keep-alive — background Git processes cut from ~11 to 2; Chinese filenames and branch switching are fixed.
+  - Canvas Ctrl+F searches the entire conversation with smooth centered navigation; the question outline anchors correctly; auto-follow respects manual browsing.
+  - Mermaid diagrams no longer vanish (hydration crash fixed, flowchart labels preserved, nested fences handled) with a simplified toolbar; streaming Markdown fences, headings, and lists render without fragmentation.
+  - Image uploads up to 8 MB with aspect-ratio-preserving transcoding; composer input recall with ↑/↓; mobile layout fixes; eye-care light palette and circular power-switch controls.
+  - TUIx: legacy `list` action support, mid-stream `/clear` and `/new`, and `read` tool detail formatting.
+
+- **[Background Processes & Terminal Runtime] Resident services decoupled from turns, live logs, and native PIDs**:
+  - Detached background services now survive turn completion, user stops, refreshes, and session switches — terminated only by explicit kill, session deletion, or host exit.
+  - Background output streams to OS temp log files with tail-read guidance; session-scoped log pools roll with LRU cleanup.
+  - Virtual IDs are retired end to end: registries, cancellation, and status hooks all use native OS PIDs.
+  - Git-Bash/MSYS reliability on Windows: paths and environment normalized (`$TMPDIR` / `$DESKTOP`), real background PIDs reported, mixed-encoding output decoded, interactive commands fail fast instead of hanging, and pipes are drained on exit.
+
+- **[Tools, Editing & Code Intelligence] Compressed outputs with retrieval handles, canonical tool names, and hardened editing**:
+  - Oversized tool outputs are uniformly compressed and carry an artifact handle for full retrieval; terminal outputs get a dedicated configurable threshold.
+  - Tool names converge on canonical `read` / `write` / `edit` / `run_command` across the stack with legacy aliases still accepted; worker scope gates recognize modern calls.
+  - Edit tool: lossy-recovery rejection, a 50% similarity gate with cross-file hints, richer mismatch diagnostics, and unambiguous errors for conflicting options.
+  - grep tolerates bare braces and falls back gracefully on missing paths; Windows path normalization hardened (verbatim UNC casing, multibyte path slicing).
+  - Directory pickers modernized (native Windows dialog + built-in web explorer for remote sessions); Python venv launcher context preserved on Windows.
+  - Subagents gain `code_explore` plus lenient task dispatch with aliases and error self-healing; the todo `list` action becomes first-class.
+
+- **[Kernel, Context & Prompts] Watermark budgeting, persona architecture, and workflow discipline**:
+  - Context budgeting now uses a safety watermark — no more "warns every turn but never compacts" confusion — with model tier presets (32K–384K plus custom) in the editor.
+  - The system persona is reorganized into a four-block architecture with a dedicated explore strategy; prompts align to a modern structured workflow (todo rules, task-scope awareness); noisy dynamic turn-start reminders are retired.
+  - Prompt/persona baselines resolve reliably so built-in safeguards are never silently dropped; MCP child processes are reclaimed deterministically; home/config resolution is unified to a single source.
+
+- **[MCP, Skills & Capabilities] One capability surface with hot reload**:
+  - MCP servers and skills share a unified GLOBAL/PROJECT capability state with hot reload; capability switches are the single authority and project trust is confirmed silently.
+
+- **[Networking & Remote Access] IPv6 dual-stack support**:
+  - WebUI binds IPv6 alongside IPv4 with shareable-address ranking and RFC-compliant bracketed URLs; the remote access panel surfaces IPv6 addresses across platforms.
+
+- **[Security & Dependencies] Hardened dependency chains and path guards**:
+  - Vulnerable WebUI dependency chains removed and `npm audit` gated in CI; Mermaid output sanitized before injection; `code_explore` honors the sensitive-path gate; credential files are excluded from the code graph via a dedicated ignore list.
+
+- **[Internationalization, Desktop & VSCode]**:
+  - Full Vietnamese localization across WebUI, TUIx, daemon, desktop startup, and the VSCode extension, with three-tier OS locale detection.
+  - Desktop startup status localized (EN/ZH/VI); accessibility labels and native terminal guidance localized; VSCode extension receives an updated icon and packaging fixes.
+
+- **[CI, Release Pipeline & Engineering]**:
+  - The release pipeline is rebuilt as a fully parallel per-architecture matrix with global Rust caching, nearly halving critical-path build time; temporary release watchers are removed.
+  - The portability workflow runs native and subset cross-platform suites; the TUI library suite is gated in CI; the all-features suite is made hermetic; the CI-first verification policy is documented.
+  - Repository hygiene: LF line endings pinned via `.gitattributes` / `.editorconfig`; the version bump script cascades the Tauri lockfile and desktop metadata; bilingual commit bodies are now required.
+  - Build health restored across jobs (workspace warnings cleared, compile blockers and cross-platform assertions fixed).
+
+---
+
+- **[对话流式与会话连续性] 单事件总线、可续传游标与全链路幂等渲染，刷新/切换/多端查看全部稳妥**:
+  - 缓存性能与画布数据一致性全面提升，防止重复重放、消息渲染错位等情况。
+  - 全量对话流式收敛至唯一广播事件总线，`/chat` 以无状态 RPC 触发；历史重放旧机制物理退役。
+  - 会话级单调游标让断线重连精确续接：刷新、失焦、切换会话后，提问、思考与正文不再重复或丢失。
+  - 修复工具调用后的多轮实时输出、流式思考/正文中途碎裂、刷新后最新提问消失等问题；重复重放严格幂等。
+  - 消息与部件身份贯穿 kernel、daemon 与 WebUI，配合跨实例增量事件通道，多标签页与多设备实时同步。
+  - 会话流按会话隔离；热切换自动对账磁盘态；侧栏运行指示自愈校准，重连风暴彻底平息。
+
+- **[对话历史与交互] 气泡内联编辑、回溯与重新生成，可靠的转向与停止控制**:
+  - 历史气泡支持内联编辑与多图回填：「改写历史」（原地更新、不触发重新生成）与「回溯并提交」（截断后续历史、重新分支生成），并支持单轮临时模型覆盖；助手回答支持「重新生成」与「删除」。
+  - 所有历史变更原子落盘，并差量广播到全部打开的标签页。
+  - Steer 卡片刷新不丢失，取消即清理内核缓冲；回合时钟在断线重连后继续累计真实耗时。
+  - 「立即发送」可靠终止在跑回合并即时投递；停止会等待真实离场、不再有任意超时；409 冲突平滑回退到队列；停止按钮秒级响应并带防反弹屏障。
+
+- **[性能与冷启动] 画布秒开、分级缓存与空闲零轮询**:
+  - 内存 + IndexedDB 双层会话缓存配合空闲预取，刷新后全态画布瞬时还原：提问大纲、待办清单、Token 用量一并恢复。
+  - 内嵌静态资源分级 HTTP 强缓存；重量级面板懒加载（主包缩减逾 70 kB）；非关键启动检测错峰延后。
+  - 彻底拔除 500ms~5s 高频轮询，全面事件驱动；新增模型手动刷新按钮；空闲态网络请求归零。
+
+- **[WebUI 体验与视觉] Git 面板、画布搜索、Mermaid、Markdown、媒体与主题**:
+  - Git 面板重建为项目级单飞缓存 + HEAD 锚定图谱缓存 + DOM 常驻保活，后台 Git 进程由约 11 个压到 2 个；中文文件名与分支切换问题修复。
+  - 画布 Ctrl+F 全量搜索并居中平滑跳转；提问大纲锚定修复；自动跟屏尊重手动翻阅。
+  - Mermaid 图表不再消失（水合崩溃修复、流程图标签保留、嵌套围栏妥善处理），工具栏精简；流式 Markdown 的围栏、标题、列表不再碎裂。
+  - 支持 8MB 图片上传并保持纵横比转码；输入框 ↑/↓ 历史召回；移动端布局修复；护眼亮色主题与圆形电源开关。
+  - TUIx：支持 legacy `list` 动作、流式中 `/clear` 与 `/new`、`read` 工具详情格式化。
+
+- **[后台进程与终端运行时] 常驻服务与回合解耦、实时日志与原生 PID**:
+  - 后台常驻服务在回合结束、用户停止、刷新与会话切换后依然存活，仅在显式 kill、删除会话或宿主退出时终止。
+  - 后台输出实时落盘为系统临时日志并附 tail 读取指南；会话级日志池滚动复用、级联清理。
+  - 虚拟 ID 全链路退役：注册、取消与状态钩子全部改用操作系统原生 PID。
+  - Windows Git-Bash/MSYS 可靠性：路径与环境归一（`$TMPDIR` / `$DESKTOP`）、后台任务回报真实 PID、混合编码正确解码、交互式命令快速失败不再挂起、退出前排空管道。
+
+- **[工具、编辑与代码智能] 压缩输出带取回钥匙、规范工具名与编辑加固**:
+  - 超长工具输出统一压缩并携带 artifact 钥匙，可随时取回全文；终端输出拥有独立可配置阈值。
+  - 工具名全栈收敛为规范 `read` / `write` / `edit` / `run_command`，旧名仅作别名继续兼容；worker 作用域闸门识别现代调用。
+  - edit 工具：拒绝失真恢复、50% 相似度守卫与跨文件提示、更丰富的失配诊断、冲突选项明确报错。
+  - grep 容忍裸花括号并在目标缺失时优雅兜底；Windows 路径归一加固（verbatim UNC 大小写、多字节路径切片）。
+  - 目录选择器现代化（Windows 原生对话框 + 远程会话内置网页浏览器）；Windows 下 Python venv 启动器上下文保留。
+  - 子代理获得 `code_explore`，task 分发宽松化并支持别名与错误自愈；todo 的只读 `list` 动作转正。
+
+- **[内核、上下文与提示词] 水位预算、persona 架构与工作流纪律**:
+  - 上下文预算采用水位机制，消除「每轮报警但从不压缩」的困扰；模型面板提供 32K~384K 档位与自定义。
+  - 系统 persona 重组为四段式架构并引入独立 explore 策略；提示词对齐现代结构化工作流（todo 规范、任务边界意识）；无意义的回合开始动态提醒退役。
+  - 提示词/persona 基线解析稳定，不再静默丢失内置防线；MCP 子进程确定性回收；home/配置解析统一为单一来源。
+
+- **[MCP、Skills 与能力面] 统一能力状态与热重载**:
+  - MCP 与 Skills 共享统一的 GLOBAL/PROJECT 能力状态并支持热重载；能力开关是唯一权威，项目信任静默确认。
+
+- **[网络与远程访问] IPv6 双栈支持**:
+  - WebUI 同时监听 IPv6 与 IPv4，可分享地址按优先级排序并采用 RFC 规范中括号 URL；远程访问面板跨平台展示 IPv6 地址。
+
+- **[安全与依赖] 依赖链与路径防护加固**:
+  - 移除存在漏洞的 WebUI 依赖链并将 `npm audit` 纳入 CI；Mermaid 输出注入前净化；`code_explore` 纳入敏感路径闸门；凭据文件由图谱专用忽略清单隔离。
+
+- **[国际化、桌面与 VSCode]**:
+  - WebUI、TUIx、daemon、桌面启动与 VSCode 扩展全面支持越南语，配合三级系统语言自动探测。
+  - 桌面启动状态本地化（英/中/越）；无障碍标签与原生终端引导本地化；VSCode 扩展更新图标并修复打包。
+
+- **[CI、发布流水线与工程化]**:
+  - 发布流水线重建为全架构真并行矩阵并接入全局 Rust 编译缓存，关键路径耗时缩短近半；临时发布监控脚本下线。
+  - portability 工作流全量运行 native 与 subset 跨平台测试；TUI 套件纳入 CI 门禁；all-features 套件密闭化；CI-first 验证策略成文。
+  - 仓库卫生：LF 行尾全局钉死（`.gitattributes` / `.editorconfig`）；版本 bump 脚本级联 Tauri 锁文件与桌面元数据；提交正文双语规范确立。
+  - 构建健康恢复：workspace 告警清零，编译阻塞与跨平台断言问题修复。
+
+## v7.2.2-beta.7 (2026-10-12)
+
+- **[Daemon & WebUI Live Streaming / Canvas] Monotonic live sequence tagging and global idempotency against duplicate replays**:
+  - **Technical Root Cause / Detail**: 
+    1. Stale client cursor: Live stream frames from `live_stream` omitted `seq` tags (`None`), causing client-side stream cursors (`streamCursor`) to freeze at 0 during active generation. Upon blur or refresh, the client requested reconnects with stale cursors (`after_seq = 0`), prompting the server to re-emit the entire turn replay from the beginning.
+    2. Missing global text/thinking deduplication: When a full replay re-emitted initial reasoning while the canvas already displayed trailing text, `mergeReasoningIntoParts` and `mergeTextIntoParts` erroneously appended new parts instead of updating in place, resulting in duplicate interleaved blocks (`[reasoning] -> text -> [reasoning] -> duplicate text`).
+  - **Implementation Mechanism**: 
+    1. Continuous monotonic sequence counter: Daemon's `live_stream` now tags all live events with monotonically increasing `seq` values (`AtomicU64`), ensuring client cursors advance in real time and reconnects only pull unreceived suffixes.
+    2. Global content idempotency: In `sessionProjection.ts`, `mergeReasoningIntoParts` and `mergeTextIntoParts` now globally search existing parts: if content is already present or identical, it is cleanly discarded; if it is a prefix extension, it updates in place.
+  - **Verification & Testing**: 472 WebUI unit tests pass (`node --test`), 401 daemon lib tests pass (`cargo test --lib -p jeikcode-daemon`), and TypeScript checks clean (`tsc --noEmit`).
+
+---
+
+- **[Daemon 与 WebUI 流式与画布] 实时流递增序号赋权与防重复重播全局内容幂等**:
+  - **技术机理 / 现象溯源**: 
+    1. 客户端游标僵死：后端在推送实时事件（`live_stream`）时帧上未带 `seq`（为 None），导致前端在推流期间本地游标始终定格在 0。失焦或刷新重连时前端只能发回 `after_seq = 0`，服务端被迫将本轮整段历史（从最早的思考到正文）全量重新重播一遍。
+    2. 全量重播跨类型追加：当全量重播帧到达时，画布末尾已经是正文，此时首帧思考过程到来因类型不同被强制在正文后面新建了思考块；紧随其后的正文帧又在思考块后新建了正文块，导致思考与正文被双倍重复追加。
+  - **实现防线 / 核心改动**: 
+    1. 实时流全链路单调递增游标：后端 `live_stream` 全局使用 `AtomicU64` 为每一帧实时流赋以严格单调递增的 `seq` 序号，前端毫秒级实时推进本地游标，断线/刷新重连精准按序续接，服务端绝不多发一条旧内容。
+    2. 全局内容级幂等防线：在 `sessionProjection.ts` 中，`mergeReasoningIntoParts` 与 `mergeTextIntoParts` 建立全局检测防线：若已有部件已包含该内容，直接丢弃，绝不在末尾造出第二个重复块；若为前缀延伸则原地扩展。
+  - **验证与交付**: WebUI 472 项单测全绿，daemon 401 项单测全绿，`tsc --noEmit` 0 报错。
+
+## v7.2.2-beta.6 (2026-10-12)
+
+- **[WebUI Live Stream / Canvas] Unify thinking blocks and eliminate reasoning duplication across tool rounds**:
+  - **Technical Root Cause / Detail**: During stream reconnection or focus changes, `appendReasoningPart` checked `tail.id !== id` and `mergeReasoningIntoParts` returned early when part ids diverged. Consequently, replayed or newly arriving thinking deltas failed part-id matching against existing elements and bypassed whole-text deduplication (`existing.includes(content)`), creating consecutive duplicated thinking blocks on screen.
+  - **Implementation Mechanism**: Restored the fundamental rule for reasoning streams in `appendReasoningPart`: as long as the trailing part is a reasoning block, incoming thinking chunks unconditionally append in place (`tail.text += delta`), strictly preventing multiple consecutive thinking blocks. Restored full-text deduplication in `mergeReasoningIntoParts` across all part-id checks.
+  - **Verification & Testing**: 472 WebUI unit tests pass (`node --test`), 401 daemon lib tests pass (`cargo test --lib -p jeikcode-daemon`), and TypeScript checks clean (`tsc --noEmit`).
+
+---
+
+- **[WebUI 流式与画布] 合并思考流式输出，杜绝工具轮次间思考块分叉与重复**:
+  - **技术机理 / 现象溯源**: 在流式断点重连或失焦切回时，`appendReasoningPart` 严苛校验 `tail.id !== id`，且 `mergeReasoningIntoParts` 在 partId 不匹配时直接提前 return。导致已存在的思考块无法被命中，进而跳过了全量文本去重防线（`existing.includes(content)`），在工具调用之间硬生生追加出了多个连续重复的思考折叠块。
+  - **实现防线 / 核心改动**: 确立思考流式输出的绝对合并铁律：在 `appendReasoningPart` 中只要末尾已是思考部件，任何新来的思考 chunk 无条件在尾部拼接（`tail.text += delta`），绝不分裂；并在 `mergeReasoningIntoParts` 中恢复全量文本去重防线。
+  - **验证与交付**: WebUI 472 项单测全绿，daemon 401 项单测全绿，`tsc --noEmit` 0 报错。
+
+## v7.2.2-beta.5 (2026-10-12)
+
+- **[WebUI & Daemon Live Stream / Canvas] Fix post-refresh user prompt loss and streaming reasoning/text fragmentation**:
+  - **Technical Root Cause / Detail**: 
+    1. Prompt disappearance on refresh: When a turn was active, `/chat/watch` filtered replay frames using `seq >= after_seq`. Because the turn's `ChatEvent::User` was tagged with `seq_base`, any connection reconnecting with an advanced cursor filtered out the active turn's user prompt. Simultaneously, reloading disk history during an active turn lacked unpersisted user prompts and erroneously overwrote the memory/IndexedDB cache, completely vanishing the user prompt across refresh.
+    2. Streaming fragmentation across refresh/blur: During continuous live streaming, `appendReasoningPart` and `mergeTextIntoParts` erroneously checked `tail.id === id`. Whenever a slight part-id divergence or focus reconnection occurred, incoming chunks failed this check and were pushed as entirely separate parts rather than appending text in place, fragmenting single coherent thoughts and responses into dozens of disjointed blocks.
+  - **Implementation Mechanism**: 
+    1. Guard active user prompts in replay: Daemon's `subscribe_live_with_replay` now explicitly preserves `ChatEvent::User` at the head of `replay_head` regardless of `after_seq` filtering. Front-end `paintUserMessage` idempotently restores missing user prompts while deduplicating existing ones. In `Chat.tsx`, active sessions strictly skip `saveSessionCache` overwrites from incomplete disk state.
+    2. Seamless text and reasoning streaming: `appendReasoningPart` and `mergeTextIntoParts` now unconditionally append incoming streaming chunks to the trailing part of the same kind unless a distinct part-id boundary is explicitly encountered, eliminating streaming text/thinking splitting.
+  - **Verification & Testing**: 472 WebUI unit tests pass (`node --test`), 401 daemon lib tests pass (`cargo test --lib -p jeikcode-daemon`), and TypeScript checks clean (`tsc --noEmit`).
+
+---
+
+- **[WebUI 与 Daemon 流式与画布] 修复刷新后最新用户消息丢失与思考/正文流式输出碎裂分叉**:
+  - **技术机理 / 现象溯源**: 
+    1. 刷新后用户提问消失：当回合处于活跃执行中，后端 `/chat/watch` 重放过滤以 `seq >= after_seq` 截断。本回合提问 `ChatEvent::User` 携带 `seq_base`，任何持有递增游标重连的连接均将本轮用户消息过滤拦截；同时刷新时读取磁盘因尚未完结落盘而缺少最新提问，并错误覆写了缓存，导致刷新后用户消息 100% 丢失。
+    2. 失焦/刷新导致思考与正文碎裂断开：在流式生成期间，`appendReasoningPart` 与 `mergeTextIntoParts` 严苛校验 `tail.id === id`。一旦发生失焦重连或部件 ID 微小差异，后续到来的 chunk 校验失败便全部作为新部件 push，将原本同一段连续输出切碎为十几个孤立的折叠块与文本块。
+  - **实现防线 / 核心改动**: 
+    1. 活跃用户提问重放铁律守护：后端 `subscribe_live_with_replay` 明确保证无论 `after_seq` 游标如何过滤，本回合活跃提问 `ChatEvent::User` 恒定保留在重放头部送达；前端 `paintUserMessage` 幂等自愈恢复提问并自动去重；`Chat.tsx` 严格禁止在活跃期间用未落盘的磁盘历史覆写会话缓存。
+    2. 流式思考与正文连贯合并：`appendReasoningPart` 与 `mergeTextIntoParts` 恢复同类型部件流式文本无缝合并原则，仅在跨工具或显式跨段时另起部件，彻底根治流式内容被碎尸万段的顽疾。
+  - **验证与交付**: WebUI 472 项单测全绿，daemon 401 项单测全绿，`tsc --noEmit` 0 报错。
+
+## v7.2.2-beta.4 (2026-10-12)
+
+- **[WebUI / Daemon Streaming] Session-level resume cursor and identity-idempotent canvas**:
+  - **Technical Root Cause / Detail**: The canvas is fed by a single event bus (`/chat/watch`) that carries BOTH replayed buffer frames and live deltas. The client hard-coded "this frame may already be painted" for the whole stream, so `mayPaintUnroutedDelta` rejected every round after the first tool call whenever the session already had an earlier turn — thinking and body text after tool execution never appeared until a manual refresh re-read the disk. Replay de-duplication additionally compared a frame against the concatenation of ALL text parts of a message, so re-sent mid-segments were re-appended (the whole in-flight turn was re-typed) and cross-round frames were glued into the previous round's parts (thinking split in two, body text swallowed).
+  - **Implementation Mechanism**: `/chat/watch` now takes `after_seq` (`-1` = brand-new session → no replay, only a `session_start` handshake carrying the starting cursor; `N` = replay only frames with `seq >= N`; absent = full replay). Replayed frames carry `seq`, live frames do not; the cursor is a strictly increasing SESSION-level counter that survives turn boundaries, context compaction, and history rewrites. Tool boundaries open a new streaming part id (`end_streaming_part`). The WebUI stores the cursor per session and per stream (`streamCursor.ts`), dispatches by WHAT THE CONNECTION REQUESTED instead of guessing per frame, merges replay frames by part id (idempotent), deletes the legacy gate, never merges cross-round frames into the previous round's parts, writes the canvas back to the L1/L2 session cache (debounced 800ms plus forced writes at turn end and on mutations), keeps display monotonic under compaction, and invalidates the cursor (clearing the stale turn buffer server-side) on session mutations.
+  - **Verification & Testing**: `tsc --noEmit` clean; 477 WebUI unit tests pass; 401 daemon lib tests pass; `cargo check --lib -p jeikcode-daemon` clean.
+
+---
+
+- **[WebUI / Daemon 流式传输] 会话级断点续传游标与纯身份幂等画布**:
+  - **技术机理 / 现象溯源**: 画布由单事件总线（`/chat/watch`）推进，而这条流同时搬运回放帧与实时增量。前端对整条流硬编码「这帧可能已经画过」，于是只要会话已有历史回合，`mayPaintUnroutedDelta` 就会拦掉第一轮工具调用之后的每一轮思考与正文 —— 只有手动刷新才出现。回放去重还拿「整条消息所有正文的拼接」当基线：从中间重发的片段被再次追加（整个在途回合被逐帧重打一遍），跨轮的帧还会被粘进上一轮的部件里（思考被拆成两段、正文被吞掉开头）。
+  - **实现防线 / 核心改动**: `/chat/watch` 支持 `after_seq`（`-1` = 新会话 → 不补发，只回一条携带起始游标的 `session_start` 握手帧；`N` = 只补 `seq >= N` 的回放帧；缺省 = 全量补发）。回放帧带 `seq`，实时帧不带；游标为会话级严格递增计数器，跨回合、跨上下文压缩、跨历史改写都成立。工具调用处闭合当前流式部件（`end_streaming_part`），工具前后的正文各自拥有独立段编号。前端新增 `streamCursor.ts` 按会话、按流分别存游标，按「本次连接请求了什么」分发，回放帧按段编号幂等合并，删除旧守卫，跨轮帧绝不并进上一轮，画布反哺 L1/L2 缓存（防抖 800ms + 回合收尾与变更时强制写入），压缩时显示只增不减，会话变更即时作废游标并清空服务端失效缓冲。
+  - **验证与交付**: `tsc --noEmit` 干净；webui 477 项单测全过；daemon 401 项 lib 测试全过；`cargo check --lib -p jeikcode-daemon` 通过。
+
+## v7.2.2-beta.3 (2026-10-12)
+
+- **[WebUI Live Streaming & Turn Settlement] Unblock multi-round live streaming and auto-reconcile disk at turn boundary**:
+  - **Technical Root Cause / Detail**: In turns involving tool executions, Round 1 (tool execution) stamped the assistant bubble with `last.id = "m-round-1"`. When Round 2 (final summary response text) began streaming with a new round identity (`message_id: "m-round-2"`), the anti-ghost-replay gate `mayPaintUnroutedDelta` erroneously rejected all live text deltas because `last.id` was already set. Consequently, live streaming of the final text after tool execution was completely dropped on the canvas, only appearing after manual page refresh or window blur triggered disk reconciliation.
+  - **Implementation Mechanism**: Unblocked live streaming by ensuring `mayPaintUnroutedDelta` unconditionally permits live streaming deltas (`replay === false`), guaranteeing real-time token-by-token rendering on screen during active LLM generation. Enhanced `identifiedAssistantIndex` to match both `message.id === messageId` and any part whose id starts with `${messageId}:`, enabling multi-round assistant bubbles to route subsequent events cleanly. Added `settleDiskCatchUp` with a `force` option to proactively reconcile disk state upon turn completion (`settleToIdleWatch`), user stop (`handleStop`), or premature stream closures without waiting for window blur.
+  - **Verification & Testing**: Added regression test `live streaming of multi-round turn (tools in round 1, final text in round 2) is NEVER blocked` in `sessionProjection.test.ts`. All 479 WebUI tests pass, `tsc --noEmit` is clean, and `npm run build` succeeds.
+
+---
+
+- **[WebUI 实时流式传输与回合结算] 放行多轮工具后实时流式输出，并在回合收尾时主动对账磁盘**:
+  - **技术机理 / 现象溯源**: 当回合包含工具调用时，Round 1（工具轮）为助手气泡盖上了 `last.id = "m-round-1"`。随后 Round 2（最终回复正文）带着新分配的 `message_id: "m-round-2"` 推流到达时，画布拦截守卫 `mayPaintUnroutedDelta` 因发现 `last.id` 已存在而错误地拒绝了所有实时文本增量。导致工具执行后的最终正文在推流期间完全无法在画布渲染，只响铃弹通知，正文必须等到用户手动刷新或窗口失焦触发磁盘回读后才显现。
+  - **实现防线 / 核心改动**: 彻底放行实时推流：`mayPaintUnroutedDelta` 增加 `!replay` 检查，在直播推流状态（`replay === false`）下 100% 放行，确保活动生成期间实时逐字上屏。强化轮次部件前缀索引：`identifiedAssistantIndex` 除了比对 `message.id` 外，新增按部件前缀 `${messageId}:` 匹配，打通同一气泡跨多轮次（多 round）的精准寻址。回合收尾磁盘对账：新增 `settleDiskCatchUp`（携带 `force` 选项），在终态到达、用户停止或长连接意外提前关闭等收尾时机主动补偿拉取磁盘，无需等待窗口失焦。
+  - **验证与交付**: 在 `sessionProjection.test.ts` 中新增多轮工具调用后最终正文实时推流回归测试；全量 479 项 WebUI 单元测试 100% 通过；`tsc --noEmit` 0 报错；`npm run build` 成功。
+
+## v7.2.2-beta.2 (2026-10-12)
+
+- **[WebUI & Daemon Interaction] Robust send-now, idempotent turn replay, and todolist replay dedup**:
+  - **Technical Root Cause / Detail**: Three replay/stop consistency defects. (1) "Send now" never stopped the running turn: `handleSendImmediately` only tried `requestIdRef.current`, which is cleared as soon as POST /chat is admitted, so the stop was skipped entirely and the immediate delivery hit 409 session_busy — the card flashed and bounced back into the queue. (2) The canvas projection appended any replay frame whose `message_id` was missing from the canvas to the LAST assistant row; a mid-turn steer splits a turn into several assistant rows, so old body/reasoning was repainted into the newest bubble on every reconnect — the background session cache had dropped the wire id when painting, and the id-less row was later adopted as the canvas and persisted to IndexedDB. (3) `todowrite` is stateless and a full plan / batch add replaces the whole list, so re-folding a replayed call restored the statuses frozen in that call's arguments; the idempotency key was deleted exactly when the list completed, was not persisted across refresh, and was seeded by overwriting (visible window only) — which is why a fully checked list reverted after a refresh.
+  - **Implementation Mechanism**: `stopRunningTurn` becomes the single stop channel shared with the stop button (session id + request id aliases); `POST /chat/stop` reports an authoritative `released` verdict and waits for the real release (no 2.5 s cap, false while a native-runtime turn still occupies the session). Queue cards are dequeued only when the message actually becomes content (`dispatchQueuedCard`), and every queue mutation goes through `persistSessionQueue` / `updateQueuedForSession` so the in-memory map, localStorage and the backend `/chat/queue` stay identical. Every canvas writer stamps the wire identity (background cache via `paintCachedAssistantDelta`, tool rows via `withAssistantIdentity`), `mayPaintUnroutedDelta` refuses to paint an unrouted frame when the trailing assistant row already owns another identity so replays stay byte-identical, and a healthy `/chat/watch` is no longer torn down on every focus/visibility change. New `todoAppliedIds` persists the applied call-id set per session (localStorage, synchronous hydration, merge-only seeds, never cleared on completion).
+  - **Verification & Testing**: webui 472 unit tests pass (new regression tests for stop aliases and the programmatic stop mark, projection idempotency, background-cache identity stamping, and the replayed-plan revert); `tsc --noEmit` clean; `npm run build` succeeds; `cargo check --lib -p jeikcode-daemon` and the two targeted `stop_and_wait` tests pass.
+
+- **[Repository Hygiene] Pinned LF line endings via `.gitattributes` + `.editorconfig`**:
+  - **Technical Root Cause / Detail**: Line endings were unpinned (no `.gitattributes`, `core.autocrlf=true`), so the working tree was checked out as CRLF while the index stored LF; any tool rewriting a file with its own EOL style left *mixed* endings behind, and the next save produced a whole-file whitespace diff with zero content change.
+  - **Implementation Mechanism**: `* text=auto eol=lf`, with CRLF explicitly kept for `*.bat`/`*.cmd`/`*.ps1` and binary assets marked `binary`; `.editorconfig` aligns editors and formatters (LF, final newline, no trailing whitespace, Rust at 4-space indent, Markdown exempt). The index already stored LF for 1172 of 1173 text files, so this is a zero-churn change.
+  - **Verification & Testing**: `git check-attr` confirms the rules; the 7 previously mixed-endings files were normalized on disk with unchanged git content; `git hash-object --path` matches the index blob for CRLF working-tree samples (zero churn).
+
+- **[WebUI & Docs / MCP Trust] Auto-confirm MCP project trust, capability switches become the only authority**:
+  - **Technical Root Cause / Detail**: The sidebar rendered a "blocked N MCP server(s) from an untrusted project" banner plus a "Trust this project" button, so enabling a project-level MCP server always ended in an authorization prompt.
+  - **Implementation Mechanism**: The WebUI now confirms that trust silently and never prompts (`maybeAutoTrustProjectMcp`); toggling a capability ON clears the gate first (`onToggleCapability`) while OFF never touches it; new `webui/src/lib/mcpTrust.ts` isolates the policy as pure functions with regression tests; project switches revalidate the capability list; the dead `mcp.trustProject` copy and styles were removed and the docs now state the boundary — the trust gate only audits whether a server MAY load, while the GLOBAL/PROJECT switches decide whether it DOES load.
+  - **Verification & Testing**: `npm run build` and `node --test` (478/478, including the new trust-policy cases) pass.
+
+---
+
+- **[WebUI 与 Daemon 交互] 立即发送可靠化、回合重放幂等与 todolist 重放去重**:
+  - **技术机理 / 现象溯源**: 三类停止/重放一致性缺陷：（1）“立即发送”从未真正停止运行中的回合——`handleSendImmediately` 只尝试 `requestIdRef.current`，而它在 POST /chat 被 admit（202）之后即被清空，停止被整体跳过，紧接着的投递必然撞上 409 session_busy，卡片闪一下又弹回队列；（2）画布投影会把“`message_id` 在画布上找不到”的重放帧追加到最后一条 assistant 上，而中途 steer 会把一个 turn 劈成多条 assistant 行，于是旧正文/思考每次重连都被画进最新气泡——根源是后台会话缓存落笔时丢掉了 wire 身份，缺 id 的行随后被采用为画布并写入 IndexedDB；（3）`todowrite` 无状态，全量 plan / 批量 add 是整表替换，重复折叠重放帧就会把清单打回该调用参数里冻结的状态，而幂等键恰好在清单全完成时被删除、不跨刷新持久化、种子是覆盖式（只看得到当前窗口），所以“全部打钩”的清单刷新后会回退。
+  - **实现防线 / 核心改动**: `stopRunningTurn` 成为与“停止”按钮共用的唯一停止通道（会话 id + request id 双别名）；`POST /chat/stop` 返回权威 `released` 结论并等待真正离场（去掉 2.5s 上限，native runtime 仍占用时保持 false）。队列卡片只在消息真正成为正文时才出队（`dispatchQueuedCard`），所有队列变更统一走 `persistSessionQueue` / `updateQueuedForSession`，保证内存映射、localStorage 与后端 `/chat/queue` 三处一致。所有画布写入者统一盖章 wire 身份（后台缓存经 `paintCachedAssistantDelta`，工具行经 `withAssistantIdentity`），新增 `mayPaintUnroutedDelta` 在末行已属别轮时拒绝落笔（同一帧重放任意多次，画布一字不变），健康中的 `/chat/watch` 不再在每次失焦/可见性变化时被拆除。新增 `todoAppliedIds`：按会话持久化“已消费的调用 id”（localStorage、同步水合、种子只并入、全完成不清空）。
+  - **验证与交付**: webui 472 项单测全绿（新增停止别名/程序化停止标记、投影幂等、后台缓存身份盖章、重放 plan 不得回退的回归测试）；`tsc --noEmit` 干净；`npm run build` 成功；`cargo check --lib -p jeikcode-daemon` 与两个 `stop_and_wait` 定向单测通过。
+
+- **[仓库卫生] 行尾约定钉死：`.gitattributes` + `.editorconfig`**:
+  - **技术机理 / 现象溯源**: 行尾此前未被钉死（无 `.gitattributes` 且 `core.autocrlf=true`）：索引存 LF、工作区检出为 CRLF，任何工具按自己的行尾风格重写文件都会留下 mixed 行尾，下一次保存就产出“整片空白 diff、内容零变化”的噪音。
+  - **实现防线 / 核心改动**: `* text=auto eol=lf`，`*.bat`/`*.cmd`/`*.ps1` 显式保留 CRLF，二进制资产标记 `binary`；`.editorconfig` 对齐编辑器/格式化器（LF、末尾换行、不留尾部空白，Rust 4 空格，Markdown 豁免）。索引中 1172/1173 个文本文件本就是 LF，因此零内容变更。
+  - **验证与交付**: `git check-attr` 确认规则生效；7 个 mixed 行尾文件已在工作区归一且 git 内容不变；`git hash-object --path` 与索引 blob 逐字节一致（零 churn）。
+
+- **[WebUI 与文档 / MCP 信任] MCP 项目信任自动确认，能力开关成为是否加载的唯一权威**:
+  - **技术机理 / 现象溯源**: 侧栏原先渲染“已拦截 N 个来自不受信任项目的 MCP server”横幅与“信任本项目”按钮，导致每次启用项目级 MCP 都要过一次授权提示。
+  - **实现防线 / 核心改动**: WebUI 静默完成该信任、不再弹任何提示（`maybeAutoTrustProjectMcp`）；开关 ON 前先清信任闸门（`onToggleCapability`），OFF 永不触碰信任闸门；新增 `webui/src/lib/mcpTrust.ts` 纯策略函数与回归测试；项目切换时重新校验能力列表；删除失效的 `mcp.trustProject` 文案与样式，文档统一到“信任闸门只管能不能加载，全局/项目开关决定是否加载”。
+  - **验证与交付**: `npm run build` 与 `node --test`（478/478，含新增信任策略用例）通过。
+
+## v7.2.2-beta.1 (2026-10-12)
+
+- **[Unified Tool-Output Compression (capabilities/kernel/config)]**:
+  - **Technical Root Cause / Detail**: Two independent mechanisms — a 64 KiB artifact fold at execution time and a 24 KiB wire prune at request time — left the 24–64 KiB band trimmed for the model with NO retrieval handle, and the terminal class had no dedicated line.
+  - **Implementation Mechanism**: One compression seam at tool return (`ArtifactMiddleware`): non-exempt results above `[tools.tool_output] max_bytes` (default 64 KiB) and terminal (`run_command` / `bash`) results above `min(max_bytes, terminal_max_bytes)` (default 24 KiB) become a uniform head 1500 + tail 2200 preview carrying the `artifact_id` handle (`fetch_output(artifact_id=...)`); the full text is spilled to the artifact store first, so the handle always resolves. `terminal_max_bytes` is configurable (config.toml + `JEIKCODE_TOOL_OUTPUT_TERMINAL_THRESHOLD_BYTES`, env wins; `0` follows `max_bytes`). The kernel's `adaptive_prune_tool_output_for_llm` / `prune_messages_for_wire` are deleted; `model_history()` is verbatim.
+  - **Verification & Testing**: kernel lib 131; capabilities lib 936 (terminal split, alias, config override, uniform preview); coding artifact wiring roundtrip; config 245; workspace `check --all-targets`; `cargo fmt --check` clean.
+
+- **[Kernel: Watermark Context Budget, Canonical Tool Names & Deterministic MCP Teardown]**:
+  - **Watermark Budget**: `[models.X] max_tokens` is a capability declaration and per-protocol output budget — never context math. `effective_input_limit` is replaced by `input_watermark_budget` = window − min(20K, window/4); the wire sends the declared value verbatim; auto-compaction, the pre-send guard and `CompactionView` share one denominator; `compact_threshold` moves to 0.9 of the watermark, killing the "warns every turn but never compacts" gap (the reported 491K warning at 49% on a 1M window). The model editor offers 32K/64K/128K/256K/384K tiers + custom.
+  - **Tool-Name Retirement**: `read_file`→`read` (now also lists directories), `list_directory` dropped, `write_file`→`write`, `edit_file`→`edit`; legacy names remain dispatch aliases only. Real defects fixed with it: compaction's "never stub file reads" exemption compared the literal `read_file` (now `is_file_read_tool`), the wander meter missed `read`, goal summaries only collected legacy names, the reviewer mounted the purged `list_directory`, tuix/daemon file-class arms lacked canonical names, and model-facing prose was aligned.
+  - **MCP Child Lifecycle**: the last `SessionMcpLease` drop parked the process for an async TTL reaper that lives ON the runtime — a host that tears its runtime down (tests / one-shot CLI / embedded SDK) could never run it, leaking the npx/cmd/node tree while `Runtime::drop` waited forever on the child's still-open stdout. Added `McpClient::kill_now` / `StdioClient::kill_now`, `McpRegistry::kill_all_children_now` and a process-global weak registry; the last owner now reaps synchronously unless the host's idle reaper has proven itself.
+  - **Verification & Testing**: `cargo check --lib -p jeikcode-daemon`; kernel 131 lib + integration; capabilities 927 lib + compaction_cache/tools_integration; coding 366 lib + full_assembly (un-ignored, ~2.4s) / plan_mode / sensitive_path / tool_args_repair / system_context; review 67+1; tuix display/format 30; webui build.
+
+- **[Git-Bash/MSYS Reliability: Paths, Background PIDs & Mixed-Encoding]**:
+  - **Technical Root Cause / Detail**: Git-Bash/MSYS integration made tool paths and background tasks unreliable on Windows: POSIX-polluted `TMP`/`TEMP` reached child shells, `$VAR`/`%VAR%` handling was inconsistent, background reports carried the wrapper PID only, and a single GBK line garbled neighbouring UTF-8 lines.
+  - **Implementation Mechanism**: one `special_dirs` source for `$TMPDIR`/`$TMP`/`$TEMP`/`$DESKTOP`/`$HOME` (desktop registry-backed); tool path params accept `$VAR`/`${VAR}`/`%VAR%` plus one quote pair with undefined names kept verbatim (fail-closed); temp normalized end to end (`BASH_ENV` rc re-exports native values, `TMPDIR_WIN`/`DESKTOP_WIN` alias handles, host env sanitized at three entry points); background tasks report the workload's two real ids (`WinPID` + Git-Bash pid, leaf via Toolhelp) with the exact stop recipe; readiness probes detected ports on 127.0.0.1; `decode_mixed_span` decodes per same-class line run; `//X`→`/X` and native `/dev/null`→`NUL` normalization.
+  - **Verification & Testing**: `tools::bash` 143/143, `tools_integration` 11/11 (real background start/stop with the printed recipe), `special_dirs` 6/6, `pathutil` 12/12, `mixed_encoding` 4/4, `bash_runtime` 14/14, registry consistency 18/18, reminder 9/9, `temp_env_sanitize` 1/1.
+
+- **[Pipeline Identity & the Cross-Instance Incremental Event Bus (kernel/daemon/webui)]**:
+  - **Technical Root Cause / Detail**: Without a stable per-part identity, live streaming, refresh and session switching produced ordering errors, card resurrection and ghost answer replay.
+  - **Implementation Mechanism**: kernel `Message.id` + a new `AgentEvent::UserMessage` boundary event; `SteeredInput` carries the landed `message_id`; daemon `message_id`/`part_id`/`part_seq` on chat/live deltas; replay merging scoped by `message_id`/`part_id`; id-driven render keys and directed painting in the WebUI (`withAssistantIdentity` uniqueness guard, whitespace-delta self-healing); a process-wide broadcast bus + `GET /events` incremental channel (`session_upsert`/`session_deleted`/`activity`/`review_asked`/`review_resolved`) with a route-level SSE test.
+  - **Verification & Testing**: `cargo check --workspace --all-targets`; daemon lib tests; webui `tsc`, `node --test`, production build.
+
+- **[Single Home-Root Derivation & Thread-Local Test Home Seam]**:
+  - **Technical Root Cause / Detail**: every path layer re-implemented the home rule (env → legacy → real home); tests repointed the process-wide environment, so one test's `update_config` rewrote the file another test was asserting on (observed: a provider key resolved to "").
+  - **Implementation Mechanism**: `capabilities::paths::config_dir` delegates to `Config::resolve_config_dir`; `Config::config_dir` memoizes production resolution in a `OnceLock`; all 91 `set_var` sites on `JEIKCODE_HOME`/`TMPDIR`/`TMP`/`TEMP` across 22 files move to a thread-local home override (`IsolatedHome::at`); kernel `isolate_home` resolves through the POSIX-normalized resolver; a source-scanning guard fails the build for new `set_var` sites outside the two sanctioned startup points (backlog now empty).
+  - **Verification & Testing**: capabilities lib 927/927, coding lib 364/364, daemon lib 396/396 (x3), env guard green, workspace `--all-targets` clean.
+
+- **[Prompt/Persona Baseline Resolution (coding)]**:
+  - **Technical Root Cause / Detail**: an existing-but-empty prompts dir was treated as the whole persona set (silently dropping the embedded baseline — PROHIBITIONS vanished); routing resolution solely through `Config::config_dir()` dropped the real-home fallback and removed the `<environment>` block.
+  - **Implementation Mechanism**: an absent dir yields `None` while the interim `exists()` gate is reverted (a not-yet-existing dir is the normal state — persona assembly seeds it from embedded defaults); resolution order keeps the thread-local test override, then env → `~/.jeikcode/prompts`; init prompts fall back to the embedded baseline; the prompt cache gains `invalidate_cache_for_test()`; `system_context` asserts design-independent invariants.
+  - **Verification & Testing**: `system_context` 2/2, coding suite green.
+
+- **[Tool-Name & Alias Convergence Across the Stack]**:
+  - **Edit repair (#38)**: `extract_edit_file_args` matched only the literal `edit_file`, so a modern `edit` call with unescaped quotes fell through to generic extraction; a single `is_edit_tool_name` now covers both names and all four check sites converge on it.
+  - **Daemon formatting (#40)**: artifact extraction and `format_tool_args` were hardcoded to legacy names/`file_path`; now `write|write_file|create_file|edit|edit_file`, `path` before `file_path`, `command` or `cmd`, plus modern `read`/`write`/`edit`/`run_command`/`code_explore`/`task` formatting.
+  - **Worker scope gate**: `WorkerScope::violation` matched a hardcoded list and allowed anything else, so `create_file` silently escaped a worker's declared scope; the name set now lives once (`FILE_MUTATION_TOOLS` / `is_file_mutation_tool` + `is_search_replace_tool`).
+  - **todo `list` (read-only first-class)**: the legacy `{"action":"list"}` shape half-worked (summary/apply returned an error merely carrying the list, with a self-contradictory hint); it is now a real read-only action (short-circuit, no-op fold, batch rejection, schema advertises `list` plus the long-accepted `remove`).
+  - **Edit ambiguity**: mixing `edits[]` with a top-level `replace_all` is a loud error; a missing `old_string` names the exact `edits[N]` index; occurrence-vs-replace_all precedence documented and pinned.
+  - **TUix**: legacy `list` action recognized, mid-stream `/clear` and `/new` whitelisted, `format_tool_detail("read", …)` accepts `file_path`/`path`, and the never-passable auth-gated login tests are deleted with a comment.
+  - **Verification & Testing**: focused unit regressions per area (capabilities 931, tool_format_tests 69/69, menu_tests 54/54, write_approval 18/18).
+
+- **[Security & Indexing: `code_explore` Sensitivity + Graph-Only Credential Ignores (#41)]**:
+  - **Technical Root Cause / Detail**: `SensitivePathGate` only resolved targets for `read`/`read_file`/`grep`/`glob`, so a `code_explore` on a benign symlink pointing at credentials bypassed the prompt; and the shipped `.codegraphignore` (with `.env`/`.env.*`) applied to BOTH the graph and the search walk, so an explicit glob/grep silently lost `.env.local` (green in isolation, red in the full suite).
+  - **Implementation Mechanism**: `code_explore` joins `local_tool` + `local_read_target` with symlink-intercept tests; the ignore list splits into `.codegraphignore` (noise, both scopes) and the new graph-only `.codegraphignore.graph` (`.env*`, `.ssh/`, `*.pem`, `*.key`, `id_rsa*`/`id_ed25519*`), registered in `BUNDLED_ASSETS` (+ localized description) so upgrades receive it as a default-selected New diff.
+  - **Verification & Testing**: `--all-features` suite 1644 passed / 0 failed / 1 ignored (previously never finished); default suite 928; tools::glob 24/24; an integration test locks the asset diff.
+
+- **[Grep Correctness & Windows Path Normalization]**:
+  - **Lenient braces**: rust's regex parser treats any unescaped `{` as a quantifier, so `.sidebar {` failed pattern build and silently degraded; `escape_bare_braces`/`build_regex_lenient` keep legal quantifiers and escape the rest (PCRE/GNU ERE aligned), with an `is_regex=true` guidance line on zero-hit patterns containing bare `.`/`{`/`}`.
+  - **Missing target**: a non-existent path now searches the same-named candidate, then the nearest existing ancestor directory, stating the fallback in the output header.
+  - **UNC (#39)**: `strip_verbatim` was case-sensitive on `\?\UNC\`/`\??\UNC\`, corrupting lowercase verbatim UNC paths into `unc\server\share`; all verbatim UNC forms (backslash + slash) now normalize case-insensitively to canonical UNC.
+
+- **[Subagents Gain `code_explore` (#37)]**: `child_reg` never registered codeintel tools, so explore/worker subagents calling the flagship semantic graph failed with "tool not found" and fell back to flat grep; `codeintel` now mounts into `child_reg` and `code_explore` joins both profiles, with parts.rs regressions.
+
+- **[WebUI: Mermaid Labels, Power Switches & Eye-Care Palette]**:
+  - **Mermaid**: DOMPurify's SVG namespace validation stripped HTML inside `foreignObject`, making all flowchart labels vanish; foreignObject inner HTML and outer SVG are now sanitized separately under their respective profiles and restored via placeholder tokens, preserving labels, line breaks and KaTeX while keeping strict XSS protection.
+  - **Theming**: circular IEC 5009 power-key switches (energised green micro-glow / red standby glow, press-scale micro-interactions, spinning busy glyph) and a low-glare matte-slate light palette (#f4f5f7 / #eaecee) with deepened borders, darker typography, deep forest-green success/JSON tones, a deep-amber reasoning accent, and light-mode overrides for settings surfaces.
+
+- **[CI & Suite Hygiene]**:
+  - **TUI suite gated**: `ci.yml` / `portability.yml` now run `cargo test -p jeikcode-tuix --lib -- --test-threads=1` (1,700+ tests previously only exercised locally), and `retained_small_frame_single_write` pins the Unix DA1 parser query separately (adapted from PR #44).
+  - **Hermetic all-features suite**: isolated-home guard lifetime fixed (an unsafe-block-bound guard dropped immediately, reading the developer's real `~/.jeikcode/mcp.json`), plugin fixtures built with `serde_json`, trusted-domain expectations gated on the live list, the glob hidden-file test serialized, the explore workspace-root test bounded + ignored; rustfmt passes folded in for files CI's check-only policy left unformatted.
+  - **Coding integration convergence**: `full_assembly` asserts prompt layout by shape (60s bounded drive loop, phase-labelled panics); `permission_grants` encodes correct allow-always semantics and canonical `write` (the fixture's `../..` path is an unresolved parent traversal that is deliberately never remembered).
+  - **Portability gate**: the native-temp assertion in `special_dirs` is platform-gated — a leading `/` is POSIX pollution only on Windows; on Unix it IS the native form, so the slash/drive checks run under `cfg!(windows)` (the first real cross-platform run of this batch caught it).
+  - **Process**: `AGENTS.md` now requires bilingual commit bodies (English pass, `---`, Chinese pass).
+
+---
+
+- **[统一工具输出压缩（capabilities/kernel/config）]**:
+  - **技术机理 / 现象溯源**: 执行时的 64 KiB 折叠与请求时的 24 KiB wire 裁剪是两套独立机制，导致 24–64 KiB 区间被裁剪后**没有任何取回钥匙**，且终端类没有专属线。
+  - **实现防线 / 核心改动**: 压缩只保留一处——工具返回时的 `ArtifactMiddleware`：非豁免结果超过 `[tools.tool_output] max_bytes`（默认 64 KiB）、终端（`run_command` / `bash`）结果超过 `min(max_bytes, terminal_max_bytes)`（默认 24 KiB）时，统一改写为「头 1500 + 尾 2200 字节」预览并携带 `artifact_id` 钥匙（`fetch_output(artifact_id=...)`）；改写前先落盘全量文本，钥匙永远可解析。`terminal_max_bytes` 可配置（config.toml + `JEIKCODE_TOOL_OUTPUT_TERMINAL_THRESHOLD_BYTES`，env 优先；`0` 表示跟随 `max_bytes`）。内核的 `adaptive_prune_tool_output_for_llm` / `prune_messages_for_wire` 整体删除，`model_history()` 不再二次改写。
+  - **验证与交付**: kernel lib 131；capabilities lib 936（终端分档、别名、配置覆盖、均匀预览）；coding artifact 接线往返；config 245；全工作区 `check --all-targets`；fmt 干净。
+
+- **[内核：水位上下文预算、权威工具名与 MCP 子进程确定性回收]**:
+  - **水位预算**: `[models.X] max_tokens` 是能力声明与各协议输出预算，绝不进入上下文计算；`effective_input_limit` 改为 `input_watermark_budget` = 窗口 − min(20K, 窗口/4)，wire 按声明值原样下发；自动压缩、发前守卫与 `CompactionView` 共用同一分母；`compact_threshold` 提到水位 0.9，消除「每轮报警但从不压缩」死区（即 1M 窗口上的 491K / 49% 误报）。模型面板提供 32K/64K/128K/256K/384K 档 + 自定义。
+  - **工具名退役**: `read_file`→`read`（兼列目录）、`list_directory` 删除、`write_file`→`write`、`edit_file`→`edit`，旧名仅作分发别名。随之修复的真实缺陷：压缩的「不打桩文件读取」豁免对 `read` 静默失效（改用 `is_file_read_tool`）、wander 漏数 `read`、goal 摘要清单恒空、review 挂载已删工具、tuix/daemon 文件类分支缺 canonical、模型可见文案全面对齐。
+  - **MCP 生命周期**: 最后一个租约 drop 只把进程「停放」给活在运行时上的异步 reaper —— 销毁运行时的宿主（测试 / 一次性 CLI / 嵌入式 SDK）永远跑不到它，npx/cmd/node 进程树泄漏且 `Runtime::drop` 永久等待子进程未关闭的 stdout。新增 `McpClient::kill_now` / `StdioClient::kill_now`、`McpRegistry::kill_all_children_now` 与进程级弱登记表；最后一个 owner 在宿主 reaper 未证明可用时同步回收。
+  - **验证与交付**: `cargo check --lib -p jeikcode-daemon`；kernel 131 lib + 集成；capabilities 927 lib + compaction_cache/tools_integration；coding 366 lib + full_assembly（解禁，~2.4s）/ plan_mode / sensitive_path / tool_args_repair / system_context；review 67+1；tuix 30；webui build。
+
+- **[Git-Bash/MSYS 可靠性：路径、后台 PID 与混合编码]**:
+  - **技术机理 / 现象溯源**: Windows 上 Git-Bash/MSYS 集成让工具路径与后台任务不可靠：被 POSIX 污染的 `TMP`/`TEMP` 进入子 shell、`$VAR`/`%VAR%` 处理不一致、后台只报包装进程 PID、一行 GBK 污染相邻 UTF-8 行。
+  - **实现防线 / 核心改动**: `special_dirs` 单一事实源（`$TMPDIR`/`$TMP`/`$TEMP`/`$DESKTOP`/`$HOME`，桌面走注册表）；工具路径参数支持 `$VAR`/`${VAR}`/`%VAR%` 与一层引号，未定义变量原样保留（fail-closed）；temp 全链路原生化（`BASH_ENV` rc 重导出、`TMPDIR_WIN`/`DESKTOP_WIN` 别名、三入口清理宿主 env）；后台任务回报工作负载两个真实 ID（`WinPID` + Git-Bash pid，Toolhelp 取叶子）与可照抄停止配方；端口在 127.0.0.1 就绪探测；`decode_mixed_span` 按同类行段解码；`//X`→`/X`、原生 `/dev/null`→`NUL` 归一。
+  - **验证与交付**: `tools::bash` 143/143、`tools_integration` 11/11（真实后台起停 + 配方照抄）、`special_dirs` 6/6、`pathutil` 12/12、`mixed_encoding` 4/4、`bash_runtime` 14/14、注册表一致性 18/18、提醒 9/9、`temp_env_sanitize` 1/1。
+
+- **[管线身份与跨实例增量事件总线（kernel/daemon/webui）]**:
+  - **技术机理 / 现象溯源**: 缺少稳定的部件身份时，流式、刷新与切会话会产生错序、卡片复活与幽灵回放。
+  - **实现防线 / 核心改动**: kernel `Message.id` + 新 `AgentEvent::UserMessage` 边界事件；`SteeredInput` 携带落盘 `message_id`；daemon 在 chat/live 增量上带 `message_id`/`part_id`/`part_seq`；回放合并按 `message_id`/`part_id` 作用域；WebUI 按 id 定向落笔与渲染键（`withAssistantIdentity` 唯一性守卫、空白增量自愈）；进程级广播 + `GET /events` 增量通道（`session_upsert`/`session_deleted`/`activity`/`review_asked`/`review_resolved`）并附路由级 SSE 测试。
+  - **验证与交付**: `cargo check --workspace --all-targets`；daemon lib 测试；webui `tsc`、`node --test`、生产构建。
+
+- **[单一 home 根推导与线程级测试 home 缝]**:
+  - **技术机理 / 现象溯源**: 各路径层各自重写 home 规则（env → legacy → 真实 home）；测试改向进程级环境变量，导致一个测试的 `update_config` 重写另一个测试正在断言的文件（实测 provider key 解析成 ""）。
+  - **实现防线 / 核心改动**: `capabilities::paths::config_dir` 委派 `Config::resolve_config_dir`；`Config::config_dir` 用 `OnceLock` memo 生产解析；22 个文件里 91 处 `set_var` 全部改为线程级 home 覆盖（`IsolatedHome::at`）；kernel `isolate_home` 走 POSIX 归一解析；源码扫描守卫对新增 `set_var` 直接判失败（历史清单已清空）。
+  - **验证与交付**: capabilities lib 927/927、coding lib 364/364、daemon lib 396/396（×3）、env 守卫绿、workspace `--all-targets` 干净。
+
+- **[提示词/persona 基线解析（coding）]**:
+  - **技术机理 / 现象溯源**: 「目录存在但为空」被当成完整 persona 集，静默丢掉内嵌基线（PROHIBITIONS 消失）；只走 `Config::config_dir()` 丢掉真实 home 回退，`<environment>` 块整体消失。
+  - **实现防线 / 核心改动**: 目录不存在返回 `None`，期间引入的 `exists()` 门回滚（目录尚不存在是正常态——组装会从内嵌默认 seed）；解析顺序保留线程级覆盖，再 env → `~/.jeikcode/prompts`；init 提示词回退内嵌基线；提示词缓存新增 `invalidate_cache_for_test()`；`system_context` 改断言与设计无关的不变量。
+  - **验证与交付**: `system_context` 2/2，coding 套件全绿。
+
+- **[全栈工具名与别名收敛]**:
+  - **edit 修复（#38）**: `extract_edit_file_args` 只认字面 `edit_file`，现代 `edit` 调用（含未转义引号）落到通用提取；新增单一真源 `is_edit_tool_name` 并收敛四处检查点。
+  - **daemon 格式化（#40）**: artifact 提取与 `format_tool_args` 硬编码旧名/`file_path`；现支持 `write|write_file|create_file|edit|edit_file`、`path` 优先于 `file_path`、`command` 或 `cmd`，并补齐 `read`/`write`/`edit`/`run_command`/`code_explore`/`task` 格式化。
+  - **worker 作用域门**: `WorkerScope::violation` 用硬编码名单、其余一律放行，`create_file` 可静默绕过声明作用域；名字集合收敛为 `FILE_MUTATION_TOOLS` / `is_file_mutation_tool` + `is_search_replace_tool`。
+  - **todo `list` 一等公民**: 老形态 `{"action":"list"}` 此前半支持（返回夹带清单的错误与自相矛盾提示）；现为真正只读动作（短路回显、no-op 折叠、批次拒绝、schema 广告 `list` 与早已接受的 `remove`）。
+  - **edit 歧义**: `edits[]` 与顶层 `replace_all` 混用改为响亮报错；缺 `old_string` 点名 `edits[N]`；occurrence 与 `replace_all` 优先级文档化并用回归锁定。
+  - **TUix**: 识别 legacy `list`、流式中放行 `/clear` 与 `/new`、`format_tool_detail("read", …)` 同时接受 `file_path`/`path`、删除永远无法通过的账号登录测试并注明。
+  - **验证与交付**: 各区域定向回归（capabilities 931、tool_format_tests 69/69、menu_tests 54/54、write_approval 18/18）。
+
+- **[安全与索引：`code_explore` 敏感路径 + 图谱专用凭据忽略（#41）]**:
+  - **技术机理 / 现象溯源**: `SensitivePathGate` 只为 `read`/`read_file`/`grep`/`glob` 解析目标，`code_explore` 经良性符号链接指向凭据可绕过审批；内置 `.codegraphignore`（含 `.env`/`.env.*`）同时作用于建图与搜索遍历，显式 glob/grep 会静默丢失 `.env.local`（单跑绿、全套红）。
+  - **实现防线 / 核心改动**: `code_explore` 加入 `local_tool` + `local_read_target` 并附符号链接拦截测试；忽略清单拆为 `.codegraphignore`（噪声，双作用域）与新增图谱专用 `.codegraphignore.graph`（`.env*`、`.ssh/`、`*.pem`、`*.key`、`id_rsa*`/`id_ed25519*`），注册进 `BUNDLED_ASSETS`（含本地化描述），升级用户以默认勾选的 New 差异收到。
+  - **验证与交付**: `--all-features` 全套 1644 passed / 0 failed / 1 ignored（此前跑不完）；默认套件 928；tools::glob 24/24；集成测试锁定资产差异。
+
+- **[grep 正确性与 Windows 路径归一]**:
+  - **花括号宽容**: rust regex 把任何未转义 `{` 当量词，`.sidebar {` 会让模式构建失败并静默降级；`escape_bare_braces`/`build_regex_lenient` 保留合法量词、其余转义（对齐 PCRE/GNU ERE），零命中且含裸 `.`/`{`/`}` 时追加 `is_regex=true` 引导。
+  - **目标缺失兜底**: 路径不存在时先找同名候选、再退最近已存在祖先目录，并把落空事实写进输出头部。
+  - **UNC（#39）**: `strip_verbatim` 对 `\?\UNC\`/`\??\UNC\` 大小写敏感，小写 verbatim UNC 会被毁成 `unc\server\share`；现所有 verbatim UNC 形态（反斜杠 + 斜杠）大小写不敏感归一到规范 UNC。
+
+- **[子代理获得 `code_explore`（#37）]**: `child_reg` 从不注册 codeintel 工具，explore/worker 子代理调用旗舰语义图谱时报 "tool not found"、退回扁平 grep；现 `codeintel` 挂入 `child_reg`，`code_explore` 进入两个 profile，parts.rs 附回归。
+
+- **[WebUI：Mermaid 标签、电源开关与护眼配色]**:
+  - **Mermaid**: DOMPurify 的 SVG 命名空间校验会剥掉 `foreignObject` 内的 HTML，流程图节点标签全部消失；现将 foreignObject 内层 HTML 与外层 SVG 分别按各自 profile 净化并用占位符还原，标签、换行与 KaTeX 全保留，同时维持严格 XSS 防护。
+  - **主题**: 圆形 IEC 5009 电源按键（通电绿色微光 / 红色待机辉光、按压缩放微交互、忙碌旋转）与低眩光哑光石板亮色配色（#f4f5f7 / #eaecee），加深描边与文字、成功/JSON 深森林绿、思考深琥珀色，并为设置面板补亮色覆盖。
+
+- **[CI 与测试套件治理]**:
+  - **TUI 套件门禁**: `ci.yml` / `portability.yml` 现跑 `cargo test -p jeikcode-tuix --lib -- --test-threads=1`（1700+ 单测此前只在本地被跑到）；`retained_small_frame_single_write` 单独钉住 Unix DA1 查询（改自 PR #44）。
+  - **all-features 套件密闭化**: 修复 unsafe 块内即析构的 isolated-home guard（此前读开发机真实 `~/.jeikcode/mcp.json`）、插件夹具改用 `serde_json`、信任域期望按实时表 gate、glob 隐藏文件测试串行化、explore workspace-root 测试加有界护栏并 `#[ignore]`；并入 CI 只 check 未 fmt 文件的 rustfmt 收敛。
+  - **coding 集成收敛**: `full_assembly` 按形状断言提示布局（60s 有界 drive、按阶段 panic）；`permission_grants` 采用正确的始终允许语义与规范 `write`（夹具的 `../..` 属设计上「每次问、不记住」的未解析父级穿越）。
+  - **Portability 门禁**: `special_dirs` 的原生 temp 断言改为按平台判定 —— 前导 `/` 只在 Windows 上属于 POSIX 污染，Unix 上它就是原生形态；斜杠/盘符检查现仅在 `cfg!(windows)` 下执行（本批提交的首次真实跨平台运行抓到了它）。
+  - **流程**: `AGENTS.md` 新增双语提交正文规范（英文整段、`---`、中文整段）。
+
+## v7.2.2-beta.0 (2026-10-11)
+
+- **[Subagent Dispatch, Shell-Alias Extraction & Worker Scope Gate]** (#32, #33, #34):
+  - **Technical Root Cause / Detail**: Subagent dispatch rejected alias/lenient task shapes outright; the `cmd` shell alias was special-cased in two separate gates (`BashWorkspaceGate`, `TurnExecutionPolicy`); and `WorkerScopeGate` only recognized the legacy `edit_file`/`write_file` names + `file_path`, so modern `edit`/`write` calls fell through `_ => None` and escaped a worker's declared scope.
+  - **Implementation Mechanism**: Lenient `task` dispatch with alias support and recoverable-error self-healing; one shared `shell_names::extract_shell_command` (also reused by argument repair) replacing per-gate alias handling; `WorkerScopeGate::violation` now matches `edit|edit_file|write|write_file` and both `path`/`file_path`.
+  - **Verification & Testing**: Workspace `cargo check --all-targets` plus the three-OS Portability matrix; a new end-to-end repair→gate test covers the shared extractor; unit regressions in `task.rs`/`write_approval.rs` cover modern and legacy tool calls.
+
+- **[Session Persistence: Native Catalog Timestamp Units]** (#36):
+  - **Technical Root Cause / Detail**: `catalog_entry` guessed the timestamp unit from magnitude, mistaking small placeholder values for seconds and rewriting them.
+  - **Implementation Mechanism**: Decide the unit by storage format instead — native `.meta` is passed through verbatim as milliseconds, legacy `.json` seconds still go through the checked conversion; the parallel narrower self-heal (`851d30ccc`) was superseded by this zero-guess formulation.
+  - **Verification & Testing**: Unit tests extended to the native/legacy/native-precedence tri-state, plus a new CI persisted-catalog smoke step.
+
+- **[Bash Runtime & Cross-Platform Shell Environment]**:
+  - **Host Lifetime**: the per-turn bash runtime defaults to the process-global host state, so live tasks (including detached background resident services) survive turn teardown, page refresh and session reconfigure; runtime `Shutdown` now cancels foreground-only, so an ordinary turn completion no longer kills `background=true` services — they end only on explicit kill, session deletion, or host exit.
+  - **Environment Normalization**: one cross-platform `apply_shell_env` on every shell path (Unix bash/sh, Windows bash, cmd.exe, PowerShell) exports `TMPDIR`/`TMP`/`TEMP` in native, forward-slash form and `DESKTOP` via the OS folder API; `sys1` environment facts (and the teaches doc) now hint to prefer `"$TMPDIR"`/`"$DESKTOP"`.
+
+- **[Pipeline Identity Consistency (kernel/daemon/webui)]**:
+  - **Technical Root Cause / Detail**: Without a stable per-part identity, live streaming, refresh and session switching produced ordering errors, card resurrection and ghost answer replay.
+  - **Implementation Mechanism**: Kernel `Message.id` + a new `AgentEvent::AssistantMessage` boundary event; daemon `message_id/part_id/part_seq` on chat/live deltas and `/chat/steer` `client_input_ids` echo; id-driven render keys and reconciliation in the WebUI.
+  - **Verification & Testing**: `cargo check --workspace --all-targets`; daemon lib tests; webui `tsc`, `node --test` and production build.
+
+- **[Unified MCP + Skills Capability State (GLOBAL/PROJECT)]**:
+  - **Implementation Mechanism**: one `control` surface (`CapItem`: global/project disabled + effective state) + `skills/controls` store (`skills.json` at both scopes); `mcp/config` union-disabled semantics + list/set surface; `SkillRegistry::retain_enabled`; a `SkillCatalogHook` that hot-reloads on `turn_start` (byte-stable when the catalog is unchanged). Daemon `/capabilities` + `/capabilities/toggle` endpoints; WebUI capability toggles, bare skill names, draggable notifications and zh/en/vi i18n.
+
+- **[WebUI Dependency Security & Mermaid Toolbar]** (#35 + follow-ups):
+  - **Technical Root Cause / Detail**: Tailwind's build chain retained an unpatched `braces`, Mermaid loaded an older KaTeX renderer independently of the patched stylesheet, and other locked CSS-tool deps had advisories.
+  - **Implementation Mechanism**: Preserve the complete Tailwind 3 CSS output and MIT notices as static styles, patch the CSS tooling, and share Mermaid's KaTeX renderer with the existing patched stylesheet; drop the unused Tailwind CDN design draft; gate `npm audit --audit-level=high` into the WebUI quality job; DOMPurify-sanitize Mermaid SVG output before injection; remove the unused Tailwind generator chain from `site/` (site audit zero). The Mermaid badge is simplified to "Mermaid" with reactive tooltips. `webui/README.md` documents the residual Mermaid→KaTeX override risk.
+  - **Verification & Testing**: 27 pre-change characterization checks + inherited-trust JS-link defect reproduction; after locked reinstall all 28 focused checks pass and `npm audit` is zero at every severity; browser smoke confirms unchanged reset/math/Mermaid output and stripped script/event-handler markup.
+
+- **[CI & Build Hygiene]**:
+  - **Technical Root Cause / Detail**: Subagent dispatch resolved `t.resolved_description(idx)` after `t.prompt` was moved, failing `cargo check --all-targets` with `E0382` across every CI "Rust quality" and Portability matrix job.
+  - **Implementation Mechanism**: Reorder the calls so the borrow precedes the move; clear the residual workspace warnings (unused imports in `config`/`capabilities`, a Windows-only `mut` on `persist_res`, `parse_scutil_proxy` gated to `macOS`+test, `ToolResult`/`Message`+`Role` moved under `#[cfg(test)]`, an unused `tools::suppress_console_window` re-export removed, and the detached-driver `PgroupChild` reaped flag routed through `mark_terminated`).
+  - **Policy**: `AGENTS.md` codifies a CI-first verification policy (#29).
+
+---
+
+- **[子代理分发、Shell 别名抽取与 Worker 作用域闸门]** (#32, #33, #34):
+  - **技术机理 / 现象溯源**: 子代理分发直接拒绝别名/宽松形态的 task；`cmd` shell 别名在两个闸门（`BashWorkspaceGate`、`TurnExecutionPolicy`）各自硬编码；`WorkerScopeGate` 只识别遗留的 `edit_file`/`write_file` + `file_path`，现代 `edit`/`write` 调用落入 `_ => None`，绕过 worker 声明的目录作用域。
+  - **实现防线 / 核心改动**: `task` 宽松分发 + 别名支持 + 可修复错误自愈；统一的 `shell_names::extract_shell_command`（argument repair 复用）替换各闸门的别名处理；`WorkerScopeGate::violation` 同时匹配 `edit|edit_file|write|write_file` 与 `path`/`file_path`。
+  - **验证与交付**: workspace `cargo check --all-targets` 与三平台 Portability 矩阵；新增 repair→gate 端到端测试覆盖共享抽取器；`task.rs`/`write_approval.rs` 单测覆盖现代与遗留调用。
+
+- **[会话持久化：原生 catalog 时间戳单位]** (#36):
+  - **技术机理 / 现象溯源**: `catalog_entry` 按数量级猜测时间戳单位，会把小占位值误当秒级并改写。
+  - **实现防线 / 核心改动**: 改由存储格式决定单位——native `.meta` 一律按毫秒透传，legacy `.json` 秒级仍走 checked 转换；并行的窄自愈提交（`851d30ccc`）被这套“零猜测”写法取代。
+  - **验证与交付**: 单测扩展覆盖 native/legacy/native 优先三态，并新增 CI 持久化 catalog smoke 步骤。
+
+- **[Bash 运行时与跨平台 Shell 环境]**:
+  - **宿主生命周期**: 每轮 bash 运行时默认使用进程级全局宿主状态，使实时任务（含分离的后台常驻服务）在回合结束、页面刷新、会话重配后依然存活；运行时 `Shutdown` 仅取消前台，普通回合结束不再杀死 `background=true` 的服务（仅在显式 kill、删除会话或宿主退出时终止）。
+  - **环境归一**: 各 shell 路径（Unix bash/sh、Windows bash、cmd.exe、PowerShell）统一经 `apply_shell_env` 导出原生正斜杠形式的 `TMPDIR`/`TMP`/`TEMP` 与经 OS 解析的 `DESKTOP`；`sys1` 环境事实（及 teaches 文档）提示优先使用 `"$TMPDIR"`/`"$DESKTOP"`。
+
+- **[管线身份一致性（kernel/daemon/webui）]**:
+  - **技术机理 / 现象溯源**: 缺少稳定的部件身份时，实时流式、刷新与会话切换会出现错序、卡片复活与幽灵重放。
+  - **实现防线 / 核心改动**: kernel 侧 `Message.id` 与新增 `AgentEvent::AssistantMessage` 边界事件；daemon 侧增量携带 `message_id/part_id/part_seq`、`/chat/steer` 回传 `client_input_ids`；webui 侧渲染 key 与 reconcile 全面 id 驱动。
+  - **验证与交付**: `cargo check --workspace --all-targets`；daemon lib 测试；webui `tsc`、`node --test` 与生产构建。
+
+- **[统一 MCP + Skills 能力态（GLOBAL/PROJECT）]**:
+  - **实现防线 / 核心改动**: 统一 `control` 能力面（`CapItem`：双 scope disabled + 生效态）+ `skills/controls` 存储（双 scope `skills.json`）；`mcp/config` 跨 scope 联合禁用语义 + list/set 能力面；`SkillRegistry::retain_enabled`；`turn_start` 热重载的 `SkillCatalogHook`（catalog 未变则字节稳定）。daemon 新增 `/capabilities` 与 `/capabilities/toggle` 端点；WebUI 增加能力开关、裸技能名、可拖拽通知与 zh/en/vi i18n。
+
+- **[WebUI 依赖安全与 Mermaid 工具栏]** (#35 及后续):
+  - **技术机理 / 现象溯源**: Tailwind 构建链包含未修复的 `braces`，Mermaid 独立加载较旧 KaTeX，其他锁定 CSS 工具依赖也存在已公开漏洞。
+  - **实现防线 / 核心改动**: 将完整 Tailwind 3 CSS 输出与 MIT 声明保留为静态样式、修补 CSS 工具链、让 Mermaid 复用既有修复版 KaTeX；删除未使用的 Tailwind CDN 设计草稿；把 `npm audit --audit-level=high` 纳入 WebUI quality 作业；注入前用 DOMPurify 净化 Mermaid SVG 输出；移除 `site/` 未使用的 Tailwind 生成链（site audit 归零）。徽标简化为 “Mermaid”，提示随语言即时更新。`webui/README.md` 记录 Mermaid→KaTeX 覆盖的残余风险。
+  - **验证与交付**: 修改前 27 项行为基线 + 继承 trust 的 JS 链接漏洞复现；锁定重装后 28 项针对性检查全部通过，`npm audit` 各严重度为零；真实浏览器验证 reset/公式/Mermaid 输出不变、脚本与事件属性被清除。
+
+- **[CI 与构建卫生]**:
+  - **技术机理 / 现象溯源**: 子代理分发在 `t.prompt` 被移动**之后**才解析 `t.resolved_description(idx)`，触发 `E0382`，令 CI “Rust quality” 与 Portability 全部矩阵作业失败。
+  - **实现防线 / 核心改动**: 调整调用顺序使借用先于移动；清理残余 workspace 告警（`config`/`capabilities` 未使用导入、仅 Windows 需要的 `persist_res` `mut`、`parse_scutil_proxy` 归到 `macOS`+test、`ToolResult`/`Message`+`Role` 移入 `#[cfg(test)]`、移除未使用的 `tools::suppress_console_window` 再导出、分离驱动中的 `PgroupChild` reaped 标志改经 `mark_terminated`）。
+  - **策略**: `AGENTS.md` 记录 CI-first 验证策略 (#29)。
+
+## v7.2.1-beta.11 (2026-10-11)
+
+- **[Markdown Hydration & Streaming Fence Robustness] Fix Mermaid Context Hydration Crash, Prevent Mobile GPU Compositor Tiling Ghosting, and Stop Nested Code Fence Fragmentation Across Protocols**:
+  - **Mermaid Context Hydration Crash & Fallback Resolution**: Fixed a fatal unhandled exception where `MermaidDiagram` invoking `useT()` in an isolated Preact root crashed on `useSettings must be used within <SettingsProvider>`, causing diagrams and action toolbar icons to vanish across desktop, mobile, and WebUI. Added an automatic language fallback in `settings.tsx` when outside `<SettingsProvider>`, wrapped the mount point in `<SettingsProvider>` with `try...catch` error isolation, and relaxed Mermaid security level to `'loose'` to seamlessly parse rich HTML labels and `<br/>` tags.
+  - **Mobile GPU Tile Compositor Ghosting Eradication**: Eliminated the rapid cascade of render-phase exceptions during token streaming that previously desynchronized mobile browser compositor threads, completely extinguishing the visual glitch where headers and input bars replicated as repeating tiles across the screen.
+  - **Adaptive Fence Length Matching & Nesting Depth Tracking**: Upgraded daemon `ArtifactDetector` with variable fence length matching (`fence_len >= 3`) and depth tracking so that nested code blocks (e.g. 4-backtick markdown wrapping 3-backtick mermaid) are not prematurely terminated by inner closing fences or fragmented into stray backtick lines.
+  - **Cross-Protocol Wire Fence Reconstruction**: Forwarded `fence_len` in `ArtifactStart` events and upgraded `Chat.tsx` along with OpenAI Chat (`/v1/chat/completions`), OpenAI Responses (`/v1/responses`), and Anthropic Messages (`/v1/messages`) stream projectors to reconstruct exact opening and closing fences, preserving post-block headings without markdown corruption.
+
+---
+
+- **[Markdown 水合容灾与流式围栏全链路稳固] 根治 Mermaid 跨端吞图与移动端鬼畜重叠残影，消除嵌套代码块碎裂与反引号堆叠**:
+  - **Mermaid Context 水合断裂与环境安全降级**: 修复 `MermaidDiagram` 在独立 Preact 挂载孤岛中调用 `useT()` 时因脱离 `<SettingsProvider>` 抛出未捕获异常导致图表与工具栏图标全平台（桌面端、手机端、Web UI）被吞噬消失的致命缺陷；在 `settings.tsx` 中为 `useT()` 增加脱离 Provider 时的安全语言兜底，在 `Markdown.tsx` 中以 `<SettingsProvider>` 与 `try...catch` 隔离保护水合过程，并将 Mermaid 安全级别配置为 `'loose'` 以完美支持节点内 `<br/>` 换行与复杂富文本。
+  - **移动端 GPU 瓦片合成器失步残影（鬼畜平铺）根除**: 彻底终结了流式输出过程中每秒数十次抛错导致的 Preact VNode 指针紊乱与移动端浏览器合成器线程（Compositor Thread）失步，彻底消除了顶栏与输入框在手机屏幕上像贴图一样疯狂复制重叠的视觉故障。
+  - **变长围栏匹配与嵌套深度栈追踪**: 升级后台 Daemon `ArtifactDetector`，引入自适应围栏长度（`fence_len >= 3`）与嵌套深度栈（`depth`），确保 4 反引号等外层容器内的 3 反引号子代码块被完整作为普通内容保留，绝不被内层闭合误杀提前腰斩。
+  - **全协议出站流式围栏精确还原**: `ArtifactStart` 协议事件携带 `fence_len` 规格，并在前端 `Chat.tsx` 以及 OpenAI Chat、OpenAI Responses 和 Anthropic Messages 等兼容流式投射器中动态还原精准匹配的围栏标记，彻底终结反引号乱葬岗并保全后续 `####` 块级标题解析。
+
+## v7.2.1-beta.10 (2026-10-10)
+
+- **[Background Process Decoupling, Lifecycle Isolation, and Native PID Refactoring] Complete Decoupling of Foreground Stop from Background Resident Services, Streaming Log Persistence, and Total Eradication of Legacy `bashid`**:
+  - **Background Task Immunity & Foreground-Only Cancellation**: Separated foreground turn cancellation (`cancel_foreground_live_bash`) from irrevocable session transition (`cancel_all_live_bash`). User-initiated Stop actions, steer preemptions, and rapid sequential turns on OpenAI, Anthropic, and Responses APIs now terminate only blocking foreground commands and streaming LLM tokens, strictly exempting detached background resident services (`background=true`, such as FastAPI, Uvicorn, and dev servers) so they remain permanently active across turns.
+  - **Transport Reconnection & 409 Conflict Safety**: Network jitters, tab refreshes, and 409 Conflict errors (`This session already has an active chat operation`) now strictly perform transport-level observer re-attaching via `/chat/watch`. Disconnections no longer cascade into task termination, guaranteeing long-running backend processes continue uninterrupted.
+  - **Streaming Ephemeral Log Persistence & Smart Read Guidance**: Automatically writes detached background process output to an OS-managed temporary log file (`jeikcode-bg-{pid}.log`), updating in real time as chunks arrive from stdout and stderr pipes, and unlinking on process termination. Injected an English advisory note into `run_command`'s output teaching models to inspect live logs using negative offsets (`read(offset=-50)`) or targeted keywords (`read(key_string=..., upward=..., downward=...)`) without introducing tool clutter.
+  - **Complete Physical Eradication of Legacy `bashid`**: Abolished the historical virtual ID generator (`new_bashid`, `NEXT_ID`) and obsolete `kill_by_id`. Refactored `LiveBash`, `ActiveBackgroundTask`, and `BackgroundAlert` to store native OS PIDs (`u32`), converted all internal registry lookups, cancellations, and status hooks to real PIDs, and purged obsolete `bashid` assertions across all Rust and WebUI test suites.
+
+---
+
+- **[后台进程生命周期解耦、前台终止隔离与原生 PID 彻底重构] 彻底隔离前台 Stop 与后台常驻服务、实时日志流式留存及伪 `bashid` 物理清零**:
+  - **后台服务豁免机制与前台精准终止隔离**: 严格拆分轮次级前台取消（`cancel_foreground_live_bash`）与不可逆会话销毁（`cancel_all_live_bash`）。用户点击 Stop 停止生成、Steer 抢占式发送以及在 OpenAI、Anthropic、Responses API 快速叠发消息时，仅杀死阻塞中的前台终端命令与大模型生成流，绝对豁免通过 `background=true` 启动的常驻后台服务（如 FastAPI、Uvicorn、开发服务器），使其跨轮次持续稳定运行。
+  - **传输层重连与 409 冲突无害化**: 网络波动、断网重连、页面刷新以及 409 Conflict 冲突（`This session already has an active chat operation`）完全收敛为纯传输层重连（通过 `/chat/watch` 作为观察者重新订阅总线），严禁级联下发任何停止或杀死信号，确保后端任务与生成进程持续演进。
+  - **后台实时日志临时持久化与 Read 引导尾注**: 为每个后台常驻进程自动在系统临时目录建立独立日志文件（`jeikcode-bg-{pid}.log`），Tokio 异步管道在读取 stdout/stderr 时实时追加写入，服务停止后自动 unlink 清洁删除；在 `run_command` 返回尾部贴心注入英文指南，传授大模型使用 `read(offset=-50)` 逆序 tail 读取最新日志及 `read(key_string=...)` 锚点定位排错，零新增工具负担。
+  - **历史遗留伪 `bashid` 物理清零**: 彻底物理删除虚拟 ID 自增器（`new_bashid`、`NEXT_ID`）与废弃的 `kill_by_id`；将 `LiveBash`、`ActiveBackgroundTask`、`BackgroundAlert` 等核心数据结构及注册/注销/查找方法全面重构为操作系统原生数字 `pid: u32`，全面净化全仓 Rust 与 WebUI 废弃测试断言，实现底层到表层的 100% 真实 PID 接管。
+
+## v7.2.1-beta.9 (2026-10-10)
+
+- **[Ghost Watch Elimination, Canvas Hydration, Git Unicode Path, and Steer Lifecycle] Watch Loop Storm Eradication, Full-State IndexedDB Hydration, Git Octal Path Decoding, and Steer Card Preservation**:
+  - **Ghost Watch & Reconnect Loop Storm Eradication**: Fixed a critical backend bug in `subscribe_or_standby` and `subscribe_live_with_replay` where completed turns (`terminal_reached` or `stopped`) were erroneously returned as active `Live` streams over dead broadcast channels, instantly triggering connection EOFs. Injected a 1000ms backoff retry delay and a 3-strike circuit breaker with 30s cooldown in frontend `startIdleWatch`, completely extinguishing the 0ms tight reconnect loop storm.
+  - **Full-State Canvas Hydration & TodoList Anti-Resurrection Guard**: Extended IndexedDB `sessionCache.ts` to persist `turns` (question outlines), `todos` (task checklists), and `tokenUsage` alongside messages, enabling 0ms instant first-paint restoration and completely eliminating timeline redraw jitter and right-panel 3-to-11 question jumps after refresh. Added `isTodoPlanCall` in `todos.ts` to recognize modern Agent batch actions (`{"actions":[{"action":"add"}]}`), preventing historical tasks from being discarded as fragments and stopping stale stashed plans from overwriting settled checklists.
+  - **Git Unicode Path & Branch Switching Robustness**: Enforced `-c core.quotepath=false`, `GIT_TERMINAL_PROMPT=0`, `GIT_OPTIONAL_LOCKS=0`, and `LANG=C.UTF-8` across all daemon Git commands, and introduced an automated `unquote_git_path` octal-escape decoder in `api_git.rs`, completely eliminating `\346\226\260...` garbled filenames for Chinese files. Fixed `GRAPH_CACHE` branch staleness when switching between branches pointing to the same commit, supported Detached HEAD short hashes, and added a 1-click shortcut in the checkout error banner directing users to uncommitted changes.
+  - **Steer Card Lifecycle Preservation & 409 Conflict Reconciliation**: Fixed a timing bug where the queue drain effect wiped out in-flight steer cards on the initial F5 render frame before active session discovery resolved, ensuring steer cards persist seamlessly until absorbed by the backend kernel. Enriched conflict error classification (`postChatPrompt` status and code attachment + `already has an active chat operation` matching), smoothly rolling conflicting submits into the queue without emitting connection error banners.
+
+---
+
+- **[幽灵监听风暴清零、全态画布秒开、Git中文八进制转码与转向生命周期闭环] 彻底终结 Watch 零延迟死循环、IndexedDB 全态持久化、Git 中文乱码修复与 Steer 刷新防丢**:
+  - **幽灵监听与零延迟死循环风暴根除**: 修复后端 `subscribe_or_standby` 与 `subscribe_live_with_replay` 将已终结（`terminal_reached` / `stopped`）的僵尸回合误当 Live 流返回导致 channel 瞬间闪断的致命 Bug；在前端 `startIdleWatch` 注入 1000ms 异常断开退避延迟与连续 3 次闪断熔断机制（30s 冷却），彻底平息数千次请求的零延迟网络风暴。
+  - **画布全态秒级直出与 TodoList 脏状态防招魂**: 扩展 IndexedDB 本地缓存引擎，将提问大纲（`turns`）、待办清单（`todos`）和 `tokenUsage` 全面纳入原子级持久化，实现 F5 刷新 1~3ms 全态秒开，彻底消除右侧栏从 3 个问题跳到 11 个以及消息重绘跳帧拉扯；在 `todos.ts` 引入 `isTodoPlanCall` 兼容现代 Agent `actions` 批处理语法，根治历史计划被误当碎片抛弃、导致过期的半成品待办被招魂复活的顽疾。
+  - **Git 中文八进制乱码与分支切换全链路优化**: 在后端 `api_git.rs` 全面注入 `-c core.quotepath=false`、`GIT_TERMINAL_PROMPT=0` 与 `GIT_OPTIONAL_LOCKS=0`，并内置 `unquote_git_path` 双保险解码器，彻底消灭外部新建中文文件产生的 `\346\226\260...` 八进制转义乱码；修复同 Commit 分支切换与 Detached HEAD 状态下的缓存盲区，并在工作区代码冲突时提供一键直达“更改”标签页的中文指引。
+  - **Steer 转向卡片生命周期保护与 409 冲突平滑重排**: 修复 F5 刷新首屏队列处理器在 `busy=false` 空窗期抢跑误杀 `kind === 'steer' | 'steering'` 转向卡片的漏洞，确保卡片稳健保留直到后端内核吸收并升级为正式正文；全面增强 409 Conflict 识别覆盖（包含 `already has an active chat operation`），将毫秒级停止抢跑平滑转入队列重排，彻底消除界面红字报错。
 
 ## v7.2.1-beta.8 (2026-10-10)
 
@@ -567,8 +1398,8 @@
 ## v7.2.0-beta.2 (2026-10-07)
 
 - **[Capabilities & Tools / Shell Hardening & Precision Reading] Fix Windows WSL bash hijacking in `run_command`, enhance `read` with anchor matching, and modernize notification audio**:
-  - **Technical Root Cause / Detail**: On Windows environments with WSL enabled, running scripts with `#!/usr/bin/env bash` shebangs (such as Node.js `npm`/`npx` wrappers) through `run_command` previously triggered exit code 127 (`No such file or directory`) because Windows `System32\bash.exe` shadowed Git Bash's `/usr/bin/bash` in `PATH` and failed to resolve MSYS2 drive paths (`/d/...`). Furthermore, inspecting symbols in large files previously required reading entire pages or manual offset guessing, OS desktop toasts suffered from unstackable popup spam, and legacy `.atomcode` database paths lingered in `index_db.rs`.
-  - **Implementation Mechanism**: Hardened Windows shell execution in `crates/jeikcode-capabilities/src/tools/bash.rs` by prepending a dedicated `/tmp/.jeikcode_shims` directory containing Git Bash `bash`/`sh` symlinks to `PATH`, completely eliminating WSL binary shadowing while preserving native Windows compiler precedence. Upgraded `read` tool with `key_string`, `upward`, `downward`, and `max_matches` arguments supporting 4-tier fuzzy matching and centered inspection windows with line numbers. Replaced OS popup toasts with pure platform alert sounds (`MessageBeep`, `afplay`, `paplay`) protected by an 800ms atomic debounce lock in `notify.rs`. Purged legacy `.atomcode` fallback in `index_db.rs`.
+  - **Technical Root Cause / Detail**: On Windows environments with WSL enabled, running scripts with `#!/usr/bin/env bash` shebangs (such as Node.js `npm`/`npx` wrappers) through `run_command` previously triggered exit code 127 (`No such file or directory`) because Windows `System32\bash.exe` shadowed Git Bash's `/usr/bin/bash` in `PATH` and failed to resolve MSYS2 drive paths (`/d/...`). Furthermore, inspecting symbols in large files previously required reading entire pages or manual offset guessing, OS desktop toasts suffered from unstackable popup spam, and leftover database paths lingered in `index_db.rs`.
+  - **Implementation Mechanism**: Hardened Windows shell execution in `crates/jeikcode-capabilities/src/tools/bash.rs` by prepending a dedicated `/tmp/.jeikcode_shims` directory containing Git Bash `bash`/`sh` symlinks to `PATH`, completely eliminating WSL binary shadowing while preserving native Windows compiler precedence. Upgraded `read` tool with `key_string`, `upward`, `downward`, and `max_matches` arguments supporting 4-tier fuzzy matching and centered inspection windows with line numbers. Replaced OS popup toasts with pure platform alert sounds (`MessageBeep`, `afplay`, `paplay`) protected by an 800ms atomic debounce lock in `notify.rs`. Purged a leftover path fallback in `index_db.rs`.
   - **Verification & Testing**: Passed all 34 read tool unit tests in `jeikcode-capabilities`, verified `npm` execution via the new shim mechanism, and passed `cargo check --lib -p jeikcode-daemon`.
 
 - **[WebUI & Chat Interface / Stream Integrity & Multi-Repo Navigation] Shield active streaming against watch stream tearing, eliminate scroll jitter, and add multi-repo Git switching**:
@@ -580,7 +1411,7 @@
 
 - **[能力层与工具系统 / Shell 加固与精准阅读] 根治 Windows WSL bash 路径劫持、强化 `read` 锚点定位并升级轻量系统通知音**:
   - **技术机理 / 现象溯源**: 在启用了 WSL 的 Windows 机器上，`run_command` 执行带 `#!/usr/bin/env bash` Shebang 的脚本（如 Node.js 自带的 `npm`/`npx` 包装器）时，因系统 `System32\bash.exe` 在 PATH 中先于 Git Bash 被 `env` 检索，导致 WSL 的 Linux bash 被误唤起并因无法识别 MSYS2 盘符路径（如 `/d/...`）报出 127 错误；同时大文件符号检视缺乏精准锚点窗口支持、系统级 Toast 弹窗存在无法堆叠的弹窗轰炸问题，且 `index_db.rs` 存在历史遗留路径。
-  - **实现防线 / 核心改动**: 在 `crates/jeikcode-capabilities/src/tools/bash.rs` 的 Windows bash 初始化逻辑中，注入最高优先级的 `/tmp/.jeikcode_shims` 目录并建立指向当前 Git Bash `bash`/`sh` 的软链接，彻底杜绝 WSL `System32\bash.exe` 劫持 `env bash`，同时严密保护宿主原生编译工具链（Cargo/MSVC/Python）的优先级；为 `read` 工具引入 `key_string`、`upward`、`downward` 与 `max_matches`，支持四级容错匹配、居中行窗口与精确定位；在 `notify.rs` 中全面移除 OS 弹窗，改为纯系统提示音（`MessageBeep`/`afplay`/`paplay`）并配合 800ms 原子防抖锁；清理 `index_db.rs` 中已废弃的 `.atomcode` 路径。
+  - **实现防线 / 核心改动**: 在 `crates/jeikcode-capabilities/src/tools/bash.rs` 的 Windows bash 初始化逻辑中，注入最高优先级的 `/tmp/.jeikcode_shims` 目录并建立指向当前 Git Bash `bash`/`sh` 的软链接，彻底杜绝 WSL `System32\bash.exe` 劫持 `env bash`，同时严密保护宿主原生编译工具链（Cargo/MSVC/Python）的优先级；为 `read` 工具引入 `key_string`、`upward`、`downward` 与 `max_matches`，支持四级容错匹配、居中行窗口与精确定位；在 `notify.rs` 中全面移除 OS 弹窗，改为纯系统提示音（`MessageBeep`/`afplay`/`paplay`）并配合 800ms 原子防抖锁；清理 `index_db.rs` 中已废弃的路径。
   - **验证与交付**: `jeikcode-capabilities` 的 34 项 read 工具单测全绿通过，实测 Git Bash 下 `npm` 顺利执行，`cargo check --lib -p jeikcode-daemon` 编译校验通过。
 
 - **[WebUI 与交互界面 / 流式防撕裂与多仓库支持] 阻断流式会话被重放撕裂、消除滚动锚定抖动并支持多仓 Git 切换**:

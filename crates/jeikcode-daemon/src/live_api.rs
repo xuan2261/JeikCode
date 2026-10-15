@@ -24,6 +24,35 @@ use tokio_util::sync::CancellationToken;
 #[cfg(test)]
 use std::sync::OnceLock;
 
+/// One `/sync` live-wire SSE payload.
+///
+/// `replay: true` marks a frame from the snapshot/replay head — the WebUI must
+/// merge it idempotently. Live frames stay UNTAGGED because they are true deltas
+/// and must be painted verbatim: a live delta routed through the replay heuristics
+/// gets swallowed, which is how thinking/body after a tool round used to vanish
+/// from the canvas until a manual refresh. Mirrors `chat_watch_frame_json`.
+fn live_wire_frame_json<W: serde::Serialize>(wire: &W, replay: bool) -> String {
+    let mut val = match serde_json::to_value(wire) {
+        Ok(val) => val,
+        Err(error) => {
+            crate::ctrace!(
+                "LIVE",
+                "live_stream: serde_json serialization failed: {error}"
+            );
+            serde_json::json!({
+                "type": "error",
+                "message": format!("live event serialization failed: {error}"),
+            })
+        }
+    };
+    if replay {
+        if let serde_json::Value::Object(ref mut map) = val {
+            map.insert("replay".to_string(), serde_json::Value::Bool(true));
+        }
+    }
+    serde_json::to_string(&val).unwrap_or_default()
+}
+
 /// Truncate a value for the file-sink diagnostic log at a char boundary (CJK-safe).
 fn log_truncate_live(value: &str, max: usize) -> String {
     if value.chars().count() <= max {
@@ -53,15 +82,44 @@ pub(crate) fn fallback_approval_decision(mode: ApprovalMode) -> PermissionDecisi
 /// Web/TUI 共同显示并下发给 Coding Runtime 的审批模式。
 static LIVE_APPROVAL_MODE: StdMutex<ApprovalMode> = StdMutex::new(ApprovalMode::Build);
 
-/// 读取当前生效的审批模式。`pub(crate)` 以便 `/chat` 路径（非 sync webui）也据此
+/// 按 session_id 隔离记录的审批模式表；未单独配置的会话回退到 `LIVE_APPROVAL_MODE`。
+static SESSION_APPROVAL_MODES: StdMutex<Option<HashMap<String, ApprovalMode>>> =
+    StdMutex::new(None);
+
+/// 读取当前全局生效的审批模式。`pub(crate)` 以便 `/chat` 路径（非 sync webui）也据此
 /// 选择 PermissionDecider——否则模式 pill 只在 sync 模式生效。
 pub(crate) fn live_current_approval_mode() -> ApprovalMode {
     *LIVE_APPROVAL_MODE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// 读取指定 session 的审批模式；若未单独指定则回退到全局默认模式。
+pub(crate) fn live_session_approval_mode(session_id: Option<&str>) -> ApprovalMode {
+    if let Some(sid) = session_id.filter(|s| !s.trim().is_empty()) {
+        if let Ok(guard) = SESSION_APPROVAL_MODES.lock() {
+            if let Some(map) = guard.as_ref() {
+                if let Some(mode) = map.get(sid.trim()) {
+                    return *mode;
+                }
+            }
+        }
+    }
+    live_current_approval_mode()
+}
+
 /// Force the process-wide live approval mode (used by `serve --yolo` → Auto).
 pub(crate) fn live_set_approval_mode(mode: ApprovalMode) {
     *LIVE_APPROVAL_MODE.lock().unwrap_or_else(|e| e.into_inner()) = mode;
+}
+
+/// 设置指定 session 的审批模式；若 session_id 为 None 则更新全局默认模式。
+pub(crate) fn live_set_session_approval_mode(session_id: Option<&str>, mode: ApprovalMode) {
+    if let Some(sid) = session_id.filter(|s| !s.trim().is_empty()) {
+        let mut guard = SESSION_APPROVAL_MODES.lock().unwrap_or_else(|e| e.into_inner());
+        let map = guard.get_or_insert_with(HashMap::new);
+        map.insert(sid.trim().to_string(), mode);
+    } else {
+        *LIVE_APPROVAL_MODE.lock().unwrap_or_else(|e| e.into_inner()) = mode;
+    }
 }
 
 /// Format a `request_user_input` payload as a user-visible final answer so API
@@ -363,14 +421,25 @@ struct AuthoritativeTerminal {
 
 /// 设置 live 视图审批模式；已绑定 runtime 的调用方另行下发 `SetMode`。
 pub fn live_set_mode(mode: ApprovalMode) {
-    *LIVE_APPROVAL_MODE.lock().unwrap_or_else(|e| e.into_inner()) = mode;
+    live_set_mode_for_session(None, mode);
+}
+
+/// 设置 live 视图审批模式（可指定 session_id）；若命中活跃 binding 则下发 `SetMode`。
+pub fn live_set_mode_for_session(session_id: Option<&str>, mode: ApprovalMode) {
+    live_set_session_approval_mode(session_id, mode);
     if let Ok(binding) = crate::native_live::binding() {
-        let _ = crate::native_live::publish_unsequenced(
-            &binding,
-            jeikcode_coding::CodingRuntimeEvent::ModeChanged {
-                mode: native_runtime_mode(mode),
-            },
-        );
+        let affects_binding = match session_id {
+            Some(sid) => binding.session_id == sid,
+            None => true,
+        };
+        if affects_binding {
+            let _ = crate::native_live::publish_unsequenced(
+                &binding,
+                jeikcode_coding::CodingRuntimeEvent::ModeChanged {
+                    mode: native_runtime_mode(mode),
+                },
+            );
+        }
     }
 }
 
@@ -388,6 +457,9 @@ impl ScopedApprovalModeForTest {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         live_set_mode(ApprovalMode::Build);
+        if let Ok(mut map) = SESSION_APPROVAL_MODES.lock() {
+            *map = None;
+        }
         Self { _guard: guard }
     }
 }
@@ -396,6 +468,9 @@ impl ScopedApprovalModeForTest {
 impl Drop for ScopedApprovalModeForTest {
     fn drop(&mut self) {
         live_set_mode(ApprovalMode::Build);
+        if let Ok(mut map) = SESSION_APPROVAL_MODES.lock() {
+            *map = None;
+        }
     }
 }
 
@@ -602,7 +677,8 @@ pub(crate) fn chat_runtime_config(
         // responder is registered; otherwise run_chat_turn_v2 applies the mode-specific,
         // fail-closed fallback. Keep the runtime round-trip enabled here.
         dangerously_skip_permissions: false,
-        // Keep the fail-closed approval timeout for the daemon (current behavior).
+        // Interactive cards park with no deadline once a responder is registered.
+        // Headless turns never enter that wait.
         interactive: false,
         keep_interrupted_context: config.keep_interrupted_context,
         user_agent: p.and_then(|p| p.user_agent.clone()),
@@ -617,14 +693,7 @@ pub(crate) fn chat_runtime_config(
             config.coding.max_rounds,
             std::env::var("JEIKCODE_TURN_MAX_ROUNDS").ok().as_deref(),
         ),
-        // First-token liveness: mirror the canonical resolution (env > [coding]).
-        first_token_timeout: {
-            let secs = std::env::var("JEIKCODE_FIRST_TOKEN_TIMEOUT_SECS")
-                .ok()
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .unwrap_or(config.coding.first_token_timeout_secs);
-            std::time::Duration::from_secs(secs)
-        },
+        timeouts: jeikcode_coding::resolve_timeout_policy(&config.coding),
         first_token_timeout_retries: {
             std::env::var("JEIKCODE_FIRST_TOKEN_RETRIES")
                 .ok()
@@ -645,11 +714,18 @@ pub(crate) fn chat_runtime_config(
         session_display_name: None,
         // env wins over `[tools.tool_output] max_bytes`; missing → None (default).
         // Mirrors `CodingRuntimeConfig::from_config` so the daemon path honors the
-        // same fold threshold as CLI/TUI.
+        // same compression thresholds as CLI/TUI.
         tool_output_max_bytes: std::env::var("JEIKCODE_TOOL_OUTPUT_THRESHOLD_BYTES")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .or(config.tools.tool_output.max_bytes),
+        // Same env-wins rule for the terminal early line.
+        tool_output_terminal_max_bytes: std::env::var(
+            "JEIKCODE_TOOL_OUTPUT_TERMINAL_THRESHOLD_BYTES",
+        )
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .or(config.tools.tool_output.terminal_max_bytes),
         tool_output_no_fold_tools: config.tools.tool_output.no_fold_tools.clone(),
         shared_mcp_registry: None,
     }
@@ -936,12 +1012,13 @@ pub(crate) async fn steer_into_running_turn(
 fn configure_chat_runtime_interactivity(
     runtime_cfg: &mut jeikcode_coding::CodingRuntimeConfig,
     has_interactive_driver: bool,
-) -> Option<std::time::Duration> {
-    let driver_request_timeout = runtime_cfg.agent_config().request_timeout;
+) {
+    // A shown approval or question card waits until the user answers or the
+    // turn is cancelled. The 300s request timeout must not expire the card,
+    // auto-deny the tool, or tell the model that no answer was provided.
     if has_interactive_driver {
         runtime_cfg.interactive = true;
     }
-    driver_request_timeout
 }
 
 pub(crate) async fn run_chat_turn_v2(
@@ -959,11 +1036,8 @@ pub(crate) async fn run_chat_turn_v2(
     use jeikcode_capabilities::tools::{ApprovalRequest, ApprovalResponse, APPROVAL_KIND};
     use jeikcode_coding::TurnCompletion;
 
-    // When this daemon has a real interactive response route, the daemon owns
-    // cancellation/liveness at the transport seam. Disable the kernel's second,
-    // equal request timeout so it cannot expire the RequestCtx first and then
-    // race a later HTTP decision that the daemon still considers pending.
-    let driver_request_timeout = configure_chat_runtime_interactivity(
+    // Shown cards wait without a deadline. Cancellation still unblocks the turn.
+    configure_chat_runtime_interactivity(
         &mut runtime_cfg,
         permission_responders.is_some() || user_input_responders.is_some(),
     );
@@ -1200,8 +1274,7 @@ pub(crate) async fn run_chat_turn_v2(
                             );
                             (PermissionDecision::Deny, false)
                         } else {
-                            let response =
-                                await_chat_permission_response(rx, driver_request_timeout);
+                            let response = await_chat_permission_response(rx, None);
                             tokio::pin!(response);
                             loop {
                                 match next_chat_permission_driver_event(
@@ -1334,7 +1407,7 @@ pub(crate) async fn run_chat_turn_v2(
                 // Register before publishing the SSE event so a very fast browser answer
                 // cannot race the response route and be rejected as stale.
                 let _ = runtime_event_tx.send(CodingRuntimeEvent::Request(request.clone()));
-                let answer = await_chat_user_input_response(rx, driver_request_timeout);
+                let answer = await_chat_user_input_response(rx, None);
                 tokio::pin!(answer);
                 let value = tokio::select! {
                     _ = cancel.cancelled(), if !cancelled => {
@@ -1487,14 +1560,36 @@ pub(crate) enum LiveWireEvent {
         client_input_id: Option<String>,
     },
     #[serde(rename = "text")]
-    TextDelta { content: String },
+    TextDelta {
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        part_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        part_seq: Option<u32>,
+    },
     #[serde(rename = "reasoning")]
-    ReasoningDelta { content: String },
+    ReasoningDelta {
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        part_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        part_seq: Option<u32>,
+    },
     #[serde(rename = "tool_start")]
     ToolStart {
         id: String,
         name: String,
         arguments: String,
+        /// Assistant message (round) that issued this call — same identity the
+        /// `text` / `reasoning` deltas of that round carry. A mid-turn steer
+        /// bubble can be appended after a still-running round, so the WebUI
+        /// must attach late tool rows by this id, not "whatever is last".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
     },
     /// Append-only live stdout/stderr (or other committed tool bytes). Distinct
     /// from `tool_progress`, which is latest-wins ephemeral activity.
@@ -1562,6 +1657,14 @@ pub(crate) enum LiveWireEvent {
     },
     #[serde(rename = "user_input_resolved")]
     UserInputResolved { request_id: u64 },
+    /// The STORED identity of the real user prompt this turn runs on (kernel
+    /// `UserMessage` boundary). The visible bubble is already painted by the
+    /// `user` echo — this only binds it to the transcript message id.
+    #[serde(rename = "user_identified")]
+    UserIdentified {
+        message_id: String,
+        turn_ordinal: u32,
+    },
     /// One or more live inputs were folded into the active turn. The exact
     /// payload lets browser clients acknowledge their FIFO pending-steer UI
     /// without guessing from text deltas or turn terminals.
@@ -1579,6 +1682,9 @@ pub(crate) enum LiveWireEvent {
     /// the title of tabs viewing other sessions.
     #[serde(rename = "session_renamed")]
     SessionRenamed { session_id: String, name: String },
+    /// Session execution status change (idle, running, compacting, aborted).
+    #[serde(rename = "session_status")]
+    SessionStatus { session_id: String, status: String },
     /// Working directory switched (any view's `/cd`). Every webui tab updates its
     /// path display + session-list filter to follow. Carries the absolute path.
     #[serde(rename = "working_dir")]
@@ -1604,9 +1710,36 @@ pub(crate) enum LiveWireEvent {
 struct NativeLiveWireProjector {
     tools: HashMap<String, (String, std::time::Instant)>,
     session_id: String,
+    /// Streaming assistant-message identity + part counter (from
+    /// `AgentEvent::AssistantMessage`), mirroring the `/chat` projector.
+    current_message_id: Option<String>,
+    part_seq: u32,
+    last_part_kind: Option<String>,
 }
 
 impl NativeLiveWireProjector {
+    /// Allocate the id set for the current streaming part `kind` (bumping
+    /// `part_seq` on a kind change). `None` when no boundary has been seen.
+    fn next_part_stamp(&mut self, kind: &str) -> (Option<String>, Option<String>, Option<u32>) {
+        let message_id = self.current_message_id.clone();
+        if self.last_part_kind.as_deref() != Some(kind) {
+            self.part_seq += 1;
+            self.last_part_kind = Some(kind.to_string());
+        }
+        let has_id = message_id.is_some();
+        let part_id = message_id
+            .as_ref()
+            .map(|m| format!("{m}:{}:{kind}", self.part_seq));
+        (message_id, part_id, has_id.then_some(self.part_seq))
+    }
+
+    /// Close the current streaming part so the next delta opens a fresh one.
+    /// Called on tool boundaries: the run after a tool must carry its own
+    /// `part_id` or a replay cannot converge the two runs separately.
+    fn end_streaming_part(&mut self) {
+        self.last_part_kind = None;
+    }
+
     #[cfg(test)]
     fn project(&mut self, event: crate::live_hub::LiveViewEvent) -> Option<LiveWireEvent> {
         self.project_at_generation(None, 0, event)
@@ -1623,6 +1756,30 @@ impl NativeLiveWireProjector {
         };
         use jeikcode_coding::CodingRuntimeEvent as Runtime;
         use jeikcode_kernel::event::AgentEvent as Kernel;
+
+        // Boundary: remember the streaming assistant-message identity (boundary
+        // marker carries no wire event of its own — return None).
+        if let crate::live_hub::LiveViewEvent::Runtime(Runtime::Agent(Kernel::AssistantMessage {
+            message_id,
+        })) = &event
+        {
+            self.current_message_id = Some(message_id.clone());
+            self.part_seq = 0;
+            self.last_part_kind = None;
+            return None;
+        }
+        // Identity-only boundary for the STORED user prompt: the `user` echo
+        // already painted the bubble; this binds it to the transcript identity.
+        if let crate::live_hub::LiveViewEvent::Runtime(Runtime::Agent(Kernel::UserMessage {
+            message_id,
+            turn_ordinal,
+        })) = &event
+        {
+            return Some(LiveWireEvent::UserIdentified {
+                message_id: message_id.clone(),
+                turn_ordinal: *turn_ordinal,
+            });
+        }
 
         Some(match event {
             crate::live_hub::LiveViewEvent::CommandOutput(text) => {
@@ -1667,9 +1824,27 @@ impl NativeLiveWireProjector {
                     stop_reason: None,
                     message: None,
                 },
-                Kernel::TextDelta(content) => LiveWireEvent::TextDelta { content },
-                Kernel::Reasoning(content) => LiveWireEvent::ReasoningDelta { content },
+                Kernel::TextDelta(content) => {
+                    let (message_id, part_id, part_seq) = self.next_part_stamp("text");
+                    LiveWireEvent::TextDelta {
+                        content,
+                        message_id,
+                        part_id,
+                        part_seq,
+                    }
+                }
+                Kernel::Reasoning(content) => {
+                    let (message_id, part_id, part_seq) = self.next_part_stamp("reasoning");
+                    LiveWireEvent::ReasoningDelta {
+                        content,
+                        message_id,
+                        part_id,
+                        part_seq,
+                    }
+                }
                 Kernel::ToolStarted { call } => {
+                    // Tool boundary: the post-tool prose is a new streaming part.
+                    self.end_streaming_part();
                     self.tools.insert(
                         call.id.clone(),
                         (call.name.clone(), std::time::Instant::now()),
@@ -1678,6 +1853,7 @@ impl NativeLiveWireProjector {
                         id: call.id,
                         name: call.name,
                         arguments: call.arguments,
+                        message_id: self.current_message_id.clone(),
                     }
                 }
                 Kernel::ToolProgress { call_id, message } => {
@@ -1716,16 +1892,48 @@ impl NativeLiveWireProjector {
                     cached: meta.tokens.cached as usize,
                 },
                 Kernel::Compacted {
+                    removed,
+                    bytes_before,
                     bytes_after,
                     committed: true,
                     ..
                 } => {
+                    crate::publish_global(crate::GlobalWireEvent::Activity {
+                        session_id: self.session_id.clone(),
+                        running: true,
+                        terminal: None,
+                        status: None,
+                    });
+                    let before_tokens = (bytes_before as f32 / 3.5).ceil() as usize;
                     let after_tokens = (bytes_after as f32 / 3.5).ceil() as usize;
-                    LiveWireEvent::Tokens {
-                        prompt: after_tokens,
-                        completion: 0,
-                        total: after_tokens,
-                        cached: 0,
+                    let mark = jeikcode_config::i18n::format_compaction_mark(
+                        removed,
+                        before_tokens,
+                        after_tokens,
+                    );
+                    LiveWireEvent::Warning { message: mark }
+                }
+                Kernel::CompactionFailed { error, .. } => {
+                    crate::publish_global(crate::GlobalWireEvent::Activity {
+                        session_id: self.session_id.clone(),
+                        running: true,
+                        terminal: None,
+                        status: None,
+                    });
+                    LiveWireEvent::Warning {
+                        message: format!("Compaction failed: {error}"),
+                    }
+                }
+                Kernel::CompactionStarted { .. } => {
+                    crate::publish_global(crate::GlobalWireEvent::Activity {
+                        session_id: self.session_id.clone(),
+                        running: true,
+                        terminal: None,
+                        status: Some("compacting".to_string()),
+                    });
+                    LiveWireEvent::SessionStatus {
+                        session_id: self.session_id.clone(),
+                        status: "compacting".to_string(),
                     }
                 }
                 Kernel::Error { message, .. } => LiveWireEvent::Error { message },
@@ -1750,8 +1958,7 @@ impl NativeLiveWireProjector {
                 | Kernel::Snapshot { .. }
                 | Kernel::TurnComplete { .. }
                 | Kernel::Cancelled
-                | Kernel::CompactionStarted { .. }
-                | Kernel::CompactionFailed { .. } => return None,
+                | Kernel::Compacted { .. } => return None,
                 Kernel::Steered { count, inputs } => LiveWireEvent::Steered {
                     count,
                     inputs,
@@ -2098,6 +2305,9 @@ fn live_stream_from_registry(
     let project_hash = crate::hash_path(&working_dir);
     let provider = live_current_provider();
     let (tx, out_rx) = mpsc::unbounded_channel::<LiveWireEvent>();
+    // Snapshot + replay head is emitted ahead of the live bus and tagged
+    // `replay: true`; only those frames may be de-duplicated client-side.
+    let mut head: Vec<LiveWireEvent> = Vec::new();
     let mut snapshot_messages: Vec<crate::MessageInfo> = snapshot
         .messages
         .iter()
@@ -2105,7 +2315,7 @@ fn live_stream_from_registry(
         .collect();
     crate::stamp_turn_elapsed_on_last_assistants(&mut snapshot_messages, &[]);
     crate::attach_display_images(&mut snapshot_messages, &working_dir, &session_id);
-    let _ = tx.send(LiveWireEvent::Snapshot {
+    head.push(LiveWireEvent::Snapshot {
         messages: snapshot_messages,
         session_id: session_id.clone(),
         session_name,
@@ -2133,7 +2343,7 @@ fn live_stream_from_registry(
     };
     for sequenced in replay {
         if let Some(w) = project_registry_event(&mut projector, sequenced) {
-            let _ = tx.send(w);
+            head.push(w);
         }
     }
 
@@ -2160,20 +2370,13 @@ fn live_stream_from_registry(
         }
     });
 
-    let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(out_rx).map(|w| {
-        let json = serde_json::to_string(&w).unwrap_or_else(|error| {
-            crate::ctrace!(
-                "LIVE",
-                "live_stream: serde_json serialization failed: {error}"
-            );
-            serde_json::json!({
-                "type": "error",
-                "message": format!("live event serialization failed: {error}"),
-            })
-            .to_string()
-        });
-        Ok::<_, std::convert::Infallible>(Event::default().data(json))
+    let head_stream = futures::stream::iter(head).map(|wire| {
+        Ok::<_, std::convert::Infallible>(Event::default().data(live_wire_frame_json(&wire, true)))
     });
+    let live_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(out_rx).map(|wire| {
+        Ok::<_, std::convert::Infallible>(Event::default().data(live_wire_frame_json(&wire, false)))
+    });
+    let stream = head_stream.chain(live_stream);
     let mut resp = Sse::new(stream)
         .keep_alive(
             KeepAlive::new()
@@ -2213,6 +2416,9 @@ fn live_stream_from_hub_join(join: crate::live_hub::LiveJoin) -> axum::response:
     };
     let project_hash = crate::hash_path(&snapshot_wd);
     let (tx, out_rx) = mpsc::unbounded_channel::<LiveWireEvent>();
+    // Snapshot + replay head is emitted ahead of the live bus and tagged
+    // `replay: true`; only those frames may be de-duplicated client-side.
+    let mut head: Vec<LiveWireEvent> = Vec::new();
     let mut snapshot_messages: Vec<crate::MessageInfo> = join
         .snapshot
         .messages
@@ -2228,7 +2434,7 @@ fn live_stream_from_hub_join(join: crate::live_hub::LiveJoin) -> axum::response:
         &snapshot_wd,
         &join.binding.session_id,
     );
-    let _ = tx.send(LiveWireEvent::Snapshot {
+    head.push(LiveWireEvent::Snapshot {
         messages: snapshot_messages,
         session_id: join.binding.session_id.clone(),
         session_name,
@@ -2248,7 +2454,7 @@ fn live_stream_from_hub_join(join: crate::live_hub::LiveJoin) -> axum::response:
             observation.generation,
             observation.event,
         ) {
-            let _ = tx.send(w);
+            head.push(w);
         }
     }
     let binding_id = join.binding.id;
@@ -2279,20 +2485,13 @@ fn live_stream_from_hub_join(join: crate::live_hub::LiveJoin) -> axum::response:
         }
     });
 
-    let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(out_rx).map(|w| {
-        let json = serde_json::to_string(&w).unwrap_or_else(|error| {
-            crate::ctrace!(
-                "LIVE",
-                "live_stream: serde_json serialization failed: {error}"
-            );
-            serde_json::json!({
-                "type": "error",
-                "message": format!("live event serialization failed: {error}"),
-            })
-            .to_string()
-        });
-        Ok::<_, std::convert::Infallible>(Event::default().data(json))
+    let head_stream = futures::stream::iter(head).map(|wire| {
+        Ok::<_, std::convert::Infallible>(Event::default().data(live_wire_frame_json(&wire, true)))
     });
+    let live_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(out_rx).map(|wire| {
+        Ok::<_, std::convert::Infallible>(Event::default().data(live_wire_frame_json(&wire, false)))
+    });
+    let stream = head_stream.chain(live_stream);
     let mut resp = Sse::new(stream)
         .keep_alive(
             KeepAlive::new()
@@ -2865,7 +3064,7 @@ pub(crate) async fn live_stop(
     } else {
         crate::native_live::cancel_confirmed().await.is_ok()
     };
-    jeikcode_capabilities::tools::legacy_bash_runtime_state().cancel_all_live_bash();
+    jeikcode_capabilities::tools::legacy_bash_runtime_state().cancel_foreground_live_bash();
     Json(serde_json::json!({ "accepted": accepted }))
 }
 
@@ -3080,6 +3279,16 @@ pub(crate) async fn live_provider(
 pub(crate) struct LiveModeReq {
     /// "build" | "accept_edits" | "bypass" | "plan"
     pub mode: ApprovalMode,
+    /// 目标 session id；提供时将模式隔离记录在该会话上，避免污染其他项目/会话。
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(serde::Deserialize, Default)]
+pub(crate) struct ApprovalModeQuery {
+    /// 目标 session id；提供时优先读取该会话隔离设置的模式。
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -3088,17 +3297,29 @@ pub(crate) struct ApprovalModeResp {
     pub mode: ApprovalMode,
 }
 
-pub(crate) async fn approval_mode_get() -> impl IntoResponse {
+pub(crate) async fn approval_mode_get(
+    axum::extract::Query(query): axum::extract::Query<ApprovalModeQuery>,
+) -> impl IntoResponse {
     Json(ApprovalModeResp {
         ok: true,
-        mode: live_current_approval_mode(),
+        mode: live_session_approval_mode(query.session_id.as_deref()),
     })
 }
 
 async fn apply_live_mode(mode: ApprovalMode) -> bool {
-    live_set_mode(mode);
-    if crate::native_live::binding().is_ok() {
-        let _ = crate::native_live::set_mode(native_runtime_mode(mode)).await;
+    apply_live_mode_scoped(None, mode).await
+}
+
+async fn apply_live_mode_scoped(session_id: Option<&str>, mode: ApprovalMode) -> bool {
+    live_set_mode_for_session(session_id, mode);
+    if let Ok(binding) = crate::native_live::binding() {
+        let affects_binding = match session_id {
+            Some(sid) => binding.session_id == sid,
+            None => true,
+        };
+        if affects_binding {
+            let _ = crate::native_live::set_mode(native_runtime_mode(mode)).await;
+        }
     }
     true
 }
@@ -3107,49 +3328,63 @@ pub(crate) async fn approval_mode_set(
     State(state): State<AppState>,
     Json(req): Json<LiveModeReq>,
 ) -> impl IntoResponse {
-    let ok = apply_live_mode(req.mode).await;
+    let session_id = req.session_id.as_deref();
+    let ok = apply_live_mode_scoped(session_id, req.mode).await;
     if req.mode == ApprovalMode::Auto {
         state
             .pending_permissions
             .deliver_all(PermissionDecision::AllowOnce);
         if let Ok(binding) = crate::native_live::binding() {
-            jeikcode_capabilities::session::SessionManager::clear_pending_permission_any_project(
-                &binding.session_id,
-            );
+            let affects_binding = match session_id {
+                Some(sid) => binding.session_id == sid,
+                None => true,
+            };
+            if affects_binding {
+                jeikcode_capabilities::session::SessionManager::clear_pending_permission_any_project(
+                    &binding.session_id,
+                );
+            }
         }
     }
     Json(ApprovalModeResp {
         ok,
-        mode: live_current_approval_mode(),
+        mode: live_session_approval_mode(session_id),
     })
 }
 
 /// POST /live/mode — webui 底栏「模式」pill 切换审批模式
 /// （build / accept_edits / bypass / plan）。
 ///
-/// 更新进程级 LIVE_APPROVAL_MODE；若当前已有 live 会话，则广播 ModeChanged 让
+/// 更新进程级 LIVE_APPROVAL_MODE 或会话隔离模式；若当前已有 live 会话，则广播 ModeChanged 让
 /// 其他 webui tab / TUI 实时跟随。没有 live 会话时不为一次普通模式切换创建会话。
-/// 下一轮实际用哪个 PermissionDecider 由 run_turn 读 LIVE_APPROVAL_MODE 决定。
+/// 下一轮实际用哪个 PermissionDecider 由 run_turn 读 LIVE_APPROVAL_MODE 或 session 模式决定。
 /// 模式是运行时会话状态，不写入 config（与 provider 持久化为默认不同）——避免
 /// Auto（wire: bypass）这种危险态被静默持久化。
 pub(crate) async fn live_mode(
     State(state): State<AppState>,
     Json(req): Json<LiveModeReq>,
 ) -> impl IntoResponse {
-    let ok = apply_live_mode(req.mode).await;
+    let session_id = req.session_id.as_deref();
+    let ok = apply_live_mode_scoped(session_id, req.mode).await;
     if req.mode == ApprovalMode::Auto {
         state
             .pending_permissions
             .deliver_all(PermissionDecision::AllowOnce);
         if let Ok(binding) = crate::native_live::binding() {
-            jeikcode_capabilities::session::SessionManager::clear_pending_permission_any_project(
-                &binding.session_id,
-            );
+            let affects_binding = match session_id {
+                Some(sid) => binding.session_id == sid,
+                None => true,
+            };
+            if affects_binding {
+                jeikcode_capabilities::session::SessionManager::clear_pending_permission_any_project(
+                    &binding.session_id,
+                );
+            }
         }
     }
     Json(ApprovalModeResp {
         ok,
-        mode: live_current_approval_mode(),
+        mode: live_session_approval_mode(session_id),
     })
 }
 
@@ -3623,6 +3858,7 @@ mod tests {
             }]),
             created_at: None,
             elapsed_ms: None,
+            id: None,
         }
     }
 
@@ -3882,7 +4118,9 @@ mod tests {
         let _mode_guard = ScopedApprovalModeForTest::new();
         live_set_mode(ApprovalMode::Auto);
 
-        let response = approval_mode_get().await.into_response();
+        let response = approval_mode_get(axum::extract::Query(ApprovalModeQuery::default()))
+            .await
+            .into_response();
         assert_eq!(response.status().as_u16(), 200);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -3891,6 +4129,50 @@ mod tests {
             serde_json::from_slice(&body).expect("approval mode response json");
 
         assert_eq!(value, serde_json::json!({ "ok": true, "mode": "bypass" }));
+    }
+
+    #[tokio::test]
+    async fn approval_mode_session_scoped_isolation() {
+        let _mode_guard = ScopedApprovalModeForTest::new();
+        live_set_mode(ApprovalMode::Build);
+        live_set_session_approval_mode(Some("session-alpha"), ApprovalMode::Plan);
+
+        // Default query without session_id returns global Build mode.
+        let resp_default = approval_mode_get(axum::extract::Query(ApprovalModeQuery::default()))
+            .await
+            .into_response();
+        let body_default = axum::body::to_bytes(resp_default.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        let val_default: serde_json::Value =
+            serde_json::from_slice(&body_default).expect("json");
+        assert_eq!(val_default, serde_json::json!({ "ok": true, "mode": "build" }));
+
+        // Scoped query for session-alpha returns isolated Plan mode.
+        let resp_alpha = approval_mode_get(axum::extract::Query(ApprovalModeQuery {
+            session_id: Some("session-alpha".to_string()),
+        }))
+        .await
+        .into_response();
+        let body_alpha = axum::body::to_bytes(resp_alpha.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        let val_alpha: serde_json::Value =
+            serde_json::from_slice(&body_alpha).expect("json");
+        assert_eq!(val_alpha, serde_json::json!({ "ok": true, "mode": "plan" }));
+
+        // Other session without explicit override falls back to global Build mode.
+        let resp_beta = approval_mode_get(axum::extract::Query(ApprovalModeQuery {
+            session_id: Some("session-beta".to_string()),
+        }))
+        .await
+        .into_response();
+        let body_beta = axum::body::to_bytes(resp_beta.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        let val_beta: serde_json::Value =
+            serde_json::from_slice(&body_beta).expect("json");
+        assert_eq!(val_beta, serde_json::json!({ "ok": true, "mode": "build" }));
     }
 
     /// Regression guard (2nd occurrence — see the `never eprintln` note near the
@@ -4245,11 +4527,8 @@ mod tests {
             false,
             false,
         );
-        let configured_timeout = runtime_cfg.agent_config().request_timeout;
-        assert!(configured_timeout.is_some());
-        let driver_request_timeout = configure_chat_runtime_interactivity(&mut runtime_cfg, true);
-        assert_eq!(driver_request_timeout, configured_timeout);
-        assert!(driver_request_timeout.is_some());
+        assert!(runtime_cfg.agent_config().request_timeout.is_some());
+        configure_chat_runtime_interactivity(&mut runtime_cfg, true);
         assert!(runtime_cfg.agent_config().request_timeout.is_none());
     }
 
@@ -4577,6 +4856,7 @@ mod tests {
                 inputs: vec![jeikcode_kernel::event::SteeredInput {
                     text: "use the smaller fix".into(),
                     images: Vec::new(),
+                    message_id: Some("m-steer-1".into()),
                 }],
                 client_input_ids: vec![Some("web-1".into())],
             })
@@ -4586,7 +4866,25 @@ mod tests {
         assert_eq!(json["count"], 1);
         assert_eq!(json["inputs"][0]["text"], "use the smaller fix");
         assert_eq!(json["inputs"][0]["images"], serde_json::json!([]));
+        assert_eq!(json["inputs"][0]["message_id"], "m-steer-1");
         assert_eq!(json["client_input_ids"][0], "web-1");
+    }
+
+    #[test]
+    fn native_live_projector_exposes_the_stored_user_prompt_identity() {
+        let mut projector = NativeLiveWireProjector::default();
+        let wire = projector
+            .project(crate::live_hub::LiveViewEvent::Runtime(
+                CodingRuntimeEvent::Agent(jeikcode_kernel::event::AgentEvent::UserMessage {
+                    message_id: "m-user-1".into(),
+                    turn_ordinal: 4,
+                }),
+            ))
+            .expect("the stored user identity must reach the live wire");
+        let json = serde_json::to_value(wire).unwrap();
+        assert_eq!(json["type"], "user_identified");
+        assert_eq!(json["message_id"], "m-user-1");
+        assert_eq!(json["turn_ordinal"], 4);
     }
 
     #[test]

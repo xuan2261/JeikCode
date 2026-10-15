@@ -518,31 +518,24 @@ mod tests {
 
     struct ScopedHome {
         _lock: std::sync::MutexGuard<'static, ()>,
-        previous: Option<std::ffi::OsString>,
         _dir: tempfile::TempDir,
+        /// Thread-local home override instead of `set_var("JEIKCODE_HOME")`:
+        /// runtime env stays constant, which is what the resolved-once config
+        /// home depends on (see `Config::config_dir`).
+        _home: jeikcode_config::test_util::IsolatedHome,
     }
 
     impl ScopedHome {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let lock = crate::jeikcode_home_test_lock()
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            let previous = std::env::var_os("JEIKCODE_HOME");
             let dir = tempfile::tempdir().unwrap();
-            std::env::set_var("JEIKCODE_HOME", dir.path());
+            let home = jeikcode_config::test_util::IsolatedHome::at(dir.path());
             Self {
                 _lock: lock,
-                previous,
                 _dir: dir,
-            }
-        }
-    }
-
-    impl Drop for ScopedHome {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(value) => std::env::set_var("JEIKCODE_HOME", value),
-                None => std::env::remove_var("JEIKCODE_HOME"),
+                _home: home,
             }
         }
     }

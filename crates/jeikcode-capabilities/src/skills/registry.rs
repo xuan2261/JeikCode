@@ -175,6 +175,18 @@ impl SkillRegistry {
         self.skills.values().map(|s| s.as_ref())
     }
 
+    /// Drop every skill whose registry name is listed in `disabled`. Used by the
+    /// runtime and the `/skills` + capability endpoints to honor the persisted
+    /// GLOBAL/PROJECT disable state ([`super::controls`]).
+    /// Matches both bare names ("foo") and namespaced IDs ("skills:foo").
+    pub fn retain_enabled(&mut self, disabled: &std::collections::BTreeSet<String>) {
+        if disabled.is_empty() {
+            return;
+        }
+        self.skills
+            .retain(|name, _| !super::controls::is_skill_disabled(disabled, name));
+    }
+
     /// Render the `=== AVAILABLE SKILLS ===` frozen user-prefix section (budget-gated,
     /// source-ranked), or `None` when no skills are installed. See
     /// [`super::render`].
@@ -236,12 +248,11 @@ pub fn standard_skill_dirs(home: &Path, project: &Path) -> Vec<PathBuf> {
 /// stray `JEIKCODE_HOME=` never rebases skills onto a bogus relative `skills` path.
 pub fn runtime_skill_dirs(home: &Path, project: &Path) -> Vec<PathBuf> {
     let dirs = standard_skill_dirs(home, project);
-    let Some(jeikcode_home) = std::env::var_os("JEIKCODE_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-    else {
-        return dirs;
-    };
+    // Unified derivation (env → legacy → real home, resolved once, plus the
+    // thread-local test override). Reading `JEIKCODE_HOME` here used to be a
+    // second rule that could rebase skills onto a different root than
+    // `Config::config_dir()` — the exact "two homes" drift.
+    let jeikcode_home = jeikcode_config::Config::config_dir();
     let user_jeikcode = home.join(".jeikcode");
     dirs.into_iter()
         .map(|dir| match dir.strip_prefix(&user_jeikcode) {
@@ -261,13 +272,9 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         let config_root = tempfile::tempdir().unwrap();
-        let prev = std::env::var_os("JEIKCODE_HOME");
-        std::env::set_var("JEIKCODE_HOME", config_root.path());
+        // 线程级 home（不再全局写 env）。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(config_root.path());
         let dirs = runtime_skill_dirs(home.path(), project.path());
-        match prev {
-            Some(v) => std::env::set_var("JEIKCODE_HOME", v),
-            None => std::env::remove_var("JEIKCODE_HOME"),
-        }
 
         // BOTH user-level `.jeikcode/*` dirs (skills AND commands) move under JEIKCODE_HOME.
         assert!(dirs.contains(&config_root.path().join("skills")));
@@ -286,13 +293,13 @@ mod tests {
     fn runtime_dirs_treat_empty_jeikcode_home_as_unset() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        let prev = std::env::var_os("JEIKCODE_HOME");
-        std::env::set_var("JEIKCODE_HOME", "");
+        // “空 JEIKCODE_HOME = 未设置”现在等价于“本线程用默认临时 home”：重点断言
+        // 不产生 bogus 的相对 `skills` 目录（历史回归：`PathBuf::from("").join("skills")`）。
+        // 把 seam 钉在**本测试 home 的 .jeikcode 根**上：`runtime_skill_dirs` 会把
+        // `home/.jeikcode/*` 重基到 `Config::config_dir()`（也就是 seam 根本身），
+        // 所以 seam 必须等于 `home/.jeikcode`，两侧才会一致。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path().join(".jeikcode"));
         let dirs = runtime_skill_dirs(home.path(), project.path());
-        match prev {
-            Some(v) => std::env::set_var("JEIKCODE_HOME", v),
-            None => std::env::remove_var("JEIKCODE_HOME"),
-        }
 
         // Empty JEIKCODE_HOME must be treated as unset — NOT redirected to a bogus
         // relative `skills` path (regression: `PathBuf::from("").join("skills")`).
@@ -434,6 +441,22 @@ mod tests {
     }
 
     #[test]
+    fn retain_enabled_drops_only_disabled_names() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("alpha.md"), "A\n").unwrap();
+        std::fs::write(d.path().join("beta.md"), "B\n").unwrap();
+        let mut reg = SkillRegistry::load(&[d.path().to_path_buf()]);
+        assert_eq!(reg.len(), 2);
+        // "skills:alpha" in disabled must drop bare "alpha" in registry
+        let disabled: std::collections::BTreeSet<String> =
+            ["skills:alpha".to_string()].into_iter().collect();
+        reg.retain_enabled(&disabled);
+        assert_eq!(reg.len(), 1);
+        assert!(reg.get("beta").is_some());
+        assert!(reg.get("alpha").is_none());
+    }
+
+    #[test]
     fn standard_dirs_include_agents_skills_between_claude_and_jeikcode() {
         let home = Path::new("/home/u");
         let project = Path::new("/proj");
@@ -475,9 +498,8 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let config_root = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        let previous = std::env::var_os("JEIKCODE_HOME");
-        std::env::set_var("JEIKCODE_HOME", config_root.path());
-
+        // 线程级 home（不再全局写 env）。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(config_root.path());
         let skill_root = config_root.path().join("skills");
         for (dir, body) in [("dedup-a", "from A"), ("dedup-b", "from B")] {
             let skill_dir = skill_root.join(dir);
@@ -490,10 +512,6 @@ mod tests {
         }
 
         let dirs = runtime_skill_dirs(home.path(), project.path());
-        match previous {
-            Some(value) => std::env::set_var("JEIKCODE_HOME", value),
-            None => std::env::remove_var("JEIKCODE_HOME"),
-        }
         let user_skills = dirs
             .iter()
             .find(|dir| *dir == &skill_root)

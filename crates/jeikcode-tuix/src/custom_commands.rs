@@ -436,8 +436,8 @@ mod tests {
         // Isolate $JEIKCODE_HOME so the global commands dir and any installed
         // plugin commands on the dev machine don't leak into the assertion.
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
-
+        // 线程级 home（不再全局写 env）。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let dir = tempfile::tempdir().unwrap();
         let cmd_dir = dir.path().join(".jeikcode/commands");
         std::fs::create_dir_all(&cmd_dir).unwrap();
@@ -504,8 +504,8 @@ mod tests {
     fn load_plugin_layer_namespaces_commands() {
         // Set up an installed plugin on disk via the plugin module's state.
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", tmp.path());
-
+        // 线程级 home（不再全局写 env）。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(tmp.path());
         let plugin_dir = tmp.path().join("plugins/marketplaces/p");
         let cmd_dir = plugin_dir.join("commands");
         std::fs::create_dir_all(&cmd_dir).unwrap();

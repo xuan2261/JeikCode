@@ -75,6 +75,10 @@ TUI 里等价的是 `/mcp login <server>` / `/mcp logout <server>`。token 存 `
 
 信任记录在 `~/.jeikcode/mcp_trust.json`（可用 `JEIKCODE_MCP_TRUST_STORE` 覆盖路径，测试用）。daemon 侧对应 `POST /live/mcp/trust`。
 
+**信任门只审「能不能被加载」，是否加载由开关决定**：GLOBAL / PROJECT 两级开关是 union-disabled——任一 scope 关掉，server 就被 `load_mcp_config` 过滤，既不连接也不进上下文（重挂时运行时先 `withdraw_mcp_tools` 撤回已挂载的工具）；开关打开就必须加载，信任门不能反过来把它扣住。
+
+**WebUI 不弹信任提示**：侧栏 MCP 面板一旦从 `/mcp/status` 看到「本项目未信任 + 存在被拦截的项目级 server」，就静默调用 `POST /live/mcp/trust` 并刷新（`Sidebar.tsx::maybeAutoTrustProjectMcp`）；拨开某个 MCP 的 GLOBAL/PROJECT 开关时，还会先把信任补上再落开关（`Sidebar.tsx::onToggleCapability`），保证「开关一落地就是已连接」。拦截横幅与「信任本项目」按钮已移除；TUI / 命令行仍走上面的 `/mcp trust`。
+
 ### 1.5 生效
 
 改完配置**不用重启**，`/mcp reload` 即可（重新读两份配置并后台重连）。
@@ -258,7 +262,7 @@ cat > ~/.jeikcode/mcp.json << 'EOF'
 EOF
 ```
 
-（放用户级可绕开项目信任门；放项目级记得先 `/mcp trust`。）
+（放用户级可绕开项目信任门；放项目级时 TUI 需先 `/mcp trust`，WebUI 自动信任。）
 
 ---
 

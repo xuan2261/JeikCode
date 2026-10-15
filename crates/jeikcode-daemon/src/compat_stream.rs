@@ -18,8 +18,8 @@ use super::{now_unix, WireFormat};
 /// code simply vanishes from `choices[0].delta.content`.
 #[derive(Debug, Clone)]
 pub(super) enum ArtifactEmit {
-    /// ```` ```lang ```` … ```` ``` ```` (language may be empty).
-    Fence,
+    /// ```` ```lang ```` … ```` ``` ```` with specific fence length.
+    Fence(usize),
     /// Raw HTML/SVG captured from tags — body already includes the markup.
     Raw,
     /// `create_file` HTML/SVG preview — not model text; skip.
@@ -37,18 +37,25 @@ pub(super) fn apply_artifact_event(
     open: &mut HashMap<String, ArtifactEmit>,
 ) -> Option<String> {
     match event {
-        ChatEvent::ArtifactStart { id, language, .. } => {
+        ChatEvent::ArtifactStart {
+            id,
+            language,
+            fence_len,
+            ..
+        } => {
             if id.starts_with("file-") {
                 open.insert(id.clone(), ArtifactEmit::Skip);
                 return None;
             }
             if language.is_some() {
-                open.insert(id.clone(), ArtifactEmit::Fence);
+                let flen = (*fence_len).max(3);
+                open.insert(id.clone(), ArtifactEmit::Fence(flen));
+                let marker = "`".repeat(flen);
                 let lang = language.as_deref().unwrap_or("").trim();
                 if lang.is_empty() {
-                    Some("```\n".into())
+                    Some(format!("{marker}\n"))
                 } else {
-                    Some(format!("```{lang}\n"))
+                    Some(format!("{marker}{lang}\n"))
                 }
             } else {
                 open.insert(id.clone(), ArtifactEmit::Raw);
@@ -60,7 +67,10 @@ pub(super) fn apply_artifact_event(
             Some(_) | None => Some(content.clone()),
         },
         ChatEvent::ArtifactEnd { id } => match open.remove(id) {
-            Some(ArtifactEmit::Fence) => Some("```\n".into()),
+            Some(ArtifactEmit::Fence(flen)) => {
+                let marker = "`".repeat(flen);
+                Some(format!("{marker}\n"))
+            }
             _ => None,
         },
         _ => None,
@@ -73,8 +83,9 @@ pub(super) fn close_open_artifact_fences(open: &mut HashMap<String, ArtifactEmit
     let mut out = String::new();
     let ids: Vec<String> = open.keys().cloned().collect();
     for id in ids {
-        if matches!(open.remove(&id), Some(ArtifactEmit::Fence)) {
-            out.push_str("```\n");
+        if let Some(ArtifactEmit::Fence(flen)) = open.remove(&id) {
+            let marker = "`".repeat(flen);
+            out.push_str(&format!("{marker}\n"));
         }
     }
     out
@@ -612,7 +623,12 @@ impl CompatProjector {
         // events are rewritten to TextDelta *before* format projection.
         let mut out = Vec::new();
         if let Some(text) = apply_artifact_event(&event, &mut self.artifact_open) {
-            out.extend(self.project_format(ChatEvent::TextDelta { content: text }));
+            out.extend(self.project_format(ChatEvent::TextDelta {
+                content: text,
+                message_id: None,
+                part_id: None,
+                part_seq: None,
+            }));
             return out;
         }
         if matches!(
@@ -620,7 +636,12 @@ impl CompatProjector {
             ChatEvent::Done { .. } | ChatEvent::Error { .. } | ChatEvent::Stopped
         ) {
             if let Some(text) = self.flush_open_artifact_markdown() {
-                out.extend(self.project_format(ChatEvent::TextDelta { content: text }));
+                out.extend(self.project_format(ChatEvent::TextDelta {
+                    content: text,
+                    message_id: None,
+                    part_id: None,
+                    part_seq: None,
+                }));
             }
         }
         out.extend(self.project_format(event));
@@ -629,7 +650,7 @@ impl CompatProjector {
 
     fn project_format(&mut self, event: ChatEvent) -> Vec<SseChunk> {
         match event {
-            ChatEvent::TextDelta { ref content } => self.note_answer_text(content),
+            ChatEvent::TextDelta { ref content, .. } => self.note_answer_text(content),
             ChatEvent::ToolBatchStarted { .. }
             | ChatEvent::ToolCallStarted { .. }
             | ChatEvent::ToolCallResult { .. } => self.seal_answer_segment(),
@@ -682,14 +703,14 @@ impl CompatProjector {
     fn project_openai_chat(&mut self, event: ChatEvent) -> Vec<SseChunk> {
         let mut out = Vec::new();
         match event {
-            ChatEvent::ReasoningDelta { content } => {
+            ChatEvent::ReasoningDelta { content, .. } => {
                 self.ensure_openai_started(&mut out);
                 // After a tool/subagent timeline line we already ended with `\n`.
                 // Mid-stream model thinking is left as-is for continuity.
                 self.note_reasoning_tail(&content);
                 out.push(self.openai_chunk(json!({"reasoning_content": content}), None));
             }
-            ChatEvent::TextDelta { content } => {
+            ChatEvent::TextDelta { content, .. } => {
                 self.ensure_openai_started(&mut out);
                 // Separate answer from reasoning/tool timeline.
                 let text = if self.reasoning_needs_nl {
@@ -737,6 +758,7 @@ impl CompatProjector {
                 id,
                 name,
                 arguments,
+                ..
             } => {
                 self.ensure_openai_started(&mut out);
                 self.remember_tool(&id, &name);
@@ -986,7 +1008,7 @@ impl CompatProjector {
             ));
         }
         match event {
-            ChatEvent::ReasoningDelta { content } => {
+            ChatEvent::ReasoningDelta { content, .. } => {
                 out.push(self.responses_event(
                     "response.reasoning.delta",
                     json!({
@@ -995,7 +1017,7 @@ impl CompatProjector {
                     }),
                 ));
             }
-            ChatEvent::TextDelta { content } => {
+            ChatEvent::TextDelta { content, .. } => {
                 out.push(self.responses_event(
                     "response.output_text.delta",
                     json!({
@@ -1013,6 +1035,7 @@ impl CompatProjector {
                 id,
                 name,
                 arguments,
+                ..
             } => {
                 out.extend(self.responses_tool_started(&id, &name, &arguments));
             }
@@ -1260,7 +1283,7 @@ impl CompatProjector {
         }
 
         match event {
-            ChatEvent::ReasoningDelta { content } => {
+            ChatEvent::ReasoningDelta { content, .. } => {
                 if self.thinking_block.is_none() {
                     self.close_open_anthropic_blocks(&mut out);
                     let idx = self.next_block;
@@ -1288,7 +1311,7 @@ impl CompatProjector {
                     });
                 }
             }
-            ChatEvent::TextDelta { content } => {
+            ChatEvent::TextDelta { content, .. } => {
                 if self.thinking_block.is_some() {
                     self.close_open_anthropic_blocks(&mut out);
                 }
@@ -1328,6 +1351,7 @@ impl CompatProjector {
                 id,
                 name,
                 arguments,
+                ..
             } => {
                 self.close_open_anthropic_blocks(&mut out);
                 out.extend(self.anthropic_tool_started(&id, &name, &arguments));
@@ -1580,11 +1604,13 @@ mod tests {
             id: "call_a".into(),
             name: "read".into(),
             arguments: "{}".into(),
+            message_id: None,
         });
         let b = p.project(ChatEvent::ToolCallStarted {
             id: "call_b".into(),
             name: "grep".into(),
             arguments: "{}".into(),
+            message_id: None,
         });
         let out_a = p.project(ChatEvent::ToolOutputChunk {
             id: "call_a".into(),
@@ -1637,6 +1663,7 @@ mod tests {
             id: "call_task".into(),
             name: "task".into(),
             arguments: "{}".into(),
+            message_id: None,
         }));
         for (id, msg) in [
             ("explore#1", "排队中 · 搜目录"),
@@ -1690,6 +1717,7 @@ mod tests {
             name: "task".into(),
             arguments: r#"{"tasks":[{"description":"d","prompt":"p","subagent_type":"explore"}]}"#
                 .into(),
+            message_id: None,
         });
         let prog = p.project(ChatEvent::ToolProgress {
             id: "task_1".into(),
@@ -1708,6 +1736,7 @@ mod tests {
             id: "call_x".into(),
             name: "bash".into(),
             arguments: r#"{"command":"ls"}"#.into(),
+            message_id: None,
         });
         let joined: String = chunks.iter().map(|c| c.data.as_str()).collect();
         assert!(
@@ -1731,11 +1760,13 @@ mod tests {
             id: "toolu_1".into(),
             name: "read".into(),
             arguments: "{}".into(),
+            message_id: None,
         });
         let b = p.project(ChatEvent::ToolCallStarted {
             id: "toolu_2".into(),
             name: "grep".into(),
             arguments: "{}".into(),
+            message_id: None,
         });
         let joined: String = a.iter().chain(b.iter()).map(|c| c.data.as_str()).collect();
         assert!(joined.contains("toolu_1"));
@@ -1766,12 +1797,16 @@ mod tests {
         let mut all = Vec::new();
         all.extend(p.project(ChatEvent::TextDelta {
             content: "分布：\n\n".into(),
+            message_id: None,
+            part_id: None,
+            part_seq: None,
         }));
         all.extend(p.project(ChatEvent::ArtifactStart {
             id: "artifact_1".into(),
             artifact_type: "code".into(),
             language: Some("python".into()),
             title: Some("python".into()),
+            fence_len: 3,
         }));
         all.extend(p.project(ChatEvent::ArtifactContent {
             id: "artifact_1".into(),
@@ -1782,6 +1817,9 @@ mod tests {
         }));
         all.extend(p.project(ChatEvent::TextDelta {
             content: "\n---\n\n### 方式二".into(),
+            message_id: None,
+            part_id: None,
+            part_seq: None,
         }));
         let text = openai_content_deltas(&all);
         assert!(
@@ -1801,6 +1839,7 @@ mod tests {
             artifact_type: "html".into(),
             language: Some("html".into()),
             title: Some("index.html".into()),
+            fence_len: 3,
         }));
         all.extend(p.project(ChatEvent::ArtifactContent {
             id: "file-abc".into(),
@@ -1825,6 +1864,7 @@ mod tests {
             artifact_type: "html".into(),
             language: None,
             title: None,
+            fence_len: 3,
         }));
         all.extend(p.project(ChatEvent::ArtifactContent {
             id: "artifact_2".into(),
@@ -1843,6 +1883,9 @@ mod tests {
         let mut all = Vec::new();
         all.extend(p.project(ChatEvent::TextDelta {
             content: "说明：\n\n".into(),
+            message_id: None,
+            part_id: None,
+            part_seq: None,
         }));
         for (id, lang, body) in [
             ("a1", "kjson", "{\n  \"a\": 1\n}\n"),
@@ -1854,6 +1897,7 @@ mod tests {
                 artifact_type: "code".into(),
                 language: Some(lang.into()),
                 title: Some(lang.into()),
+                fence_len: 3,
             }));
             all.extend(p.project(ChatEvent::ArtifactContent {
                 id: id.into(),
@@ -1874,12 +1918,16 @@ mod tests {
         let mut all = Vec::new();
         all.extend(p.project(ChatEvent::TextDelta {
             content: "# 标题\n\n".into(),
+            message_id: None,
+            part_id: None,
+            part_seq: None,
         }));
         all.extend(p.project(ChatEvent::ArtifactStart {
             id: "a1".into(),
             artifact_type: "code".into(),
             language: Some("kjson".into()),
             title: Some("kjson".into()),
+            fence_len: 3,
         }));
         all.extend(p.project(ChatEvent::ArtifactContent {
             id: "a1".into(),

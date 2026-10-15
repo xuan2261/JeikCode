@@ -149,11 +149,21 @@ impl UserInputResponders {
 
     /// Delivers at most one answer. Removing before send rejects duplicate/stale POSTs.
     pub fn deliver(&self, session_id: &str, request_id: u64, value: serde_json::Value) -> bool {
-        self.inner
+        let delivered = self
+            .inner
             .write()
             .unwrap()
             .remove(&(session_id.to_owned(), request_id))
-            .is_some_and(|tx| tx.send(value).is_ok())
+            .is_some_and(|tx| tx.send(value).is_ok());
+        if delivered {
+            // 跨实例增量：提问卡已答复 → 所有实例就地移除该卡片。
+            crate::publish_global(crate::GlobalWireEvent::ReviewResolved {
+                session_id: session_id.to_owned(),
+                approval_id: None,
+                request_id: Some(request_id),
+            });
+        }
+        delivered
     }
 }
 
@@ -223,6 +233,12 @@ impl PermissionResponders {
                 PermissionDelivery::Expired
             }
             Some(PermissionResponderEntry::Pending(pending)) => {
+                // 决策一旦被认领，待交互状态就变了：所有实例就地移除该卡片。
+                crate::publish_global(crate::GlobalWireEvent::ReviewResolved {
+                    session_id: session_id.to_owned(),
+                    approval_id: Some(approval_id.to_owned()),
+                    request_id: None,
+                });
                 let (accepted_tx, accepted_rx) = oneshot::channel();
                 match pending.tx.send(PermissionSubmissionEnvelope::with_ack(
                     submission,
@@ -251,6 +267,7 @@ impl PermissionResponders {
                 matches!(value, PermissionResponderEntry::Pending(_)).then(|| key.clone())
             })
             .collect();
+        let resolved_keys = keys.clone();
         let pending: Vec<_> = keys
             .into_iter()
             .filter_map(|key| match guard.remove(&key) {
@@ -259,6 +276,13 @@ impl PermissionResponders {
             })
             .collect();
         drop(guard);
+        for key in &resolved_keys {
+            crate::publish_global(crate::GlobalWireEvent::ReviewResolved {
+                session_id: key.0.clone(),
+                approval_id: Some(key.1.clone()),
+                request_id: None,
+            });
+        }
         pending
             .into_iter()
             .map(|tx| {

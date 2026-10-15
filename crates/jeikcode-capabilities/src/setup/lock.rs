@@ -55,15 +55,7 @@ struct Sentinel {
 }
 
 fn lock_dir(project_root: &Path) -> PathBuf {
-    let jeik = project_root.join(".jeikcode");
-    if jeik.exists() {
-        return jeik;
-    }
-    let legacy_dir = project_root.join(".atomcode");
-    if legacy_dir.exists() {
-        return legacy_dir;
-    }
-    jeik
+    project_root.join(".jeikcode")
 }
 
 fn current_pid() -> u32 {

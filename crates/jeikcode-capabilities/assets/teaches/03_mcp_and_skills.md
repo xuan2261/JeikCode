@@ -76,7 +76,7 @@ jeikcode mcp logout github
 | **终端命令** | `/mcp reload` | WebUI / TUI 重新读取配置并后台重连。 |
 | **WebUI 界面** | 侧栏 MCP 菜单的「刷新按钮」 | 点按即可即时重新挂载。 |
 | **状态查看** | `/mcp` | 列出当前所有 MCP 服务连接状态。 |
-| **信任授权** | `/mcp trust` | 首次在未信任项目中使用项目级 `.mcp.json` 时需授权信任。 |
+| **信任授权** | `/mcp trust` | 信任门只审「能不能被加载」：项目级 `.mcp.json` 在未信任项目里默认被拦截，但开关（GLOBAL/PROJECT union-disabled）才是是否加载的唯一权威。WebUI 检测到拦截或拨开 MCP 开关时会自动静默信任；TUI / 命令行需 `/mcp trust` 显式授权。 |
 
 ---
 

@@ -1,50 +1,36 @@
-//! Shared test plumbing for the plugin module. All plugin tests that
-//! mutate `JEIKCODE_HOME` use [`isolated_home`] to obtain an [`IsolatedHome`]
-//! guard whose `Drop` removes the env var, preventing cross-test leakage when
-//! tempdirs clean up out of order.
+//! Test support: a private home directory per test.
 //!
-//! Tests that share this guard MUST also be marked
-//! `#[serial_test::serial]` (default unnamed lock) so they serialize against
-//! each other across modules.
+//! Migration note: this used to `set_var("JEIKCODE_HOME")` at PROCESS scope and
+//! restore it on drop. Process-wide env writes are now forbidden (see the
+//! daemon's `env_write_guard_tests`) because `Config::config_dir()` resolves
+//! once per process — a later flip would split "write" and "read" across two
+//! different roots. The home override is instead THREAD-LOCAL, so parallel
+//! tests never see each other's home and the resolved-once path stays valid.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
+/// A fresh temp home for the CURRENT THREAD until dropped.
+///
+/// Kept API-compatible on purpose: existing tests use `_home` purely as a
+/// lifetime guard (and occasionally read `home.path`).
 pub struct IsolatedHome {
-    _tmp: tempfile::TempDir,
-    path: PathBuf,
-    prev: Option<std::ffi::OsString>,
+    inner: jeikcode_config::test_util::IsolatedHome,
+    /// The temp home directory this thread resolves while the guard lives.
+    pub path: PathBuf,
 }
 
 impl IsolatedHome {
-    pub fn path(&self) -> &Path {
+    /// Same value as the `path` field, method form (both spellings are used).
+    pub fn path(&self) -> &std::path::Path {
         &self.path
     }
 }
 
-impl Drop for IsolatedHome {
-    fn drop(&mut self) {
-        // Restore the prior value instead of unsetting. Under the test-binary
-        // `#[ctor]` that installs an isolated temp `JEIKCODE_HOME` baseline,
-        // `prev` is always `Some`, so this restores that temp baseline and
-        // never leaves the var pointing at the real `~/.jeikcode`.
-        match &self.prev {
-            Some(v) => std::env::set_var("JEIKCODE_HOME", v),
-            None => std::env::remove_var("JEIKCODE_HOME"),
-        }
-    }
-}
-
-/// Create a fresh tempdir, point `JEIKCODE_HOME` at it, and return a guard
-/// that restores the previous value and cleans up the dir on drop. Caller must
+/// Create a fresh tempdir, point THIS thread's home at it, and return a guard
+/// that restores the previous home and cleans up the dir on drop. Caller must
 /// keep the returned value alive for the duration of the test.
 pub fn isolated_home() -> IsolatedHome {
-    let prev = std::env::var_os("JEIKCODE_HOME");
-    let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().to_path_buf();
-    std::env::set_var("JEIKCODE_HOME", &path);
-    IsolatedHome {
-        _tmp: tmp,
-        path,
-        prev,
-    }
+    let inner = jeikcode_config::test_util::isolated_home();
+    let path = inner.path().to_path_buf();
+    IsolatedHome { inner, path }
 }

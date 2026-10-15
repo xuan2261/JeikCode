@@ -28,7 +28,7 @@ fn add_install_reload_flow() {
     // the real ~/.jeikcode. Bind the TempDir to keep it (and its files) alive
     // for the duration of the test.
     let home = tempfile::tempdir().unwrap();
-    std::env::set_var("JEIKCODE_HOME", home.path());
+    let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
     let _home = home;
 
     // Build a minimal plugin repo with a skill and a command.

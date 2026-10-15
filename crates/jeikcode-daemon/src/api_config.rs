@@ -83,6 +83,7 @@ pub(crate) fn config_response(config: &Config) -> ConfigResponse {
         providers,
         accounts,
         language,
+        github_logo: config.github_logo,
     }
 }
 
@@ -1241,6 +1242,7 @@ pub(crate) async fn reload_config(State(state): State<AppState>) -> impl IntoRes
         }
     };
     let _ = crate::reload_mcp_and_live_runtime(&state).await;
+    crate::publish_global(crate::GlobalWireEvent::ConfigReloaded);
     Json(config_response(&config)).into_response()
 }
 

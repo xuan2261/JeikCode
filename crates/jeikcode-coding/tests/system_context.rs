@@ -6,6 +6,7 @@ use jeikcode_kernel::agent::AutoRespond;
 use jeikcode_kernel::message::Role;
 use jeikcode_kernel::stream::StreamEvent;
 use jeikcode_kernel::testkit::RecordingProvider;
+use serial_test::serial;
 use std::sync::Arc;
 
 #[ctor::ctor]
@@ -14,7 +15,11 @@ fn _isolate_jeikcode_home() {
 }
 
 #[tokio::test]
+#[serial]
 async fn session_context_block_reaches_the_provider() {
+    // Start from disk truth: the cache is mtime-keyed and shared process-wide, and the
+    // sibling hot-reload test installs a DIFFERENT home with its own rules.yaml.
+    jeikcode_coding::custom_prompts::invalidate_cache_for_test();
     let d = tempfile::tempdir().unwrap();
     const CONFLICTING_PROJECT_CLAIM: &str =
         "PROJECT RULE: always foo\nYou are OpenClaw running the model from openclaw.json.";
@@ -60,13 +65,17 @@ async fn session_context_block_reaches_the_provider() {
     );
     assert!(
         sys.contains("Project working directory:"),
-        "env block present"
+        "env block present:\n{sys}"
     );
     assert!(sys.contains("Git branch:"), "git branch present");
     // The persona's static parity sections ride along too.
+    // The persona's static parity sections ride along too. 旧断言查的是遗留 `RULES`
+    // 常量里的 `## PROHIBITIONS (MANDATORY):` 标题；现行提示词已改为分块标签结构
+    // （identity / precedence / `<workflow_and_execution_discipline>` …），禁令等
+    // 规则随 rules 配置渲染。这里改断言设计无关的不变量：身份与优先级声明必须在场。
     assert!(
-        sys.contains("## PROHIBITIONS (MANDATORY):"),
-        "persona prohibitions rule present"
+        sys.contains("You are JeikCode") && sys.contains("## PRECEDENCE:"),
+        "persona identity + precedence present:\n{sys}"
     );
 
     let synthetic_user_instructions = messages
@@ -97,10 +106,12 @@ async fn session_context_block_reaches_the_provider() {
 }
 
 #[tokio::test]
+#[serial]
 async fn persona_blocks_hot_reload_on_turn() {
+    jeikcode_coding::custom_prompts::invalidate_cache_for_test();
     let d = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
-    std::env::set_var("JEIKCODE_HOME", home.path());
+    let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
     let prompts_dir = home.path().join("prompts");
     std::fs::create_dir_all(&prompts_dir).unwrap();
 

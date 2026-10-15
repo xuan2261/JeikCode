@@ -19,10 +19,10 @@ fn _isolate_jeikcode_home() {
 async fn plan_mode_blocks_a_write_tool_through_full_assembly() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
-    std::env::set_var("JEIKCODE_HOME", home.path());
+    let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
 
     let mut cfg = CodingAgentConfig::new("k", "http://unused", "test-model", project.path());
-    cfg.stream_timeout = Duration::from_secs(5);
+    cfg.timeouts = cfg.timeouts.with_content_liveness(Duration::from_secs(5));
     cfg.request_timeout = Some(Duration::from_secs(5));
     let opts = PrepareOptions {
         session: SessionMode::Disabled,
@@ -41,12 +41,12 @@ async fn plan_mode_blocks_a_write_tool_through_full_assembly() {
     // Activate plan mode before the turn, matching CodingRuntime::set_mode.
     parts.plan_mode.store(true, Ordering::Relaxed);
 
-    // Round 1: the model calls write_file (Risky). Round 2: it gives up and answers.
+    // Round 1: the model calls write (Risky). Round 2: it gives up and answers.
     let provider = Arc::new(RecordingProvider::new(vec![
         vec![
             StreamEvent::ToolCall(ToolCall {
                 id: "c1".into(),
-                name: "write_file".into(),
+                name: "write".into(),
                 arguments: r#"{"path":"x.txt","content":"hi"}"#.into(),
             }),
             StreamEvent::Done { truncated: false },
@@ -78,8 +78,7 @@ async fn plan_mode_blocks_a_write_tool_through_full_assembly() {
     h.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = h.task.await;
 
-    let (is_error, content) =
-        blocked_content.expect("write_file should have produced a tool result");
+    let (is_error, content) = blocked_content.expect("write should have produced a tool result");
     assert!(
         is_error,
         "a plan-mode-blocked write must be an error result"

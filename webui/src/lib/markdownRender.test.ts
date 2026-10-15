@@ -59,14 +59,12 @@ test('code fence inside list ending with backslash closes properly without swall
     '  ```',
     '- **进程白名单**：',
     '  - `jeikcode.exe`',
-    '  - `atomcode.exe`',
     '',
     '#### 2. Linux 服务器环境',
     '',
     '- **二进制目录与文件**：',
     '  ```text',
     '  /usr/local/bin/jeikcode',
-    '  /usr/local/bin/atomcode',
     '  ```',
   ].join('\n');
   const out = markdownToHtml(content);
@@ -266,4 +264,49 @@ test('unclosed streaming mermaid code block remains stable code block to prevent
   assert.match(out, /<span class="code-block-lang">mermaid<\/span>/);
   assert.match(out, /<code class="language-mermaid">/);
   assert.match(out, /A\[客户端\] --&gt; B\[API网关\]/);
+});
+
+test('nested mermaid block inside markdown code block is kept as source and does not fragment or corrupt post-block headings', () => {
+  const md = [
+    '典型情况是大模型正在输出一份完整的文档草稿：',
+    '````markdown',
+    '这里是给你生成的 README.md 模板：',
+    '```markdown',
+    '# 项目设计说明',
+    '以下是系统架构拓扑：',
+    '```mermaid',
+    'graph TD',
+    '    A --> B',
+    '```',
+    '```',
+    '````',
+    '',
+    '#### 结论：完成',
+    '#### 理由：测试',
+  ].join('\n');
+
+  const out = markdownToHtml(md);
+
+  // 1. 外部的大 markdown 代码块必须完整作为一个整体，且仅有 1 个代码块 wrapper
+  assert.equal((out.match(/code-block-wrapper/g) ?? []).length, 1);
+  // 2. 内部的 mermaid 语法必须保留在代码块内部，绝不能被外泄并转为 mermaid-diagram-mount
+  assert.doesNotMatch(out, /<div class="mermaid-diagram-mount"/);
+  assert.match(out, /```mermaid/);
+  assert.match(out, /graph TD/);
+  // 3. 代码块外部紧跟的 #### 结论 必须正常被渲染为 <h4> 标签，绝不能沦为裸文本
+  assert.match(out, /<h4[^>]*>结论：完成<\/h4>/);
+  assert.match(out, /<h4[^>]*>理由：测试<\/h4>/);
+});
+
+test('Mermaid labels and TeX survive mount encoding without injecting HTML', () => {
+  const source = [
+    'flowchart LR',
+    String.raw`A["$$\\frac{1}{2}$$<br/>ready & waiting"] --> B["<script>alert(1)</script>"]`,
+  ].join('\n');
+  const html = markdownToHtml(`\`\`\`mermaid\n${source}\n\`\`\``);
+  const mount = /data-mermaid-code="([^"]+)"/.exec(html);
+
+  assert.ok(mount);
+  assert.equal(decodeURIComponent(mount[1]), source);
+  assert.doesNotMatch(html, /<script\b|<br\s*\/?>|class="katex"/i);
 });

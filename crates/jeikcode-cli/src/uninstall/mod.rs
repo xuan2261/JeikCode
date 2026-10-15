@@ -8,7 +8,7 @@ pub mod paths;
 pub mod scan;
 
 mod frontend;
-pub use frontend::{run, Args};
+pub use frontend::{run, Args, Preset};
 
 use std::path::PathBuf;
 

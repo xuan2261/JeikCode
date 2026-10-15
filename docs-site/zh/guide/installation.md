@@ -85,21 +85,3 @@ cd JeikCode
 cd webui && npm run build && cd ..
 cargo install --path crates/jeikcode-cli --bin jeikcode --locked
 ```
-
-### 3. 卸载与清理
-
-如需彻底移除 JeikCode，可以使用随附的一键卸载脚本：
-
-::: code-group
-
-```bash [Linux / macOS / HarmonyOS PC]
-curl -fsSL https://raw.githubusercontent.com/jeikl/JeikCode/main/scripts/uninstall.sh | bash
-```
-
-```powershell [Windows (PowerShell)]
-irm https://raw.githubusercontent.com/jeikl/JeikCode/main/scripts/uninstall.ps1 | iex
-```
-
-:::
-
-- **配置文件与状态**：用户配置与会话缓存默认存储于 `~/.jeikcode/`，如需彻底清除，可手动删除该目录。

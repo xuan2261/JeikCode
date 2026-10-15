@@ -3782,9 +3782,9 @@ fn spawn_runtime_owner_with_optional_agent(
                         done,
                     }) => {
                         if let Some(runtime) = resources.as_ref() {
-                            runtime.parts.bash_runtime.cancel_all_live_bash();
+                            runtime.parts.bash_runtime.cancel_foreground_live_bash();
                         }
-                        jeikcode_capabilities::tools::legacy_bash_runtime_state().cancel_all_live_bash();
+                        jeikcode_capabilities::tools::legacy_bash_runtime_state().cancel_foreground_live_bash();
                         if !native_protocol || request_generation != generation || !agent_available {
                             let _ = done.send(Err(RuntimeError::Unavailable));
                         } else if let Some((turn_id, _, snapshot, stats)) = held_turn.take() {
@@ -4586,7 +4586,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             ReconfigureKind::FreshSession
                                 | ReconfigureKind::ResumeSession
                                 | ReconfigureKind::ChangeDirectory
-                        );
+                        ) && !reuses_current_session;
                         if active_turn.is_some() && (reuses_current_session || changes_session) {
                             resources = Some(runtime);
                             let _ = done.send(Err(RuntimeError::Busy));
@@ -4612,8 +4612,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         let reuse_lease = prepared_lease.or_else(|| {
                             matching_session_lease(&runtime.parts, &input.prepare.session)
                         });
-                        let reuse_bash_runtime = (operation == ReconfigureKind::Reprepare)
-                            .then(|| Arc::clone(&runtime.parts.bash_runtime));
+                        let reuse_bash_runtime = Some(Arc::clone(&runtime.parts.bash_runtime));
                         let candidate_parts = prepare_with_plugin_hook_source_reusing_lease(
                             &input.config,
                             input.prepare.clone(),
@@ -4648,7 +4647,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                         };
 
-                        if operation == ReconfigureKind::Reprepare {
+                        if operation == ReconfigureKind::Reprepare || reuses_current_session {
                             candidate.parts.inherit_runtime_continuity(&runtime.parts);
                         } else {
                             candidate.parts.plan_mode.store(
@@ -4794,15 +4793,6 @@ fn spawn_runtime_owner_with_optional_agent(
                             continue;
                         }
                         preserve_sessionless_snapshot(&mut runtime, &stop_report);
-                        if changes_session {
-                            // The candidate owns a fresh BashRuntimeState. Detached
-                            // background bash tasks stop observing request/agent
-                            // cancellation after startup, so explicitly terminate the
-                            // outgoing runtime's tasks only after every rollback path has
-                            // been cleared. Reprepare deliberately shares the same state
-                            // and therefore must not cancel its live tasks here.
-                            runtime.parts.bash_runtime.cancel_all_live_bash();
-                        }
                         runtime = candidate;
                         agent = Some(replacement);
                         generation = generation.wrapping_add(1);
@@ -5408,9 +5398,9 @@ fn spawn_runtime_owner_with_optional_agent(
                     }
                     Some(CodingRuntimeControl::Shutdown { generation: request_generation }) => {
                         if let Some(runtime) = resources.as_ref() {
-                            runtime.parts.bash_runtime.cancel_all_live_bash();
+                            runtime.parts.bash_runtime.cancel_foreground_live_bash();
                         }
-                        jeikcode_capabilities::tools::legacy_bash_runtime_state().cancel_all_live_bash();
+                        jeikcode_capabilities::tools::legacy_bash_runtime_state().cancel_foreground_live_bash();
                         if let Some(task) = next_prompt_task.take() {
                             task.abort();
                         }
@@ -8519,7 +8509,8 @@ mod tests {
     ) {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let (handle, controls) = coding_runtime_control_channel();
         let (runtime_tx, runtime_events) = mpsc::unbounded_channel();
         let (wakeup_tx, wakeup_rx) = mpsc::unbounded_channel();
@@ -8666,7 +8657,8 @@ mod tests {
     async fn uncertain_snapshot_hook_commit_fail_closes_the_completed_turn() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let (agent, mut kernel_commands, kernel_events) = fake_agent();
         let (handle, controls) = coding_runtime_control_channel();
         let (runtime_tx, mut runtime_events) = mpsc::unbounded_channel();
@@ -8757,7 +8749,8 @@ mod tests {
     async fn uncertain_compaction_checkpoint_fail_closes_the_runtime() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let (agent, mut kernel_commands, kernel_events) = fake_agent();
         let (handle, controls) = coding_runtime_control_channel();
         let (runtime_tx, mut runtime_events) = mpsc::unbounded_channel();
@@ -12089,7 +12082,8 @@ mod tests {
     #[serial_test::serial(jeikcode_home)]
     async fn mcp_withdrawal_and_same_session_reload_reject_an_active_turn() {
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let (agent, mut kernel_commands, _kernel_events) = fake_agent();
         let (handle, controls) = coding_runtime_control_channel();
         let (runtime_tx, mut runtime_events) = mpsc::unbounded_channel();
@@ -12557,7 +12551,8 @@ mod tests {
     async fn provider_reassemble_updates_cost_attribution_and_failed_reload_keeps_current_model() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
 
         let factory = Arc::new(UsageProviderFactory::default());
         let mut start = native_start(false);
@@ -12671,7 +12666,8 @@ mod tests {
     async fn change_directory_to_current_path_is_a_runtime_noop() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let mut start = native_start(false);
         start.agent.working_dir = project.path().to_path_buf();
         let mut runtime = CodingRuntime::start(start).await.unwrap();
@@ -12698,7 +12694,8 @@ mod tests {
     async fn failed_fresh_candidate_keeps_previous_runtime_ready() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let factory = Arc::new(FailAfterFirstBuildFactory {
             builds: std::sync::atomic::AtomicUsize::new(0),
         });
@@ -12734,7 +12731,8 @@ mod tests {
     async fn fresh_candidate_is_not_catalog_visible_while_provider_builds() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let entered = Arc::new(std::sync::Barrier::new(2));
         let release = Arc::new(std::sync::Barrier::new(2));
         let factory = Arc::new(BlockAndFailSecondBuildFactory {
@@ -12771,7 +12769,8 @@ mod tests {
     async fn runtime_holds_one_session_lease_reuses_it_and_releases_on_shutdown() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let session_id = "leased-runtime";
         let manager = jeikcode_capabilities::session::SessionManager::for_project(project.path());
         persist_native_session(
@@ -12809,7 +12808,8 @@ mod tests {
     async fn importer_lease_is_transferred_without_an_unlocked_resume_window() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let id = "imported-runtime";
         let manager = jeikcode_capabilities::session::SessionManager::for_project(project.path());
         persist_native_session(
@@ -12841,7 +12841,8 @@ mod tests {
     async fn prepared_resume_rejects_a_lease_for_another_session() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let manager = jeikcode_capabilities::session::SessionManager::for_project(project.path());
         manager
             .save_snapshot(
@@ -12879,7 +12880,8 @@ mod tests {
     async fn session_switch_conflict_keeps_old_owner_then_transfers_both_leases() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let manager = jeikcode_capabilities::session::SessionManager::for_project(project.path());
         for id in ["session-a", "session-b"] {
             persist_native_session(
@@ -12924,7 +12926,8 @@ mod tests {
     async fn incomplete_resume_fails_before_runtime_can_accept_a_turn() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let session_id = "incomplete-runtime";
         let manager = jeikcode_capabilities::session::SessionManager::for_project(project.path());
         let snapshot = SessionSnapshot::new(vec![Message::user("persisted")]);
@@ -12961,7 +12964,8 @@ mod tests {
     async fn startup_failure_releases_the_prepared_session_lease() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let session_id = "failed-runtime";
         let manager = jeikcode_capabilities::session::SessionManager::for_project(project.path());
         persist_native_session(
@@ -12986,7 +12990,8 @@ mod tests {
     async fn dropping_runtime_releases_its_session_lease() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let session_id = "dropped-runtime";
         let manager = jeikcode_capabilities::session::SessionManager::for_project(project.path());
         persist_native_session(
@@ -13026,7 +13031,8 @@ mod tests {
     ) {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let status = std::process::Command::new("git")
             .args(["init", "-q"])
             .current_dir(project.path())
@@ -13403,7 +13409,8 @@ mod tests {
     async fn native_undo_snapshot_cas_preserves_a_newer_canonical_snapshot() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let id = "undo-snapshot-cas";
         let manager = jeikcode_capabilities::session::SessionManager::for_project(project.path());
         let initial = SessionSnapshot::new(vec![
@@ -13449,7 +13456,8 @@ mod tests {
     async fn native_undo_persistence_error_fail_closes_an_unhealthy_aggregate() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let id = "undo-unhealthy-native";
         let manager = jeikcode_capabilities::session::SessionManager::for_project(project.path());
         let snapshot = SessionSnapshot::new(vec![
@@ -13486,7 +13494,8 @@ mod tests {
     async fn native_undo_rollback_persistence_failure_is_sticky() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let id = "undo-rollback-persistence-failure";
         let manager = jeikcode_capabilities::session::SessionManager::for_project(project.path());
         let snapshot = SessionSnapshot::new(vec![
@@ -13540,7 +13549,8 @@ mod tests {
     async fn restore_snapshot_rollback_persistence_failure_is_sticky() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let id = "restore-rollback-persistence-failure";
         let manager = jeikcode_capabilities::session::SessionManager::for_project(project.path());
         let initial = SessionSnapshot::new(vec![Message::user("initial")]);
@@ -13597,7 +13607,8 @@ mod tests {
 
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", home.path());
+        // 线程级 home 覆盖（不再全局写 env）；并行测试互不干扰，且满足“解析一次”契约。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(home.path());
         let id = "undo-sidecar-merge";
         let manager = SessionManager::for_project(project.path());
         let original_snapshot = SessionSnapshot::new(vec![

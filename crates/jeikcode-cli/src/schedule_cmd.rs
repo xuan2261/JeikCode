@@ -877,29 +877,13 @@ mod tests {
     /// Acquires `store_lock()` so concurrent tests do not stomp each other's
     /// JEIKCODE_HOME env var.  The lock is held for the duration of `f`.
     ///
-    /// Restoration of JEIKCODE_HOME is performed inside a Drop guard so that a
-    /// panic inside `f` still restores the env var (and releases the lock via
-    /// normal unwind), preventing subsequent store tests from silently seeing a
-    /// dangling path.
+    /// 隔离改为线程级 home（不再写进程 env）：guard 在 panic展开时也会正常还原
+    /// （Drop），后续 store 测试不会看到悬空路径。
     fn with_temp_home<T, F: FnOnce() -> T>(f: F) -> T {
-        struct EnvGuard {
-            prev: Option<std::ffi::OsString>,
-        }
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                match self.prev.take() {
-                    Some(v) => std::env::set_var("JEIKCODE_HOME", v),
-                    None => std::env::remove_var("JEIKCODE_HOME"),
-                }
-            }
-        }
-
         let _lock = store_lock().lock().unwrap_or_else(|p| p.into_inner());
-        let _env_guard = EnvGuard {
-            prev: std::env::var_os("JEIKCODE_HOME"),
-        };
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("JEIKCODE_HOME", tmp.path());
+        // 线程级 home（不再全局写 env）。
+        let _home = jeikcode_config::test_util::IsolatedHome::at(tmp.path());
         // `tmp` is kept alive until after `f()` returns (or unwinds), ensuring
         // the tempdir is not deleted while the store operates inside it.
         let result = f();
