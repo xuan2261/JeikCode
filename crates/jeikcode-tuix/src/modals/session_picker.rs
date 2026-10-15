@@ -1806,6 +1806,9 @@ mod tests {
         }
 
         let mut session = Session::new(PathBuf::from("/tmp/x"));
+        // Deliberately include the old substring sentinel in a resume label.
+        // Session names are unrelated to persisted accounting-only turn stats.
+        session.name = "replay-987-fixture".into();
         session.messages = vec![
             Message::user("q1"),
             Message::assistant("a1", vec![]),
@@ -1847,9 +1850,22 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(
-            labels.iter().all(|label| !label.contains("987")),
-            "accounting-only stat leaked into replay divider: {labels:?}"
+        // Compare actual turn dividers, not arbitrary session-name text: a
+        // legitimate `resumed: ...` label can itself contain "987".
+        let resumed = crate::i18n::t(crate::i18n::Msg::SessionResumedLabel {
+            name: &session.name,
+        })
+        .into_owned();
+        let turn_labels: Vec<&str> = labels
+            .iter()
+            .copied()
+            .filter(|label| !label.is_empty() && *label != resumed.as_str())
+            .collect();
+        let valid_turn = turn_divider_label(Some(&session.turn_stats[0]));
+        assert_eq!(
+            turn_labels,
+            vec![valid_turn.as_str()],
+            "accounting-only stat introduced an extra replay divider: {labels:?}"
         );
         let context = state.last_context.as_ref().expect("valid context restored");
         assert_eq!(context.sent_tokens, 77);
