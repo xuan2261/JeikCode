@@ -1,11 +1,63 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
+  findQueuedMessageIndex,
   mergeQueuedIntoDraft,
+  nextQueuedMessageId,
   queueAfterSessionActiveCheck,
   stashSessionQueued,
   restoreSessionQueued,
+  withoutQueuedMessage,
 } from './queuedDraft.ts';
+
+test('queue IDs after reload do not collide with persisted items or remove unrelated cards', () => {
+  const restored = [{ id: 0, text: 'saved 0' }, { id: 2, text: 'saved 2' }];
+  const bySession = new Map([
+    ['session-1', restored],
+    ['session-2', [{ id: 8, text: 'other session' }]],
+  ]);
+
+  // A refreshed Chat starts its transient counter at zero.
+  const allocated = nextQueuedMessageId(0, bySession.values(), restored);
+  assert.equal(allocated, 9);
+  const queue = [...restored, { id: allocated, text: 'new' }];
+  assert.deepEqual(queue.filter((item) => item.id !== 0).map((item) => item.text), ['saved 2', 'new']);
+});
+
+test('queue ID allocation observes late server hydration and keeps the counter monotonic', () => {
+  const bySession = new Map([['session-1', [{ id: 0 }]]]);
+  assert.equal(nextQueuedMessageId(3, bySession.values(), [{ id: '23' }]), 24);
+  assert.equal(nextQueuedMessageId(24, bySession.values(), [{ id: 23 }]), 24);
+  assert.equal(nextQueuedMessageId(24, bySession.values(), [{ id: 'opaque-uuid' }]), 24);
+});
+
+test('queue actions preserve a second legacy card with the same persisted ID', () => {
+  const first = { id: 0, text: 'first' };
+  const second = { id: 0, text: 'second' };
+  const queue = [first, second];
+  assert.equal(findQueuedMessageIndex(queue, second), 1);
+  assert.deepEqual(withoutQueuedMessage(queue, second), [first]);
+  assert.equal(findQueuedMessageIndex(queue, { ...second }), -1);
+  assert.equal(withoutQueuedMessage(queue, { ...second }), queue);
+});
+
+test('queue actions resolve refreshed objects only by an unambiguous identity', () => {
+  const pending = [
+    { id: 4, text: 'first', clientInputId: 'steer-a' },
+    { id: 4, text: 'second', clientInputId: 'steer-b' },
+  ];
+  assert.equal(findQueuedMessageIndex(pending, { ...pending[1] }), 1);
+  assert.equal(findQueuedMessageIndex(pending, { id: 4, text: 'ambiguous' }), -1);
+  assert.equal(findQueuedMessageIndex([pending[1]], { id: '4', text: 'server replay' }), -1);
+  assert.equal(findQueuedMessageIndex([pending[1]], { ...pending[1] }), 0);
+  // Once one legacy duplicate is removed, its stale reference must not remove the survivor.
+  assert.equal(findQueuedMessageIndex([pending[1]], pending[0]), -1);
+});
+
+test('queue ID allocator never overflows a safe integer on a restored queue', () => {
+  const max = Number.MAX_SAFE_INTEGER;
+  assert.equal(nextQueuedMessageId(0, [[{ id: max - 1 }, { id: max }]], []), 0);
+});
 
 test('mergeQueuedIntoDraft keeps queue order ahead of the current draft', () => {
   const merged = mergeQueuedIntoDraft(
@@ -97,5 +149,3 @@ test('loadQueuedFromStorage and saveQueuedToStorage round-trip across simulated 
     (globalThis as any).window = original;
   }
 });
-
-

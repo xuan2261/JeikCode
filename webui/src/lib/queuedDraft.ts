@@ -5,6 +5,67 @@ export interface QueuedDraftItem {
   images?: ImageData[];
 }
 
+/**
+ * Keep new in-tab queue IDs distinct from IDs restored after refresh, switching
+ * sessions or receiving a server queue snapshot. Locally generated IDs remain
+ * numeric, while the server wire format also allows numeric strings.
+ */
+export function nextQueuedMessageId(
+  minimum: number,
+  sessionQueues: Iterable<readonly { id?: number | string }[]>,
+  activeQueue: readonly { id?: number | string }[],
+): number {
+  const existing = new Set<number>();
+  let next = Number.isSafeInteger(minimum) && minimum >= 0 ? minimum : 0;
+  for (const queue of [...sessionQueues, activeQueue]) {
+    for (const item of queue) {
+      const rawId = item?.id;
+      const id = typeof rawId === 'string' && /^\d+$/.test(rawId)
+        ? Number(rawId)
+        : rawId;
+      if (typeof id === 'number' && Number.isSafeInteger(id) && id >= 0) {
+        existing.add(id);
+        if (id >= next && id < Number.MAX_SAFE_INTEGER) next = id + 1;
+      }
+    }
+  }
+  if (next >= Number.MAX_SAFE_INTEGER) {
+    next = 0;
+    while (existing.has(next)) next++;
+  }
+  return next;
+}
+
+interface QueuedIdentity {
+  id: number | string;
+  clientInputId?: string;
+}
+
+/**
+ * Prefer exact card identity; a stale card may only match by an unambiguous
+ * client correlation ID. A formerly duplicated wire ID is not sufficient:
+ * after one sibling is removed, it would falsely identify the survivor.
+ */
+export function findQueuedMessageIndex<T extends QueuedIdentity>(queue: readonly T[], target: T): number {
+  const sameObject = queue.indexOf(target);
+  if (sameObject >= 0) return sameObject;
+  if (!target.clientInputId) return -1;
+
+  let match = -1;
+  for (let i = 0; i < queue.length; i++) {
+    const item = queue[i];
+    if (item.clientInputId !== target.clientInputId) continue;
+    if (match >= 0) return -1;
+    match = i;
+  }
+  return match;
+}
+
+export function withoutQueuedMessage<T extends QueuedIdentity>(queue: T[], target: T): T[] {
+  const index = findQueuedMessageIndex(queue, target);
+  return index < 0 ? queue : queue.filter((_, i) => i !== index);
+}
+
 export const STORAGE_KEY_QUEUED_MESSAGES = 'jeikcode_queued_messages_v2';
 export const LEGACY_STORAGE_KEY_QUEUED_MESSAGES = 'jeikcode_queued_messages';
 

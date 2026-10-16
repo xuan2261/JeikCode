@@ -158,12 +158,15 @@ import {
 import { gitStore } from '../lib/gitStore';
 import { isInternalHistoryAssistantMessage, isInternalHistoryUserMessage, stripInjectedRemindersForDisplay, stripSteerEnvelopeForDisplay } from '../lib/historyMessages';
 import {
+  findQueuedMessageIndex,
   loadQueuedFromStorage,
   mergeQueuedIntoDraft,
+  nextQueuedMessageId,
   queueAfterSessionActiveCheck,
   saveQueuedToStorage,
   stashSessionQueued,
   restoreSessionQueued,
+  withoutQueuedMessage,
 } from '../lib/queuedDraft';
 import { consumesProgrammaticStopMark, runningTurnStopAliases, type ProgrammaticStopMark } from '../lib/turnStop';
 import { loadAppliedTodoCallIds, saveAppliedTodoCallIds } from '../lib/todoAppliedIds';
@@ -1149,6 +1152,15 @@ export function Chat({
     setQueuedState(next);
   }
   const queueIdRef = useRef(0);
+  function allocateQueuedId(): number {
+    const id = nextQueuedMessageId(
+      queueIdRef.current,
+      queuedBySessionRef.current.values(),
+      queuedRef.current,
+    );
+    queueIdRef.current = id + 1;
+    return id;
+  }
   // Stop restores the queue into the composer. Block one drain so a busy→idle
   // render cannot send those messages before the cleared queue commits.
   const blockQueueDrainRef = useRef(false);
@@ -4639,7 +4651,7 @@ export function Chat({
           setQueued((q) => [
             ...q,
             {
-              id: queueIdRef.current++,
+              id: allocateQueuedId(),
               text,
               approvalMode: modeState.confirmedMode,
               kind: 'queue' as const,
@@ -6302,7 +6314,7 @@ export function Chat({
           });
           setQueued((prev) => {
             if (prev.some((q) => q.text === text)) return prev;
-            return [...prev, { id: queueIdRef.current++, text, images, approvalMode, kind: 'queue' as const }];
+            return [...prev, { id: allocateQueuedId(), text, images, approvalMode, kind: 'queue' as const }];
           });
           pushCommandNotice(t('chat.sessionBusyQueued'));
         } else {
@@ -6461,7 +6473,7 @@ export function Chat({
       setQueued((q) => [
         ...q,
         {
-          id: queueIdRef.current++,
+          id: allocateQueuedId(),
           text: messageText,
           images: images.length ? images : undefined,
           approvalMode: modeState.confirmedMode,
@@ -6562,6 +6574,7 @@ export function Chat({
 
   /** 用户点击排队消息上的 × 撤回：从队列移除并完整回填文字与全部图片到输入框，避免输入前功尽弃。 */
   function handleCancelQueuedMessage(q: QueuedMessage) {
+    if (findQueuedMessageIndex(queuedRef.current, q) < 0) return;
     // 关键防线：如果该消息已经作为转向投递给了后端（kind === 'steer' 或 'steering'），
     // 必须立即通知后端撤回内核缓冲区中的该转向，防止下一小步或下一轮被执行！
     if (q.kind === 'steer' || q.kind === 'steering') {
@@ -6571,18 +6584,22 @@ export function Chat({
       }
     }
 
-    setQueued((arr) => arr.filter((x) => x.id !== q.id));
+    setQueued((arr) => withoutQueuedMessage(arr, q));
     const targetSid = sessionId ?? activeIdRef.current ?? requestIdRef.current;
-    if (targetSid) {
+    // setQueued already persisted the active session. Applying a second ID-based
+    // removal against that updated cache could erase a legacy ID collision.
+    if (targetSid && targetSid !== activeIdRef.current) {
       const currentList = queuedBySessionRef.current.get(targetSid) ?? [];
-      const updatedList = currentList.filter((item) => item.id !== q.id);
-      if (updatedList.length > 0) {
-        queuedBySessionRef.current.set(targetSid, updatedList);
-      } else {
-        queuedBySessionRef.current.delete(targetSid);
+      if (findQueuedMessageIndex(currentList, q) >= 0) {
+        const updatedList = withoutQueuedMessage(currentList, q);
+        if (updatedList.length > 0) {
+          queuedBySessionRef.current.set(targetSid, updatedList);
+        } else {
+          queuedBySessionRef.current.delete(targetSid);
+        }
+        saveQueuedToStorage(queuedBySessionRef.current);
+        void saveChatQueue(targetSid, updatedList as unknown as QueuedMessageApiItem[]);
       }
-      saveQueuedToStorage(queuedBySessionRef.current);
-      void saveChatQueue(targetSid, updatedList as unknown as QueuedMessageApiItem[]);
     }
 
     if (q.text) {
@@ -6614,6 +6631,7 @@ export function Chat({
    */
   async function handleSteerQueuedMessage(q: QueuedMessage) {
     if (q.kind !== 'queue') return;
+    if (findQueuedMessageIndex(queuedRef.current, q) < 0) return;
     // request id is an admission alias before session_assigned lands on a new chat.
     const sid = sessionId ?? activeIdRef.current ?? requestIdRef.current;
     if (sid) {
@@ -6626,11 +6644,16 @@ export function Chat({
     const targetSid = sid;
     // 客户端关联键：随卡片持久化，刷新后与内核回传的 client_input_ids 对账。
     const clientInputId = q.clientInputId ?? randomUUID();
+    const targetCard = { current: q };
     const updateTargetQueued = (updater: (item: QueuedMessage) => QueuedMessage) =>
       // 定向更新目标会话队列：前台/后台两态与 localStorage、后端 `/chat/queue` 三处同步。
-      updateQueuedForSession(targetSid, (items) =>
-        items.map((item) => (item.id === q.id ? updater(item) : item)),
-      );
+      updateQueuedForSession(targetSid, (items) => {
+        const index = findQueuedMessageIndex(items, targetCard.current);
+        if (index < 0) return items;
+        const updated = updater(items[index]);
+        targetCard.current = updated;
+        return items.map((item, i) => i === index ? updated : item);
+      });
 
     updateTargetQueued((item) => ({ ...item, kind: 'steering' as const, clientInputId }));
     try {
@@ -6671,8 +6694,8 @@ export function Chat({
    */
   function dispatchQueuedCard(item: QueuedMessage) {
     // 以 ref 为准做去重：两个投递入口可能在同一批渲染里竞争同一张卡片。
-    if (!queuedRef.current.some((entry) => entry.id === item.id)) return;
-    setQueued((current) => current.filter((entry) => entry.id !== item.id));
+    if (findQueuedMessageIndex(queuedRef.current, item) < 0) return;
+    setQueued((current) => withoutQueuedMessage(current, item));
     void deliver(item.text, item.images ?? [], item.approvalMode ?? modeState.confirmedMode);
   }
 
@@ -6684,13 +6707,14 @@ export function Chat({
    * 停止释放未获确认时不做无谓投递：卡片留在队首，旧回合终态一到即由 drain 自动补发。
    */
   async function handleSendImmediately(q: QueuedMessage) {
+    if (findQueuedMessageIndex(queuedRef.current, q) < 0) return;
     const currentSid = liveSessionIdRef.current ?? sessionId ?? activeIdRef.current;
 
     // 1. 该卡片跃升为队首（其余卡片保持原序）：立即发送后它就是下一条正文。
     updateQueuedForSession(currentSid, (items) => {
-      const target = items.find((item) => item.id === q.id);
-      if (!target) return items;
-      return [target, ...items.filter((item) => item.id !== q.id)];
+      const index = findQueuedMessageIndex(items, q);
+      if (index < 0) return items;
+      return [items[index], ...items.filter((_, i) => i !== index)];
     });
 
     // 2. 打上程序化停止标记（旧回合的 stopped 终态不得把队列回吐到输入框）并停止。
@@ -6706,8 +6730,8 @@ export function Chat({
 
     // 3. 后端已确认槽位释放（正常路径下与「秒停」同步完成）→ 立刻出队并投递。
     if (!released) return;
-    const latest = queuedRef.current.find((item) => item.id === q.id);
-    if (latest) dispatchQueuedCard(latest);
+    const latestIndex = findQueuedMessageIndex(queuedRef.current, q);
+    if (latestIndex >= 0) dispatchQueuedCard(queuedRef.current[latestIndex]);
   }
 
   async function handleSaveRewrite(sourceIndex: number, newText: string, newImages: ImageData[]) {
@@ -8196,8 +8220,9 @@ export function Chat({
         })()}
 
         {/* 排队中的消息：执行中输入、待当前回合结束后自动发送，卡片下方提供立即发送、转向、取消按钮。 */}
-        {queued.map((q) => (
-          <div key={`q-${q.id}`} class="user-message-wrapper queued">
+        {queued.map((q, index) => (
+          <div key={queued.some((item, i) => i !== index && String(item.id) === String(q.id))
+            ? `q-${q.id}-${index}` : `q-${q.id}`} class="user-message-wrapper queued">
             <div class="user-message-bubble queued-bubble">
               {q.images && q.images.length > 0 && (
                 <div class="msg-images">
