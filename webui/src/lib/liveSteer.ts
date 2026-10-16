@@ -12,6 +12,38 @@ export interface FoldedLiveSteer {
   images: ImageData[];
 }
 
+interface QueuedSteerCandidate {
+  text: string;
+  clientInputId?: string;
+}
+
+/**
+ * Fold a kernel-acknowledged steer through the owning session's queue writer
+ * exactly once. A known client ID is authoritative; text matching is a legacy
+ * fallback only when the acknowledgement has no client ID.
+ */
+export function foldQueuedSteersOnce<T extends QueuedSteerCandidate>(
+  updateSessionQueue: (updater: (queue: T[]) => T[]) => void,
+  folded: readonly { text: string }[],
+  clientInputIds?: readonly (string | null)[],
+): (T | undefined)[] {
+  const matched: (T | undefined)[] = [];
+  if (folded.length === 0) return matched;
+
+  updateSessionQueue((queued) => {
+    const remaining = [...queued];
+    for (const [index, input] of folded.entries()) {
+      const clientInputId = clientInputIds?.[index];
+      const matchIndex = clientInputId
+        ? remaining.findIndex((item) => item.clientInputId === clientInputId)
+        : remaining.findIndex((item) => item.text.trim() === input.text.trim());
+      matched.push(matchIndex < 0 ? undefined : remaining.splice(matchIndex, 1)[0]);
+    }
+    return remaining;
+  });
+  return matched;
+}
+
 function sameImages(left: ImageData[] | undefined, right: ImageData[]): boolean {
   const a = left ?? [];
   if (a.length !== right.length) return false;

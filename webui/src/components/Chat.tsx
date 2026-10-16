@@ -218,6 +218,7 @@ import {
 } from '../lib/turnTimer';
 import {
   acknowledgeLiveSteers,
+  foldQueuedSteersOnce,
   pendingSteersToDraft,
   type PendingLiveSteer,
 } from '../lib/liveSteer';
@@ -4082,33 +4083,13 @@ export function Chat({
     const isCurrentView = !!sid && activeIdRef.current === sid;
 
     // 1. 从排队消息 queued 中移除已被内核 fold 的转向消息，并暂存其携带的多模态原图
-    const matchedQueuedItems: (QueuedMessage | undefined)[] = [];
-    const updateQueuedList = (prevQueued: QueuedMessage[]): QueuedMessage[] => {
-      let nextQueued = prevQueued.slice();
-      for (let i = 0; i < steeredInputs.length; i++) {
-        const s = steeredInputs[i];
-        const clean = s.text.trim();
-        const cid = clientInputIds?.[i];
-        // 优先按 client_input_id 精确剔除（Phase 4），文本匹配仅作兜底。
-        // 多卡/重复文本/纯图片时不再"任选一张"错配。
-        let matchIdx = cid ? nextQueued.findIndex((q) => q.clientInputId === cid) : -1;
-        if (matchIdx < 0) matchIdx = nextQueued.findIndex((q) => q.text.trim() === clean);
-        if (matchIdx >= 0) {
-          matchedQueuedItems.push(nextQueued[matchIdx]);
-          nextQueued.splice(matchIdx, 1);
-        } else {
-          matchedQueuedItems.push(undefined);
-        }
-      }
-      return nextQueued;
-    };
-
-    if (sid) {
-      updateQueuedForSession(sid, updateQueuedList);
-    }
-    if (isCurrentView) {
-      setQueued(updateQueuedList);
-    }
+    const matchedQueuedItems: (QueuedMessage | undefined)[] = sid
+      ? foldQueuedSteersOnce<QueuedMessage>(
+        (updater) => updateQueuedForSession(sid, updater),
+        steeredInputs,
+        clientInputIds,
+      )
+      : steeredInputs.map(() => undefined);
 
     // 2. 将转向消息作为真实普通用户消息发送并追加到会话中，并在其后紧跟新的 assistant 占位
     const foldIntoMessageList = (prev: Message[]): Message[] => {

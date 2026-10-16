@@ -1,6 +1,50 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { acknowledgeLiveSteers, pendingSteersToDraft } from './liveSteer.ts';
+import { acknowledgeLiveSteers, foldQueuedSteersOnce, pendingSteersToDraft } from './liveSteer.ts';
+
+test('folded steer applies one queue update and retains a same-text follow-up', () => {
+  const first = { id: 1, text: 'repeat', clientInputId: 'folded', images: [{ media_type: 'image/png', data: 'a' }] };
+  const remaining = { id: 2, text: 'repeat', clientInputId: 'another', images: [{ media_type: 'image/png', data: 'b' }] };
+  let queue = [first, remaining];
+  let updates = 0;
+  const matched = foldQueuedSteersOnce(
+    (update) => {
+      updates += 1;
+      queue = update(queue);
+    },
+    [{ text: 'repeat' }],
+    ['folded'],
+  );
+
+  assert.equal(updates, 1);
+  assert.deepEqual(queue, [remaining]);
+  assert.deepEqual(matched, [first]);
+});
+
+test('folded steer with a foreign correlation ID does not consume same-text cards', () => {
+  const owned = { id: 3, text: 'repeat', clientInputId: 'this-client' };
+  let queue = [owned];
+  const matched = foldQueuedSteersOnce(
+    (update) => { queue = update(queue); },
+    [{ text: 'repeat' }],
+    ['another-client'],
+  );
+  assert.deepEqual(queue, [owned]);
+  assert.deepEqual(matched, [undefined]);
+});
+
+test('folded steers without IDs retain legacy text matching and fold multiple inputs in order', () => {
+  const first = { id: 1, text: 'one' };
+  const middle = { id: 2, text: 'keep' };
+  const last = { id: 3, text: 'two' };
+  let queue = [first, middle, last];
+  const matched = foldQueuedSteersOnce(
+    (update) => { queue = update(queue); },
+    [{ text: 'one' }, { text: 'two' }],
+  );
+  assert.deepEqual(queue, [middle]);
+  assert.deepEqual(matched, [first, last]);
+});
 
 test('acknowledgeLiveSteers consumes only matching FIFO inputs', () => {
   const pending = [
